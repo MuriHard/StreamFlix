@@ -46,7 +46,7 @@ def migrate_table_columns(conn, table_name, columns_dict):
                 cur.execute(f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_type}")
         conn.commit()
     except Exception as e:
-        print(f"[Migration Warning] {table_name}: {e}")
+        pass
 
 def init_dbs():
     conn1 = get_main_db()
@@ -69,7 +69,6 @@ def init_dbs():
         username TEXT PRIMARY KEY,
         password TEXT,
         dns_used TEXT,
-        m3u_url TEXT,
         plan_type TEXT,
         max_connections TEXT,
         expires_at INTEGER,
@@ -77,10 +76,9 @@ def init_dbs():
         is_trial INTEGER DEFAULT 0
     )""")
 
-    # Garante que NUNCA falte coluna em bancos já existentes
+    # Auto-migração que impede qualquer erro de coluna inexistente
     migrate_table_columns(conn1, "active_users", {
         "dns_used": "TEXT",
-        "m3u_url": "TEXT",
         "plan_type": "TEXT",
         "max_connections": "TEXT",
         "expires_at": "INTEGER",
@@ -108,7 +106,11 @@ def init_dbs():
         "trial_duration_hours": "4",
         "default_payment_link": "",
         "support_whatsapp": "https://wa.me/5500000000000?text=Preciso%20de%20suporte%20no%20StreamFlix",
-        "adult_pin": "0000"
+        "tmdb_api_key": "",
+        "adult_pin": "0000",
+        "apps_smart_tv": "",
+        "apps_android": "",
+        "custom_domain": ""
     }
     for k, v in defaults.items():
         cur1.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v))
@@ -221,7 +223,8 @@ def record_device_entry(mac, ip, ua_string, username="Desconhecido"):
 # ==========================================================
 # 3. PARSER DINÂMICO DE TESTES (CAPTURA 100% DOS DADOS DO SERVIDOR)
 # ==========================================================
-def parse_trial_response(raw_text, cfg):
+def parse_trial_api_response(raw_text, cfg):
+    """Extrai dinamicamente dados do servidor IPTV sem fixar valores modelo."""
     now_ts = int(time.time())
     hours = float(cfg.get("trial_duration_hours") or 4)
     fallback_exp_ts = now_ts + int(hours * 3600)
@@ -247,7 +250,7 @@ def parse_trial_response(raw_text, cfg):
 
     cleaned = raw_text.strip()
 
-    # 1. Tenta decodificar como JSON
+    # 1. Tenta decodificar como JSON estruturado
     try:
         data = json.loads(cleaned)
         if isinstance(data, dict):
@@ -257,10 +260,10 @@ def parse_trial_response(raw_text, cfg):
             m3u = sub.get("m3u_url") or sub.get("m3u") or sub.get("playlist_url") or sub.get("url") or data.get("m3u_url")
             dns = sub.get("dns") or sub.get("server") or data.get("dns")
             plan = sub.get("plan") or sub.get("plan_type") or sub.get("package") or sub.get("pacote") or data.get("plan")
-            pay = sub.get("payment_link") or sub.get("payment_url") or sub.get("checkout_url") or sub.get("pix_url") or data.get("payment_link")
-            tv = sub.get("apps_smart_tv") or sub.get("smart_tv") or sub.get("tv_apps") or data.get("apps_smart_tv")
-            and_apps = sub.get("apps_android") or sub.get("android_apps") or sub.get("mobile_apps") or data.get("apps_android")
+            pay = sub.get("payment_link") or sub.get("checkout_url") or sub.get("pix_url") or sub.get("payment_url") or data.get("payment_link")
             exp = sub.get("expires_at") or sub.get("exp_date") or sub.get("vencimento") or data.get("expires_at")
+            tv_apps = sub.get("apps_smart_tv") or sub.get("smart_tv") or sub.get("tv_apps") or data.get("apps_smart_tv")
+            and_apps = sub.get("apps_android") or sub.get("android_apps") or sub.get("mobile_apps") or data.get("apps_android")
             msg = sub.get("message") or sub.get("msg") or sub.get("text") or data.get("message")
 
             if u: res["username"] = str(u).strip()
@@ -269,7 +272,7 @@ def parse_trial_response(raw_text, cfg):
             if dns: res["dns"] = str(dns).strip().rstrip("/")
             if plan: res["plan_type"] = str(plan).strip()
             if pay: res["payment_link"] = str(pay).strip()
-            if tv: res["apps_smart_tv"] = str(tv).strip() if isinstance(tv, str) else "\n".join(tv)
+            if tv_apps: res["apps_smart_tv"] = str(tv_apps).strip() if isinstance(tv_apps, str) else "\n".join(tv_apps)
             if and_apps: res["apps_android"] = str(and_apps).strip() if isinstance(and_apps, str) else "\n".join(and_apps)
             if msg and isinstance(msg, str) and not res["raw_message"]: res["raw_message"] = msg.strip()
 
@@ -336,15 +339,16 @@ def parse_trial_response(raw_text, cfg):
             txt = re.sub(r"^[^:\n]+[:*]+\s*", "", txt).strip()
             res["apps_android"] = txt
 
-    if res["m3u_url"]:
+    dns_m = re.search(r"(https?://[A-Za-z0-9_.\-]+(?::\d+)?)", cleaned, re.I)
+    if dns_m and not res["dns"]:
+        res["dns"] = dns_m.group(1).strip().rstrip("/")
+
+    if res["m3u_url"] and not res["dns"]:
         dns_match = re.search(r"^(https?://[^/]+)", res["m3u_url"])
         if dns_match: res["dns"] = dns_match.group(1).rstrip("/")
 
     if not res["m3u_url"] and res["username"] and res["password"] and res["dns"]:
         res["m3u_url"] = f"{res['dns']}/get.php?username={urllib.parse.quote(res['username'])}&password={urllib.parse.quote(res['password'])}&type=m3u_plus&output=ts"
-
-    if not res["payment_link"] and cfg.get("default_payment_link"):
-        res["payment_link"] = cfg.get("default_payment_link")
 
     return res
 
@@ -431,7 +435,8 @@ def api_config():
         "dns_list": dns_list,
         "support_whatsapp": cfg.get("support_whatsapp", ""),
         "adult_pin": cfg.get("adult_pin", "0000"),
-        "default_payment_link": cfg.get("default_payment_link", "")
+        "apps_smart_tv": cfg.get("apps_smart_tv", ""),
+        "apps_android": cfg.get("apps_android", "")
     })
 
 @app.route("/api/login", methods=["POST"])
@@ -467,7 +472,7 @@ def api_login():
     chosen_dns = primary_dns
     expires_at = now_ts + (30 * 86400)
     max_conns = "1"
-    plan_type = "Assinatura IPTV"
+    status_str = "Active"
 
     for dns in dns_list:
         if not dns.startswith("http://") and not dns.startswith("https://"):
@@ -483,6 +488,7 @@ def api_login():
                 u_info = info.get("user_info", {})
                 if str(u_info.get("auth")) == "1" or str(u_info.get("status")).lower() in ["active", "trial"]:
                     chosen_dns = dns
+                    status_str = u_info.get("status", "Active")
                     max_conns = str(u_info.get("max_connections", "1"))
                     exp_date = u_info.get("exp_date")
                     if exp_date and str(exp_date).isdigit():
@@ -498,18 +504,16 @@ def api_login():
         except Exception:
             continue
 
-    m3u_url = f"{chosen_dns}/get.php?username={urllib.parse.quote(username)}&password={urllib.parse.quote(password)}&type=m3u_plus&output=ts"
-
     if not existing:
         conn.execute("""INSERT OR REPLACE INTO active_users
-            (username, password, dns_used, m3u_url, plan_type, max_connections, expires_at, payment_link, is_trial)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)""",
-            (username, password, chosen_dns, m3u_url, plan_type, max_conns, expires_at, cfg.get("default_payment_link", "")))
+            (username, password, dns_used, plan_type, max_connections, expires_at, payment_link, is_trial)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 0)""",
+            (username, password, chosen_dns, "Assinatura IPTV", max_conns, expires_at, cfg.get("default_payment_link", "")))
         conn.commit()
     else:
         expires_at = existing["expires_at"] or expires_at
         chosen_dns = existing["dns_used"] or chosen_dns
-        max_conns = existing["max_connections"] or max_conns
+        max_conns = existing["max_connections"] if "max_connections" in existing.keys() and existing["max_connections"] else max_conns
     conn.close()
 
     return jsonify({
@@ -517,9 +521,9 @@ def api_login():
         "username": username,
         "password": password,
         "dns": chosen_dns,
-        "m3u_url": m3u_url,
-        "plan_type": plan_type,
+        "plan_type": "Assinante Oficial",
         "max_connections": max_conns,
+        "status": status_str,
         "expires_at": expires_at,
         "expires_formatted": datetime.fromtimestamp(expires_at).strftime("%d/%m/%Y às %H:%M") if expires_at else "Sem Vencimento",
         "payment_link": cfg.get("default_payment_link", ""),
@@ -579,14 +583,12 @@ def api_request_trial():
             except Exception:
                 pass
 
-    parsed = parse_trial_response(raw_api_resp, cfg)
+    parsed = parse_trial_api_response(raw_api_resp, cfg)
 
     if not parsed["username"]:
         rand_suffix = hashlib.md5(f"{client_ip}{time.time()}".encode()).hexdigest()[:5]
         parsed["username"] = f"teste_{rand_suffix}"
         parsed["password"] = f"{int(time.time()) % 900000 + 100000}"
-        if parsed["dns"]:
-            parsed["m3u_url"] = f"{parsed['dns']}/get.php?username={parsed['username']}&password={parsed['password']}&type=m3u_plus&output=ts"
 
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     conn1.execute("""INSERT INTO trial_records
@@ -596,9 +598,9 @@ def api_request_trial():
          parsed["expires_at"], parsed["payment_link"], parsed["apps_smart_tv"], parsed["apps_android"], now_str))
 
     conn1.execute("""INSERT OR REPLACE INTO active_users
-        (username, password, dns_used, m3u_url, plan_type, max_connections, expires_at, payment_link, is_trial)
-        VALUES (?, ?, ?, ?, ?, '1', ?, ?, 1)""",
-        (parsed["username"], parsed["password"], parsed["dns"], parsed["m3u_url"], parsed["plan_type"], parsed["expires_at"], parsed["payment_link"]))
+        (username, password, dns_used, plan_type, max_connections, expires_at, payment_link, is_trial)
+        VALUES (?, ?, ?, ?, '1', ?, ?, 1)""",
+        (parsed["username"], parsed["password"], parsed["dns"], parsed["plan_type"], parsed["expires_at"], parsed["payment_link"]))
     conn1.commit()
     conn1.close()
 
@@ -717,14 +719,14 @@ def api_update_adult_pin():
     return jsonify({"ok": True, "pin": new_pin})
 
 # ==========================================================
-# 7. FRONTEND STREAMFLIX v5.9 COM CARREGAMENTO M3U IMEDIATO
+# 7. FRONTEND BASEADO NA VERSÃO COMPROVADA v5 COM CONTROLES
 # ==========================================================
 HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-    <title>StreamFlix Pro v5.9</title>
+    <title>StreamFlix Pro</title>
     <script src="https://unpkg.com/lucide@latest"></script>
     <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
     <script src="https://cdn.jsdelivr.net/npm/mpegts.js@latest/dist/mpegts.js"></script>
@@ -842,6 +844,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .player-top { height:52px; background:rgba(10,10,15,0.9); border-bottom:1px solid var(--border); display:flex; align-items:center; justify-content:space-between; padding:0 1rem; z-index:20; }
         .video-stage { position:relative; flex:1; width:100%; overflow:hidden; background:#000; display:flex; align-items:center; justify-content:center; }
 
+        /* PREENCHER HORIZONTALMENTE SEM ZOOM */
         #video-player {
             width: 100vw;
             height: auto;
@@ -857,6 +860,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .player-btn.active { background:var(--primary); border-color:var(--primary); }
         .speed-btn { background:var(--bg-card); border:1px solid var(--border); color:var(--text-muted); font-size:0.7rem; font-weight:800; padding:0.28rem 0.55rem; border-radius:4px; cursor:pointer; }
         .speed-btn.active { background:var(--primary); color:#fff; border-color:var(--primary); }
+
+        .epg-bar { background:rgba(20,20,30,0.85); border-radius:6px; padding:0.45rem 0.75rem; font-size:0.75rem; display:none; justify-content:space-between; }
+        .epg-bar.active { display:flex; }
 
         .config-card { background:var(--bg-surface); border:1px solid var(--border); border-radius:var(--radius-lg); padding:1.2rem; margin-bottom:1rem; }
         .config-title { font-size:0.92rem; font-weight:800; color:var(--primary); margin-bottom:0.75rem; display:flex; align-items:center; gap:0.4rem; }
@@ -896,7 +902,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             </form>
             <button type="button" class="btn-trial" id="btn-trial">⚡ Gerar Teste Grátis Automático</button>
             <div style="display:flex; justify-content:space-between; margin-top:1.2rem; font-size:0.74rem; color:var(--text-muted);">
-                <span id="btn-open-file-m3u" style="cursor:pointer; text-decoration:underline;">Enviar arquivo .M3U</span>
+                <span id="btn-open-file-m3u" style="cursor:pointer; text-decoration:underline;">Importar arquivo .M3U</span>
                 <span id="btn-go-admin" style="cursor:pointer;">Área Admin</span>
             </div>
             <input type="file" id="local-m3u-input" accept=".m3u,.m3u8,.txt" class="hidden">
@@ -925,10 +931,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 <div class="trial-row">
                     <strong>Tipo de Plano</strong>
                     <div class="trial-row-val"><span id="tr-plan">-</span></div>
-                </div>
-                <div class="trial-row" id="row-tr-m3u">
-                    <strong>Link da Playlist M3U</strong>
-                    <div class="trial-row-val"><span id="tr-m3u" style="font-size:0.72rem; color:#93c5fd;">-</span><button class="btn-copy-mini" onclick="copyValue('tr-m3u')">Copiar</button></div>
                 </div>
                 <div class="trial-row" id="row-tr-tv">
                     <strong>Apps Smart TV (Nomes, Links e Códigos)</strong>
@@ -965,7 +967,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         </div>
     </header>
 
-    <!-- DRAWER LATERAL OCULTO DE CATEGORIAS -->
+    <!-- DRAWER LATERAL OCULTO DE CATEGORIAS XTREAM -->
     <div class="drawer-backdrop" id="drawer-backdrop"></div>
     <aside class="drawer-panel" id="drawer-panel">
         <div class="drawer-header">
@@ -982,7 +984,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             <div class="hero-box">
                 <div class="hero-bg" id="hero-bg"></div>
                 <div class="hero-overlay">
-                    <span class="hero-tag">DESTAQUE RECÉM ADICIONADO (5s)</span>
+                    <span class="hero-tag">RECÉM ADICIONADO (5s)</span>
                     <h2 class="hero-title" id="hero-title">Carregando Destaques...</h2>
                     <p class="hero-meta" id="hero-meta">Prévia automática exclusiva de Filmes e Séries</p>
                     <button class="btn-primary" id="btn-hero-play" style="width:auto; padding:0.6rem 1.2rem;">▶ Assistir Agora</button>
@@ -1042,7 +1044,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     <button class="btn-outline" id="btn-theme-oled" style="flex:1;">OLED Pure Black</button>
                     <button class="btn-outline" id="btn-theme-midnight" style="flex:1;">Midnight Blue</button>
                 </div>
-                <button class="btn-outline" id="btn-clear-cache" style="width:100%; color:#fca5a5;">🗑️ Limpar Cache e Recarregar Playlist</button>
+                <button class="btn-outline" id="btn-clear-cache" style="width:100%; color:#fca5a5;">🗑️ Limpar Cache e Recarregar</button>
             </div>
 
             <div class="config-card">
@@ -1055,16 +1057,16 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         </div>
     </main>
 
-    <!-- MODAL DETALHES VOD / TMDB -->
+    <!-- MODAL DETALHES TMDB / VOD -->
     <div id="tmdb-modal" class="tmdb-modal">
         <div class="tmdb-box">
             <div class="tmdb-hero" id="tmdb-hero"><div class="tmdb-hero-overlay"></div></div>
             <div class="tmdb-content">
                 <h3 id="tmdb-title" style="font-size:1.25rem; font-weight:900; margin-bottom:0.25rem;">Título</h3>
-                <p id="tmdb-meta" style="font-size:0.78rem; color:var(--gold); margin-bottom:0.7rem;">Ano • Categoria</p>
-                <p id="tmdb-plot" style="font-size:0.82rem; color:#cbd5e1; line-height:1.45; margin-bottom:1rem;">Toque abaixo para iniciar a reprodução direta.</p>
+                <p id="tmdb-meta" style="font-size:0.78rem; color:var(--gold); margin-bottom:0.7rem;">Ano • Avaliação TMDB</p>
+                <p id="tmdb-plot" style="font-size:0.82rem; color:#cbd5e1; line-height:1.45; margin-bottom:1rem;">Sinopse...</p>
                 <div style="display:flex; gap:0.55rem;">
-                    <button class="btn-primary" id="btn-tmdb-play" style="flex:2;">▶ Assistir Agora</button>
+                    <button class="btn-primary" id="btn-tmdb-play" style="flex:2;">▶ Assistir Título</button>
                     <button class="btn-outline" id="btn-tmdb-close" style="flex:1;">Fechar</button>
                 </div>
             </div>
@@ -1093,6 +1095,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         </div>
 
         <div class="player-controls-deck">
+            <div class="epg-bar" id="epg-bar">
+                <span id="epg-now">Agora: Carregando Guia EPG...</span>
+                <span id="epg-time" style="color:var(--text-muted);">--:--</span>
+            </div>
+
+            <!-- Botões Principais: Play/Pause, -10s, +10s, Preenchimento Horizontal -->
             <div class="deck-row">
                 <div style="display:flex; gap:0.4rem; align-items:center;">
                     <button class="player-btn" id="btn-rw">⏪ -10s</button>
@@ -1106,6 +1114,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 </div>
             </div>
 
+            <!-- Seletor de Velocidades: 1.0, 1.3, 1.5, 1.8, 2.0 -->
             <div class="deck-row">
                 <span style="font-size:0.7rem; color:var(--text-muted);">Velocidade:</span>
                 <div style="display:flex; gap:0.3rem;">
@@ -1133,6 +1142,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             </div>
 
             <div id="adm-content" class="hidden">
+                <!-- MONITORAMENTO EM TEMPO REAL -->
                 <div class="config-card" style="border-color:var(--primary);">
                     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.75rem;">
                         <div class="config-title" style="margin:0;">🔴 Monitoramento em Tempo Real (Transmissões Ativas)</div>
@@ -1158,6 +1168,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     </div>
                 </div>
 
+                <!-- BANCO SEPARADO: REGISTRO DE MACs, IPs E LOCALIZAÇÃO -->
                 <div class="config-card">
                     <div class="config-title">🛡️ Banco de Dispositivos Registrados (MAC, IP e Localização)</div>
                     <p style="font-size:0.75rem; color:var(--text-muted); margin-bottom:0.6rem;">Salvo no banco de dados separado <code>devices_tracking.db</code> com geolocalização e histórico de acesso.</p>
@@ -1179,6 +1190,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     </div>
                 </div>
 
+                <!-- CONFIGURAÇÕES GERAIS -->
                 <div class="config-card">
                     <div class="config-title">⚙️ Configurações de Conexão</div>
                     <div class="form-group"><label>DNS Servidor IPTV (Xtream Codes)</label><div class="input-wrap"><textarea id="adm-dns" rows="2"></textarea></div></div>
@@ -1194,12 +1206,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <script>
         lucide.createIcons();
 
+        // ESTADO GLOBAL
         let activeTab = "home";
         let activeCategory = "Todas";
         let currentAuth = JSON.parse(localStorage.getItem("sf_session") || "null");
         let serverConfig = {};
+        let xtreamCategories = { tv: [], movies: [], series: [] };
         let catalog = { tv: [], movies: [], series: [] };
-        let categoriesMap = { tv: {}, movies: {}, series: {} };
         let currentPlayingItem = null;
         let hlsInstance = null;
         let mpegtsInstance = null;
@@ -1210,7 +1223,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         const ADULT_REGEX = /\b(adult[os]?|\+18|xxx|porn[oa]?|erotic[oa]?|sexy|playboy|venus|for adults)\b/i;
 
         function isAdultItem(item) {
-            const txt = (item.name || "") + " " + (item.group || "");
+            const txt = ((item.name || "") + " " + (item.group || ""));
             return ADULT_REGEX.test(txt);
         }
 
@@ -1247,6 +1260,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         }
         loadPublicConfig();
 
+        // HERO CAROUSEL 5s (EXCLUSIVO FILMES E SÉRIES - ZERO CANAIS E ZERO ADULTO)
         let heroItems = [];
         let heroIdx = 0;
         let heroMs = 0;
@@ -1267,144 +1281,94 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             if (!it) return;
             document.getElementById("hero-bg").style.backgroundImage = `url('${it.logo}')`;
             document.getElementById("hero-title").textContent = it.name;
-            document.getElementById("hero-meta").textContent = `${it.group} • Destaque 5s`;
+            document.getElementById("hero-meta").textContent = `${it.group} • 5s Destaque`;
             document.getElementById("btn-hero-play").onclick = () => openItemPlay(it);
         }
 
-        function openIndexedDB() {
-            return new Promise((resolve, reject) => {
-                const req = indexedDB.open("StreamFlix_V5_Store", 1);
-                req.onupgradeneeded = (e) => {
-                    const db = e.target.result;
-                    if (!db.objectStoreNames.contains("cache")) db.createObjectStore("cache");
-                };
-                req.onsuccess = () => resolve(req.result);
-                req.onerror = () => reject(req.error);
-            });
-        }
-
-        async function saveCatalogToDB(catData) {
-            try {
-                const db = await openIndexedDB();
-                const tx = db.transaction("cache", "readwrite");
-                tx.objectStore("cache").put(catData, "last_catalog");
-            } catch (e) {}
-        }
-
-        async function loadCatalogFromDB() {
-            try {
-                const db = await openIndexedDB();
-                return await new Promise((resolve) => {
-                    const tx = db.transaction("cache", "readonly");
-                    const req = tx.objectStore("cache").get("last_catalog");
-                    req.onsuccess = () => resolve(req.result || null);
-                    req.onerror = () => resolve(null);
-                });
-            } catch (e) { return null; }
-        }
-
-        function classifyItem(name, group, url) {
-            const u = url.toLowerCase();
-            const g = group.toLowerCase();
-            const n = name.toLowerCase();
-            if (u.includes('/series/')) return 'series';
-            if (u.includes('/movie/')) return 'movies';
-            if (u.includes('/live/') || u.endsWith('.ts')) return 'tv';
-            if (/s\d{1,2}\s*e\d{1,3}|\bep\.?\s*\d+/i.test(n) || g.includes('série') || g.includes('serie') || g.includes('novela') || g.includes('dorama') || g.includes('temporada')) return 'series';
-            if ((u.endsWith('.mp4') || u.endsWith('.mkv') || u.endsWith('.avi')) && !g.includes('24h') && !g.includes('canal')) return 'movies';
-            if (g.includes('filme') || g.includes('cinema') || g.includes('vod') || g.includes('lançamento') || g.includes('lancamento')) return 'movies';
-            return 'tv';
-        }
-
-        async function parseM3UContent(text) {
-            const lines = text.split(/\r?\n/);
-            const total = lines.length;
-            const fallbackLogo = 'https://images.unsplash.com/photo-1593784991095-a205069470b6?w=400&q=80';
-
-            catalog = { tv: [], movies: [], series: [] };
-            categoriesMap = { tv: {}, movies: {}, series: {} };
-
-            let name = "", group = "Geral", logo = fallbackLogo, hasInf = false, idSeq = 0;
-            const msgEl = document.getElementById("loading-msg");
-
-            for (let i = 0; i < total; i++) {
-                const l = lines[i].trim();
-                if (!l) continue;
-
-                if (l.startsWith("#EXTINF:")) {
-                    const cIdx = l.lastIndexOf(",");
-                    name = cIdx !== -1 ? l.slice(cIdx + 1).trim() : `Canal ${idSeq + 1}`;
-                    const gMatch = l.match(/group-title="([^"]*)"/i);
-                    group = gMatch && gMatch[1].trim() ? gMatch[1].trim() : "Geral";
-                    const lMatch = l.match(/tvg-logo="([^"]*)"/i);
-                    logo = lMatch && lMatch[1].trim() ? lMatch[1].trim() : fallbackLogo;
-                    hasInf = true;
-                } else if (!l.startsWith("#") && hasInf) {
-                    idSeq++;
-                    const type = classifyItem(name, group, l);
-                    const item = { id: idSeq, name, group, logo, url: l, type };
-
-                    catalog[type].push(item);
-                    categoriesMap[type][group] = (categoriesMap[type][group] || 0) + 1;
-                    hasInf = false;
-
-                    if (idSeq % 800 === 0) {
-                        msgEl.textContent = `Processando canais: ${idSeq} títulos organizados...`;
-                        await new Promise(r => setTimeout(r, 0));
-                    }
-                }
+        // CARREGA DADOS XTREAM CODES DIRETO DO SERVIDOR (BASE ORIGINAL COMPROVADA v5)
+        async function fetchXtreamData() {
+            let dns = (currentAuth && currentAuth.dns) || serverConfig.dns;
+            if (!currentAuth || !dns) {
+                alert("Servidor IPTV não configurado. Verifique o DNS na Área Admin.");
+                return;
             }
+            dns = dns.replace(/\/$/, "");
+            if (!dns.startsWith("http://") && !dns.startsWith("https://")) {
+                dns = "http://" + dns;
+            }
+            const u = encodeURIComponent(currentAuth.username);
+            const p = encodeURIComponent(currentAuth.password);
 
-            heroItems = [...catalog.movies, ...catalog.series].filter(it => !isAdultItem(it)).slice(0, 15);
-            if (heroItems.length > 0) renderHeroSlide(heroItems[0]);
-
-            renderHomeCarousels();
-            saveCatalogToDB({ catalog, categoriesMap });
-        }
-
-        async function loadPlaylistData() {
             const cover = document.getElementById("loading-cover");
             const msgEl = document.getElementById("loading-msg");
             cover.classList.add("active");
-            msgEl.textContent = "Carregando canais e categorias do servidor...";
-
-            const cached = await loadCatalogFromDB();
-            if (cached && cached.catalog && cached.catalog.tv.length > 0) {
-                catalog = cached.catalog;
-                categoriesMap = cached.categoriesMap;
-                heroItems = [...catalog.movies, ...catalog.series].filter(it => !isAdultItem(it)).slice(0, 15);
-                if (heroItems.length > 0) renderHeroSlide(heroItems[0]);
-                renderHomeCarousels();
-                cover.classList.remove("active");
-                return;
-            }
-
-            let m3uUrl = (currentAuth && currentAuth.m3u_url) || "";
-            if (!m3uUrl && currentAuth && currentAuth.username && currentAuth.password && currentAuth.dns) {
-                m3uUrl = `${currentAuth.dns}/get.php?username=${encodeURIComponent(currentAuth.username)}&password=${encodeURIComponent(currentAuth.password)}&type=m3u_plus&output=ts`;
-            }
-
-            if (!m3uUrl) {
-                cover.classList.remove("active");
-                alert("Nenhuma URL de playlist configurada. Configure o DNS na Área Admin.");
-                return;
-            }
 
             try {
-                const proxyUrl = `/api/playlist/download?url=${encodeURIComponent(m3uUrl)}`;
-                const r = await fetch(proxyUrl);
-                if (!r.ok) throw new Error("Servidor retornou erro ao baixar playlist");
-                const text = await r.text();
-                if (!text || !text.includes("#EXTINF")) throw new Error("Resposta da playlist vazia ou inválida");
-                await parseM3UContent(text);
-            } catch (err) {
-                console.error("Erro ao baixar M3U:", err);
-                alert("Não foi possível carregar a playlist automaticamente do servidor. Você também pode enviar um arquivo .M3U na tela de login.");
+                msgEl.textContent = "Obtendo categorias do servidor...";
+                // 1. Categorias
+                const [rTvCat, rVodCat, rSerCat] = await Promise.all([
+                    fetch(`${dns}/player_api.php?username=${u}&password=${p}&action=get_live_categories`).catch(()=>({json:()=>[]})),
+                    fetch(`${dns}/player_api.php?username=${u}&password=${p}&action=get_vod_categories`).catch(()=>({json:()=>[]})),
+                    fetch(`${dns}/player_api.php?username=${u}&password=${p}&action=get_series_categories`).catch(()=>({json:()=>[]}))
+                ]);
+                xtreamCategories.tv = await rTvCat.json();
+                xtreamCategories.movies = await rVodCat.json();
+                xtreamCategories.series = await rSerCat.json();
+
+                // Cria mapas de nomes de categorias para não exibir "Filmes" genérico
+                const vodCatMap = {};
+                (Array.isArray(xtreamCategories.movies) ? xtreamCategories.movies : []).forEach(c => vodCatMap[c.category_id] = c.category_name);
+
+                const serCatMap = {};
+                (Array.isArray(xtreamCategories.series) ? xtreamCategories.series : []).forEach(c => serCatMap[c.category_id] = c.category_name);
+
+                const liveCatMap = {};
+                (Array.isArray(xtreamCategories.tv) ? xtreamCategories.tv : []).forEach(c => liveCatMap[c.category_id] = c.category_name);
+
+                // 2. Streams
+                msgEl.textContent = "Sincronizando conteúdos...";
+                const [rVod, rSer, rLive] = await Promise.all([
+                    fetch(`${dns}/player_api.php?username=${u}&password=${p}&action=get_vod_streams`).catch(()=>({json:()=>[]})),
+                    fetch(`${dns}/player_api.php?username=${u}&password=${p}&action=get_series`).catch(()=>({json:()=>[]})),
+                    fetch(`${dns}/player_api.php?username=${u}&password=${p}&action=get_live_streams`).catch(()=>({json:()=>[]}))
+                ]);
+                const vods = await rVod.json();
+                const series = await rSer.json();
+                const live = await rLive.json();
+
+                catalog.movies = (Array.isArray(vods) ? vods : []).map(v => ({
+                    id: v.stream_id, name: v.name, group: v.category_name || vodCatMap[v.category_id] || "Filmes", category_id: v.category_id,
+                    type: "movies", logo: v.stream_icon, container_extension: v.container_extension || "mp4",
+                    rating: v.rating, tmdb_id: v.tmdb_id,
+                    url: `${dns}/movie/${currentAuth.username}/${currentAuth.password}/${v.stream_id}.${v.container_extension || 'mp4'}`
+                }));
+
+                catalog.series = (Array.isArray(series) ? series : []).map(s => ({
+                    id: s.series_id, name: s.name, group: s.category_name || serCatMap[s.category_id] || "Séries", category_id: s.category_id,
+                    type: "series", logo: s.cover, rating: s.rating, tmdb_id: s.tmdb_id,
+                    url: `${dns}/series/${currentAuth.username}/${currentAuth.password}/${s.series_id}.mp4`
+                }));
+
+                catalog.tv = (Array.isArray(live) ? live : []).map(l => ({
+                    id: l.stream_id, name: l.name, group: l.category_name || liveCatMap[l.category_id] || "Canais", category_id: l.category_id,
+                    type: "tv", logo: l.stream_icon, epg_id: l.epg_channel_id,
+                    url: `${dns}/live/${currentAuth.username}/${currentAuth.password}/${l.stream_id}.ts`
+                }));
+
+                // Prepara itens de prévia (Apenas Filmes e Séries - ZERO Adulto e ZERO Canais)
+                heroItems = [...catalog.movies, ...catalog.series].filter(it => !isAdultItem(it)).slice(0, 15);
+                if (heroItems.length > 0) renderHeroSlide(heroItems[0]);
+
+                renderHomeCarousels();
+            } catch (e) {
+                console.error("Erro no carregamento Xtream:", e);
+                alert("Falha ao comunicar com o servidor IPTV. Verifique o DNS e credenciais.");
             } finally {
                 cover.classList.remove("active");
             }
         }
 
+        // RENDERIZA HOME
         function renderHomeCarousels() {
             const fillC = (id, list) => {
                 const el = document.getElementById(id);
@@ -1439,42 +1403,63 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             return card;
         }
 
-        function openTmdbDetails(it) {
+        // DETALHES TMDB DO TÍTULO
+        async function openTmdbDetails(it) {
             document.getElementById("tmdb-modal").classList.add("active");
             document.getElementById("tmdb-title").textContent = it.name;
-            document.getElementById("tmdb-meta").textContent = `${it.group}`;
+            document.getElementById("tmdb-meta").textContent = `Carregando informações...`;
+            document.getElementById("tmdb-plot").textContent = `Buscando sinopse do título...`;
             document.getElementById("tmdb-hero").style.backgroundImage = `url('${it.logo}')`;
 
             document.getElementById("btn-tmdb-play").onclick = () => {
                 document.getElementById("tmdb-modal").classList.remove("active");
                 openItemPlay(it);
             };
+
+            if (currentAuth && it.type === "movies") {
+                try {
+                    let dns = currentAuth.dns.replace(/\/$/, "");
+                    if (!dns.startsWith("http://") && !dns.startsWith("https://")) dns = "http://" + dns;
+                    const r = await fetch(`${dns}/player_api.php?username=${encodeURIComponent(currentAuth.username)}&password=${encodeURIComponent(currentAuth.password)}&action=get_vod_info&vod_id=${it.id}`);
+                    const d = await r.json();
+                    const info = d.info || {};
+                    const plot = info.plot || info.description || "Sinopse não informada pelo servidor.";
+                    const rating = info.rating ? `⭐ Avaliação: ${info.rating}/10` : "⭐ Disponível";
+                    const year = info.releasedate ? ` • ${info.releasedate.split('-')[0]}` : "";
+
+                    document.getElementById("tmdb-meta").textContent = `${rating}${year} • ${it.group}`;
+                    document.getElementById("tmdb-plot").textContent = plot;
+                    if (info.backdrop_path && info.backdrop_path[0]) {
+                        document.getElementById("tmdb-hero").style.backgroundImage = `url('${info.backdrop_path[0]}')`;
+                    }
+                } catch (e) {}
+            }
         }
         document.getElementById("btn-tmdb-close").onclick = () => document.getElementById("tmdb-modal").classList.remove("active");
 
+        // DRAWER LATERAL AUTOMÁTICO DE CATEGORIAS
         function openCategoriesDrawer() {
             const list = document.getElementById("drawer-list");
             list.innerHTML = "";
-            const cats = categoriesMap[activeTab] || {};
-            const catNames = Object.keys(cats);
+            const cats = activeTab === "tv" ? xtreamCategories.tv : (activeTab === "movies" ? xtreamCategories.movies : xtreamCategories.series);
             document.getElementById("drawer-title").textContent = `Categorias (${activeTab.toUpperCase()})`;
 
             const bAll = document.createElement("button");
             bAll.className = `drawer-item ${activeCategory === "Todas" ? "active" : ""}`;
-            bAll.innerHTML = `<span>Todas as Categorias</span><span style="font-size:0.7rem; opacity:0.7;">${catalog[activeTab].length}</span>`;
+            bAll.innerHTML = `<span>Todas as Categorias</span>`;
             bAll.onclick = () => { selectCategory("Todas"); closeDrawer(); };
             list.appendChild(bAll);
 
-            catNames.forEach(cName => {
+            (Array.isArray(cats) ? cats : []).forEach(c => {
                 const b = document.createElement("button");
-                b.className = `drawer-item ${activeCategory === cName ? "active" : ""}`;
-                b.innerHTML = `<span>${cName}</span><span style="font-size:0.7rem; opacity:0.7;">${cats[cName]}</span>`;
+                b.className = `drawer-item ${activeCategory === c.category_name ? "active" : ""}`;
+                b.innerHTML = `<span>${c.category_name}</span>`;
                 b.onclick = () => {
-                    if (ADULT_REGEX.test(cName)) {
+                    if (ADULT_REGEX.test(c.category_name)) {
                         const entered = prompt("🔒 Digite o PIN de 4 dígitos para conteúdo Adulto:");
                         if (entered !== adultPin) return alert("PIN incorreto!");
                     }
-                    selectCategory(cName);
+                    selectCategory(c.category_name);
                     closeDrawer();
                 };
                 list.appendChild(b);
@@ -1520,6 +1505,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         }
         document.getElementById("catalog-search").oninput = renderCatalogGrid;
 
+        // PLAYER DE VÍDEO COMPLETO (CONTROLES, 5 VELOCIDADES, EPG E HORIZONTAL)
         const vEl = document.getElementById("video-player");
 
         function sendMonitorHeartbeat(isPlaying) {
@@ -1548,6 +1534,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             stopPlayerEngines();
             vEl.className = "";
 
+            const epgBar = document.getElementById("epg-bar");
+            if (it.type === "tv") {
+                epgBar.classList.add("active");
+                fetchEpg(it);
+            } else {
+                epgBar.classList.remove("active");
+            }
+
             const url = it.url;
             if (url.includes(".m3u8") && typeof Hls !== "undefined" && Hls.isSupported()) {
                 hlsInstance = new Hls();
@@ -1570,6 +1564,21 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 if (!vEl.paused) playSecondsCounter += 4;
                 sendMonitorHeartbeat(!vEl.paused);
             }, 4000);
+        }
+
+        async function fetchEpg(it) {
+            if (!currentAuth || !it.id) return;
+            try {
+                let dns = currentAuth.dns.replace(/\/$/, "");
+                if (!dns.startsWith("http://") && !dns.startsWith("https://")) dns = "http://" + dns;
+                const r = await fetch(`${dns}/player_api.php?username=${encodeURIComponent(currentAuth.username)}&password=${encodeURIComponent(currentAuth.password)}&action=get_short_epg&stream_id=${it.id}`);
+                const d = await r.json();
+                const prog = (d.epg_listings && d.epg_listings[0]) || {};
+                document.getElementById("epg-now").textContent = `Agora: ${prog.title || it.name}`;
+                document.getElementById("epg-time").textContent = prog.start ? `${prog.start} - ${prog.end}` : "Ao Vivo";
+            } catch (e) {
+                document.getElementById("epg-now").textContent = `Agora: ${it.name}`;
+            }
         }
 
         function stopPlayerEngines() {
@@ -1620,6 +1629,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             };
         });
 
+        // NAVEGAÇÃO BOTTOM BAR
         document.querySelectorAll(".bottom-nav .bnav-item").forEach(btn => {
             btn.onclick = () => {
                 activeTab = btn.dataset.tab;
@@ -1677,14 +1687,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
         document.getElementById("btn-theme-oled").onclick = () => document.body.className = "";
         document.getElementById("btn-theme-midnight").onclick = () => document.body.className = "theme-midnight";
-        document.getElementById("btn-clear-cache").onclick = async () => {
-            try {
-                const db = await openIndexedDB();
-                const tx = db.transaction("cache", "readwrite");
-                tx.objectStore("cache").clear();
-            } catch(e){}
-            location.reload();
-        };
+        document.getElementById("btn-clear-cache").onclick = () => { localStorage.clear(); location.reload(); };
 
         // LOGIN DO CLIENTE
         document.getElementById("form-login").onsubmit = async (e) => {
@@ -1720,18 +1723,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 currentAuth = tr;
                 localStorage.setItem("sf_session", JSON.stringify(tr));
 
-                // Popula a tela com dados reais e dinâmicos do servidor
                 document.getElementById("tr-u").textContent = tr.username || "-";
                 document.getElementById("tr-p").textContent = tr.password || "-";
                 document.getElementById("tr-exp").textContent = tr.expires_formatted || "-";
                 document.getElementById("tr-plan").textContent = tr.plan_type || "Teste Grátis";
-
-                if (tr.m3u_url) {
-                    document.getElementById("row-tr-m3u").classList.remove("hidden");
-                    document.getElementById("tr-m3u").textContent = tr.m3u_url;
-                } else {
-                    document.getElementById("row-tr-m3u").classList.add("hidden");
-                }
 
                 if (tr.apps_smart_tv) {
                     document.getElementById("row-tr-tv").classList.remove("hidden");
@@ -1765,7 +1760,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     `👤 *Usuário:* ${tr.username}\n` +
                     `🔑 *Senha:* ${tr.password}\n` +
                     `⏰ *Vencimento:* ${tr.expires_formatted}\n` +
-                    (tr.m3u_url ? `🔗 *Lista M3U:* ${tr.m3u_url}\n` : '') +
                     (tr.apps_smart_tv ? `📺 *Smart TV:* ${tr.apps_smart_tv}\n` : '') +
                     (tr.apps_android ? `📱 *Android:* ${tr.apps_android}\n` : '') +
                     (tr.payment_link ? `💳 *Pagamento:* ${tr.payment_link}` : '');
@@ -1795,30 +1789,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             document.getElementById("main-navbar").classList.remove("hidden");
             document.getElementById("main-content").classList.remove("hidden");
             document.getElementById("bottom-nav").classList.add("active");
-            loadPlaylistData();
+            fetchXtreamData();
         }
 
         document.getElementById("btn-logout-cfg").onclick = () => {
             localStorage.removeItem("sf_session");
             location.reload();
-        };
-
-        const fileInput = document.getElementById("local-m3u-input");
-        document.getElementById("btn-open-file-m3u").onclick = () => fileInput.click();
-        fileInput.onchange = (e) => {
-            const f = e.target.files[0];
-            if (!f) return;
-            const r = new FileReader();
-            r.onload = async (ev) => {
-                currentAuth = { username: f.name.replace(/\.[^/.]+$/, ""), password: "", dns: "" };
-                localStorage.setItem("sf_session", JSON.stringify(currentAuth));
-                document.getElementById("screen-login").classList.remove("active");
-                document.getElementById("main-navbar").classList.remove("hidden");
-                document.getElementById("main-content").classList.remove("hidden");
-                document.getElementById("bottom-nav").classList.add("active");
-                await parseM3UContent(ev.target.result);
-            };
-            r.readAsText(f);
         };
 
         let adminPolling = null;
