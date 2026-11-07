@@ -24,7 +24,7 @@ SSL_CTX.check_hostname = False
 SSL_CTX.verify_mode = ssl.CERT_NONE
 
 # ==========================================================
-# 1. BANCOS DE DADOS (STREAMFLIX E BANCO SEPARADO DE DISPOSITIVOS)
+# 1. BANCOS DE DADOS COM AUTO-MIGRAÇÃO DE COLUNAS
 # ==========================================================
 def get_main_db():
     conn = sqlite3.connect(MAIN_DB_PATH)
@@ -35,6 +35,18 @@ def get_devices_db():
     conn = sqlite3.connect(DEVICES_DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
+def migrate_table_columns(conn, table_name, columns_dict):
+    try:
+        cur = conn.cursor()
+        cur.execute(f"PRAGMA table_info({table_name})")
+        existing_cols = [row[1] for row in cur.fetchall()]
+        for col_name, col_type in columns_dict.items():
+            if col_name not in existing_cols:
+                cur.execute(f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_type}")
+        conn.commit()
+    except Exception as e:
+        print(f"[Migration Warning] {table_name}: {e}")
 
 def init_dbs():
     conn1 = get_main_db()
@@ -65,10 +77,33 @@ def init_dbs():
         is_trial INTEGER DEFAULT 0
     )""")
 
+    # Garante que NUNCA falte coluna em bancos já existentes
+    migrate_table_columns(conn1, "active_users", {
+        "dns_used": "TEXT",
+        "m3u_url": "TEXT",
+        "plan_type": "TEXT",
+        "max_connections": "TEXT",
+        "expires_at": "INTEGER",
+        "payment_link": "TEXT",
+        "is_trial": "INTEGER DEFAULT 0"
+    })
+    migrate_table_columns(conn1, "trial_records", {
+        "ip_address": "TEXT",
+        "device_mac": "TEXT",
+        "username": "TEXT",
+        "password": "TEXT",
+        "plan_type": "TEXT",
+        "expires_at": "INTEGER",
+        "payment_link": "TEXT",
+        "apps_smart_tv": "TEXT",
+        "apps_android": "TEXT",
+        "created_at": "TEXT"
+    })
+
     defaults = {
         "admin_user": "admin",
         "admin_pass": "admin123",
-        "dns_list": "http://seu-servidor-iptv.com:80",
+        "dns_list": "http://zavryqonix.online:80",
         "trial_api_url": "",
         "trial_duration_hours": "4",
         "default_payment_link": "",
@@ -124,7 +159,7 @@ def save_settings(new_data):
     conn.close()
 
 # ==========================================================
-# 2. LOCALIZAÇÃO E RASTREAMENTO SILENCIOSO DE DISPOSITIVOS
+# 2. LOCALIZAÇÃO E DISPOSITIVOS
 # ==========================================================
 def resolve_ip_location(ip):
     if not ip or ip in ("127.0.0.1", "0.0.0.0", "localhost") or ip.startswith("192.168.") or ip.startswith("10."):
@@ -308,7 +343,6 @@ def parse_trial_response(raw_text, cfg):
     if not res["m3u_url"] and res["username"] and res["password"] and res["dns"]:
         res["m3u_url"] = f"{res['dns']}/get.php?username={urllib.parse.quote(res['username'])}&password={urllib.parse.quote(res['password'])}&type=m3u_plus&output=ts"
 
-    # Se a API não enviou link de pagamento, usa o configurado no Admin se existir
     if not res["payment_link"] and cfg.get("default_payment_link"):
         res["payment_link"] = cfg.get("default_payment_link")
 
@@ -319,10 +353,6 @@ def parse_trial_response(raw_text, cfg):
 # ==========================================================
 @app.route("/api/playlist/download")
 def api_playlist_download():
-    """
-    Baixa o arquivo texto da playlist M3U na VPS e entrega para o navegador.
-    Consumo de vídeo ZERO na VPS, pois apenas o texto da playlist é entregue aqui.
-    """
     m3u_url = request.args.get("url", "").strip()
     if not m3u_url:
         dns = request.args.get("dns", "").strip().rstrip("/")
@@ -338,7 +368,7 @@ def api_playlist_download():
 
     try:
         req = urllib.request.Request(m3u_url, headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
             "Accept": "*/*"
         })
         with urllib.request.urlopen(req, timeout=60, context=SSL_CTX) as resp:
@@ -420,7 +450,7 @@ def api_login():
 
     cfg = get_settings()
     dns_list = [d.strip().rstrip("/") for d in cfg.get("dns_list", "").splitlines() if d.strip()]
-    primary_dns = dns_list[0] if dns_list else "http://seu-servidor.com:80"
+    primary_dns = dns_list[0] if dns_list else "http://zavryqonix.online:80"
 
     conn = get_main_db()
     existing = conn.execute("SELECT * FROM active_users WHERE username = ?", (username,)).fetchone()
@@ -444,7 +474,10 @@ def api_login():
             dns = "http://" + dns
         try:
             api_url = f"{dns}/player_api.php?username={urllib.parse.quote(username)}&password={urllib.parse.quote(password)}"
-            req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
+            req = urllib.request.Request(api_url, headers={
+                "User-Agent": "IPTVSmartersPro/3.1.5 (Linux; Android 12)",
+                "Accept": "*/*"
+            })
             with urllib.request.urlopen(req, timeout=7, context=SSL_CTX) as resp:
                 info = json.loads(resp.read().decode("utf-8", errors="ignore"))
                 u_info = info.get("user_info", {})
@@ -525,23 +558,27 @@ def api_request_trial():
 
     if trial_api_url:
         try:
-            req = urllib.request.Request(trial_api_url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=12, context=SSL_CTX) as resp:
+            req = urllib.request.Request(trial_api_url, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+            })
+            with urllib.request.urlopen(req, timeout=14, context=SSL_CTX) as resp:
                 raw_api_resp = resp.read().decode("utf-8", errors="ignore")
         except Exception:
             try:
                 req_post = urllib.request.Request(
                     trial_api_url,
                     data=b"{}",
-                    headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"},
+                    headers={
+                        "Content-Type": "application/json",
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+                    },
                     method="POST"
                 )
-                with urllib.request.urlopen(req_post, timeout=12, context=SSL_CTX) as resp2:
+                with urllib.request.urlopen(req_post, timeout=14, context=SSL_CTX) as resp2:
                     raw_api_resp = resp2.read().decode("utf-8", errors="ignore")
             except Exception:
                 pass
 
-    # Processamento 100% dinâmico da resposta do servidor
     parsed = parse_trial_response(raw_api_resp, cfg)
 
     if not parsed["username"]:
@@ -680,14 +717,14 @@ def api_update_adult_pin():
     return jsonify({"ok": True, "pin": new_pin})
 
 # ==========================================================
-# 7. FRONTEND OTIMIZADO STREAMFLIX v5.8 (M3U ULTRA-RÁPIDO)
+# 7. FRONTEND STREAMFLIX v5.9 COM CARREGAMENTO M3U IMEDIATO
 # ==========================================================
 HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-    <title>StreamFlix Pro v5.8</title>
+    <title>StreamFlix Pro v5.9</title>
     <script src="https://unpkg.com/lucide@latest"></script>
     <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
     <script src="https://cdn.jsdelivr.net/npm/mpegts.js@latest/dist/mpegts.js"></script>
@@ -805,7 +842,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .player-top { height:52px; background:rgba(10,10,15,0.9); border-bottom:1px solid var(--border); display:flex; align-items:center; justify-content:space-between; padding:0 1rem; z-index:20; }
         .video-stage { position:relative; flex:1; width:100%; overflow:hidden; background:#000; display:flex; align-items:center; justify-content:center; }
 
-        /* PREENCHER HORIZONTALMENTE SEM ZOOM */
         #video-player {
             width: 100vw;
             height: auto;
@@ -821,9 +857,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .player-btn.active { background:var(--primary); border-color:var(--primary); }
         .speed-btn { background:var(--bg-card); border:1px solid var(--border); color:var(--text-muted); font-size:0.7rem; font-weight:800; padding:0.28rem 0.55rem; border-radius:4px; cursor:pointer; }
         .speed-btn.active { background:var(--primary); color:#fff; border-color:var(--primary); }
-
-        .epg-bar { background:rgba(20,20,30,0.85); border-radius:6px; padding:0.45rem 0.75rem; font-size:0.75rem; display:none; justify-content:space-between; }
-        .epg-bar.active { display:flex; }
 
         .config-card { background:var(--bg-surface); border:1px solid var(--border); border-radius:var(--radius-lg); padding:1.2rem; margin-bottom:1rem; }
         .config-title { font-size:0.92rem; font-weight:800; color:var(--primary); margin-bottom:0.75rem; display:flex; align-items:center; gap:0.4rem; }
@@ -1214,7 +1247,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         }
         loadPublicConfig();
 
-        // HERO CAROUSEL 5s (EXCLUSIVO FILMES E SÉRIES - ZERO CANAIS E ZERO ADULTO)
         let heroItems = [];
         let heroIdx = 0;
         let heroMs = 0;
@@ -1239,9 +1271,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             document.getElementById("btn-hero-play").onclick = () => openItemPlay(it);
         }
 
-        // ==========================================================
-        // BANCO LOCAL INDEXEDDB PARA GUARDAR PLAYLIST GIGANTE
-        // ==========================================================
         function openIndexedDB() {
             return new Promise((resolve, reject) => {
                 const req = indexedDB.open("StreamFlix_V5_Store", 1);
@@ -1274,9 +1303,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             } catch (e) { return null; }
         }
 
-        // ==========================================================
-        // PARSER M3U ULTRA-RÁPIDO COM CLASSIFICAÇÃO INTELIGENTE
-        // ==========================================================
         function classifyItem(name, group, url) {
             const u = url.toLowerCase();
             const g = group.toLowerCase();
@@ -1329,7 +1355,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 }
             }
 
-            // Prepara destaques para Hero (Exclusivo Filmes e Séries - ZERO Adulto e ZERO TV)
             heroItems = [...catalog.movies, ...catalog.series].filter(it => !isAdultItem(it)).slice(0, 15);
             if (heroItems.length > 0) renderHeroSlide(heroItems[0]);
 
@@ -1343,7 +1368,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             cover.classList.add("active");
             msgEl.textContent = "Carregando canais e categorias do servidor...";
 
-            // 1. Tenta carregar do cache local primeiro para abrir instantâneo
             const cached = await loadCatalogFromDB();
             if (cached && cached.catalog && cached.catalog.tv.length > 0) {
                 catalog = cached.catalog;
@@ -1355,7 +1379,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 return;
             }
 
-            // 2. Baixa a playlist via VPS endpoint (zero CORS, zero bloqueio)
             let m3uUrl = (currentAuth && currentAuth.m3u_url) || "";
             if (!m3uUrl && currentAuth && currentAuth.username && currentAuth.password && currentAuth.dns) {
                 m3uUrl = `${currentAuth.dns}/get.php?username=${encodeURIComponent(currentAuth.username)}&password=${encodeURIComponent(currentAuth.password)}&type=m3u_plus&output=ts`;
@@ -1767,7 +1790,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             enterApp();
         };
 
-        // ENTRADA NO APP
         function enterApp() {
             document.getElementById("screen-login").classList.remove("active");
             document.getElementById("main-navbar").classList.remove("hidden");
@@ -1781,7 +1803,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             location.reload();
         };
 
-        // CARREGAMENTO MANUAL DE ARQUIVO .M3U
         const fileInput = document.getElementById("local-m3u-input");
         document.getElementById("btn-open-file-m3u").onclick = () => fileInput.click();
         fileInput.onchange = (e) => {
@@ -1800,7 +1821,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             r.readAsText(f);
         };
 
-        // ADMIN
         let adminPolling = null;
 
         document.getElementById("btn-go-admin").onclick = () => {
@@ -1892,7 +1912,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             alert("✅ Configurações salvas!");
         };
 
-        // AUTO-LOGIN
         if (currentAuth && currentAuth.username) enterApp();
     </script>
 </body>
