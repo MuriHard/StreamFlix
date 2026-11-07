@@ -235,7 +235,6 @@ def parse_trial_api_response(raw_text, cfg):
         "username": "",
         "password": "",
         "dns": fallback_dns,
-        "m3u_url": "",
         "plan_type": "Teste Grátis IPTV",
         "expires_at": fallback_exp_ts,
         "expires_formatted": fallback_exp_str,
@@ -257,7 +256,6 @@ def parse_trial_api_response(raw_text, cfg):
             sub = data.get("data") or data.get("result") or data.get("user_info") or data
             u = sub.get("username") or sub.get("user") or sub.get("login") or data.get("username")
             p = sub.get("password") or sub.get("pass") or sub.get("senha") or data.get("password")
-            m3u = sub.get("m3u_url") or sub.get("m3u") or sub.get("playlist_url") or sub.get("url") or data.get("m3u_url")
             dns = sub.get("dns") or sub.get("server") or data.get("dns")
             plan = sub.get("plan") or sub.get("plan_type") or sub.get("package") or sub.get("pacote") or data.get("plan")
             pay = sub.get("payment_link") or sub.get("checkout_url") or sub.get("pix_url") or sub.get("payment_url") or data.get("payment_link")
@@ -268,7 +266,6 @@ def parse_trial_api_response(raw_text, cfg):
 
             if u: res["username"] = str(u).strip()
             if p: res["password"] = str(p).strip()
-            if m3u: res["m3u_url"] = str(m3u).strip()
             if dns: res["dns"] = str(dns).strip().rstrip("/")
             if plan: res["plan_type"] = str(plan).strip()
             if pay: res["payment_link"] = str(pay).strip()
@@ -310,10 +307,6 @@ def parse_trial_api_response(raw_text, cfg):
     if plan_m:
         res["plan_type"] = plan_m.group(1).replace("*", "").strip()
 
-    if not res["m3u_url"]:
-        m3u_m = re.search(r"(https?://[^\s\"'<>]+(?:get\.php|\.m3u8?)[^\s\"'<>]*)", cleaned, re.I)
-        if m3u_m: res["m3u_url"] = m3u_m.group(1).strip()
-
     if not res["payment_link"]:
         pay_m = re.search(r"(https?://[^\s\"'<>]+(?:checkout|fatura|pagamento|mercadopago|pix|assinar|pay)[^\s\"'<>]*)", cleaned, re.I)
         if pay_m:
@@ -343,50 +336,10 @@ def parse_trial_api_response(raw_text, cfg):
     if dns_m and not res["dns"]:
         res["dns"] = dns_m.group(1).strip().rstrip("/")
 
-    if res["m3u_url"] and not res["dns"]:
-        dns_match = re.search(r"^(https?://[^/]+)", res["m3u_url"])
-        if dns_match: res["dns"] = dns_match.group(1).rstrip("/")
-
-    if not res["m3u_url"] and res["username"] and res["password"] and res["dns"]:
-        res["m3u_url"] = f"{res['dns']}/get.php?username={urllib.parse.quote(res['username'])}&password={urllib.parse.quote(res['password'])}&type=m3u_plus&output=ts"
-
     return res
 
 # ==========================================================
-# 4. DOWNLOAD E PROXY DE PLAYLIST M3U (ZERO CORS E ALTA VELOCIDADE)
-# ==========================================================
-@app.route("/api/playlist/download")
-def api_playlist_download():
-    m3u_url = request.args.get("url", "").strip()
-    if not m3u_url:
-        dns = request.args.get("dns", "").strip().rstrip("/")
-        u = request.args.get("username", "").strip()
-        p = request.args.get("password", "").strip()
-        if dns and u and p:
-            if not dns.startswith("http://") and not dns.startswith("https://"):
-                dns = "http://" + dns
-            m3u_url = f"{dns}/get.php?username={urllib.parse.quote(u)}&password={urllib.parse.quote(p)}&type=m3u_plus&output=ts"
-
-    if not m3u_url:
-        return jsonify({"ok": False, "error": "URL da playlist não informada"}), 400
-
-    try:
-        req = urllib.request.Request(m3u_url, headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-            "Accept": "*/*"
-        })
-        with urllib.request.urlopen(req, timeout=60, context=SSL_CTX) as resp:
-            content = resp.read()
-            try:
-                text = content.decode("utf-8")
-            except Exception:
-                text = content.decode("latin-1", errors="ignore")
-            return Response(text, mimetype="text/plain; charset=utf-8")
-    except Exception as e:
-        return jsonify({"ok": False, "error": f"Falha ao conectar no servidor IPTV: {str(e)}"}), 502
-
-# ==========================================================
-# 5. MONITORAMENTO EM TEMPO REAL
+# 4. MONITORAMENTO EM TEMPO REAL
 # ==========================================================
 @app.route("/api/monitor/heartbeat", methods=["POST"])
 def api_monitor_heartbeat():
@@ -424,7 +377,7 @@ def api_monitor_heartbeat():
     return jsonify({"ok": True})
 
 # ==========================================================
-# 6. ROTAS DE LOGIN, TESTE GRÁTIS E ADMINISTRAÇÃO
+# 5. ROTAS DE LOGIN, TESTE GRÁTIS E ADMINISTRAÇÃO
 # ==========================================================
 @app.route("/api/config")
 def api_config():
@@ -610,7 +563,6 @@ def api_request_trial():
             "username": parsed["username"],
             "password": parsed["password"],
             "dns": parsed["dns"],
-            "m3u_url": parsed["m3u_url"],
             "plan_type": parsed["plan_type"],
             "expires_at": parsed["expires_at"],
             "expires_formatted": parsed["expires_formatted"],
@@ -654,7 +606,7 @@ def api_check_session():
         })
     return jsonify({"valid": True, "expired": False, "remaining_seconds": 86400})
 
-# --- GESTÃO ADMIN ---
+# --- GESTÃO ADMIN COM PURGE TOTAL DE REGISTROS ---
 @app.route("/api/admin/login", methods=["POST"])
 def api_admin_login():
     data = request.get_json(silent=True) or {}
@@ -692,14 +644,64 @@ def api_admin_data():
         "monitoring": active_monitoring
     })
 
+def purge_device_and_trials(target_mac=None, target_ip=None, target_username=None, dev_id=None):
+    """Limpa COMPLETAMENTE o dispositivo de ambos os bancos para permitir novo teste imediato."""
+    conn1 = get_main_db()
+    conn2 = get_devices_db()
+
+    # Busca dados adicionais se só temos dev_id
+    if dev_id and (not target_mac or not target_ip):
+        r = conn2.execute("SELECT * FROM devices WHERE id = ?", (dev_id,)).fetchone()
+        if r:
+            target_mac = r["mac"] or target_mac
+            target_ip = r["ip"] or target_ip
+            target_username = r["username"] or target_username
+
+    # 1. Apaga do banco 1 (streamflix.db)
+    if target_mac or target_ip or target_username:
+        conn1.execute("""DELETE FROM trial_records WHERE 
+            (? IS NOT NULL AND device_mac = ?) OR 
+            (? IS NOT NULL AND ip_address = ?) OR 
+            (? IS NOT NULL AND username = ?)""",
+            (target_mac, target_mac, target_ip, target_ip, target_username, target_username))
+        
+        if target_username:
+            conn1.execute("DELETE FROM active_users WHERE username = ?", (target_username,))
+        conn1.commit()
+
+    # 2. Apaga do banco 2 (devices_tracking.db)
+    if dev_id:
+        conn2.execute("DELETE FROM devices WHERE id = ?", (dev_id,))
+    if target_mac:
+        conn2.execute("DELETE FROM devices WHERE mac = ?", (target_mac,))
+        conn2.execute("DELETE FROM active_monitoring WHERE mac = ?", (target_mac,))
+    if target_ip:
+        conn2.execute("DELETE FROM devices WHERE ip = ?", (target_ip,))
+        conn2.execute("DELETE FROM active_monitoring WHERE ip = ?", (target_ip,))
+    if target_username:
+        conn2.execute("DELETE FROM devices WHERE username = ?", (target_username,))
+        conn2.execute("DELETE FROM active_monitoring WHERE username = ?", (target_username,))
+    conn2.commit()
+
+    conn1.close()
+    conn2.close()
+
 @app.route("/api/admin/delete-device/<int:device_id>", methods=["DELETE"])
 def api_admin_delete_device(device_id):
     if not session.get("is_admin"):
         return jsonify({"ok": False}), 401
-    conn = get_devices_db()
-    conn.execute("DELETE FROM devices WHERE id = ?", (device_id,))
-    conn.commit()
-    conn.close()
+    purge_device_and_trials(dev_id=device_id)
+    return jsonify({"ok": True})
+
+@app.route("/api/admin/delete-trial/<int:trial_id>", methods=["DELETE"])
+def api_admin_delete_trial(trial_id):
+    if not session.get("is_admin"):
+        return jsonify({"ok": False}), 401
+    conn1 = get_main_db()
+    r = conn1.execute("SELECT * FROM trial_records WHERE id = ?", (trial_id,)).fetchone()
+    conn1.close()
+    if r:
+        purge_device_and_trials(target_mac=r["device_mac"], target_ip=r["ip_address"], target_username=r["username"])
     return jsonify({"ok": True})
 
 @app.route("/api/admin/save", methods=["POST"])
@@ -719,7 +721,7 @@ def api_update_adult_pin():
     return jsonify({"ok": True, "pin": new_pin})
 
 # ==========================================================
-# 7. FRONTEND BASEADO NA VERSÃO COMPROVADA v5 COM CONTROLES
+# 6. FRONTEND ESTILO NETFLIX COM CONTROLES MINIMALISTAS SLIM
 # ==========================================================
 HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="pt-BR">
@@ -737,13 +739,15 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             --bg-card: #12121a;
             --bg-glass: rgba(10, 10, 15, 0.94);
             --primary: #e50914;
+            --primary-glow: rgba(229, 9, 20, 0.4);
             --gold: #f59e0b;
             --success: #10b981;
             --text-main: #ffffff;
             --text-muted: #94a3b8;
             --border: #1e1e2c;
-            --radius-md: 10px;
-            --radius-lg: 16px;
+            --radius-pill: 9999px;
+            --radius-md: 14px;
+            --radius-lg: 20px;
         }
         body.theme-midnight {
             --bg-base: #05070f;
@@ -757,36 +761,90 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .screen.active { display:block; }
         .hidden { display:none !important; }
 
+        /* BOTÕES REDONDOS MINIMALISTAS ELEGANTES */
+        .btn-pill {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.45rem;
+            padding: 0.65rem 1.35rem;
+            border-radius: var(--radius-pill);
+            font-size: 0.84rem;
+            font-weight: 700;
+            cursor: pointer;
+            border: 1px solid transparent;
+            transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+            text-decoration: none;
+        }
+        .btn-pill-primary {
+            background: var(--primary);
+            color: #fff;
+            box-shadow: 0 4px 16px var(--primary-glow);
+        }
+        .btn-pill-primary:active { transform: scale(0.97); }
+        .btn-pill-success {
+            background: linear-gradient(135deg, #10b981, #059669);
+            color: #fff;
+            box-shadow: 0 4px 16px rgba(16, 185, 129, 0.35);
+        }
+        .btn-pill-outline {
+            background: rgba(255, 255, 255, 0.05);
+            border-color: rgba(255, 255, 255, 0.14);
+            color: #cbd5e1;
+        }
+        .btn-pill-outline:hover, .btn-pill-outline:active {
+            background: rgba(255, 255, 255, 0.12);
+            color: #fff;
+        }
+
+        /* TELA DE LOGIN */
         #screen-login { display:none; align-items:center; justify-content:center; padding:1.2rem; min-height:100vh; background:radial-gradient(circle at top, #240508 0%, #000 75%); }
         #screen-login.active { display:flex; }
-        .login-box { background:var(--bg-surface); border:1px solid var(--border); border-radius:var(--radius-lg); padding:2rem 1.6rem; width:100%; max-width:410px; box-shadow:0 25px 60px rgba(0,0,0,0.95); }
-        .brand-title { font-size:1.65rem; font-weight:900; text-align:center; letter-spacing:0.8px; margin-bottom:0.2rem; }
+        .login-box { background:var(--bg-surface); border:1px solid var(--border); border-radius:var(--radius-lg); padding:2rem 1.6rem; width:100%; max-width:390px; box-shadow:0 25px 60px rgba(0,0,0,0.95); text-align:center; }
+        .brand-title { font-size:1.65rem; font-weight:900; letter-spacing:0.8px; margin-bottom:0.2rem; }
         .brand-title span { color:var(--primary); }
-        .brand-sub { text-align:center; color:var(--text-muted); font-size:0.8rem; margin-bottom:1.5rem; }
-        .form-group { margin-bottom:1rem; }
-        .form-group label { display:block; font-size:0.74rem; font-weight:800; color:var(--text-muted); margin-bottom:0.35rem; text-transform:uppercase; }
-        .input-wrap { display:flex; align-items:center; background:var(--bg-card); border:1px solid var(--border); border-radius:var(--radius-md); padding:0 0.8rem; }
-        .input-wrap input, .input-wrap textarea { width:100%; background:transparent; border:none; outline:none; padding:0.85rem 0.5rem; color:#fff; font-size:0.92rem; }
-        .btn-primary { width:100%; padding:0.92rem; background:var(--primary); border:none; border-radius:var(--radius-md); color:#fff; font-size:0.95rem; font-weight:800; cursor:pointer; }
-        .btn-trial { width:100%; padding:0.9rem; margin-top:0.75rem; background:linear-gradient(135deg, #10b981, #059669); border:none; border-radius:var(--radius-md); color:#fff; font-size:0.92rem; font-weight:800; cursor:pointer; }
+        .brand-sub { color:var(--text-muted); font-size:0.8rem; margin-bottom:1.5rem; }
+        .form-group { margin-bottom:1rem; text-align:left; }
+        .form-group label { display:block; font-size:0.72rem; font-weight:800; color:var(--text-muted); margin-bottom:0.35rem; text-transform:uppercase; letter-spacing:0.4px; }
+        .input-wrap { display:flex; align-items:center; background:var(--bg-card); border:1px solid var(--border); border-radius:var(--radius-pill); padding:0 1rem; }
+        .input-wrap input, .input-wrap textarea { width:100%; background:transparent; border:none; outline:none; padding:0.75rem 0.4rem; color:#fff; font-size:0.9rem; }
 
-        .modal-sheet { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.94); backdrop-filter:blur(10px); z-index:500; align-items:center; justify-content:center; padding:1rem; }
-        .modal-sheet.active { display:flex; }
-        .modal-box { background:var(--bg-surface); border:1px solid var(--success); border-radius:var(--radius-lg); width:100%; max-width:460px; padding:1.4rem; max-height:92vh; overflow-y:auto; }
-        .trial-info-list { background:var(--bg-card); border:1px solid var(--border); border-radius:var(--radius-md); padding:0.9rem; margin:0.9rem 0; font-size:0.82rem; display:flex; flex-direction:column; gap:0.6rem; }
+        /* MODAL COM ANIMAÇÃO IMERSIVA DO TESTE GRÁTIS GERADO */
+        .modal-sheet { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.88); backdrop-filter:blur(10px); z-index:500; align-items:center; justify-content:center; padding:1rem; }
+        .modal-sheet.active { display:flex; animation:fadeIn 0.25s ease forwards; }
+
+        @keyframes cardPop {
+            0% { opacity:0; transform:scale(0.85) translateY(24px); }
+            100% { opacity:1; transform:scale(1) translateY(0); }
+        }
+        @keyframes fadeIn {
+            0% { opacity:0; }
+            100% { opacity:1; }
+        }
+
+        .modal-box {
+            background: var(--bg-surface);
+            border: 1px solid var(--success);
+            border-radius: var(--radius-lg);
+            width: 100%;
+            max-width: 450px;
+            padding: 1.5rem;
+            max-height: 92vh;
+            overflow-y: auto;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.95), 0 0 35px rgba(16, 185, 129, 0.22);
+            animation: cardPop 0.32s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+        }
+        .trial-info-list { background:var(--bg-card); border:1px solid var(--border); border-radius:16px; padding:0.9rem 1rem; margin:0.9rem 0; font-size:0.82rem; display:flex; flex-direction:column; gap:0.6rem; text-align:left; }
         .trial-row { display:flex; flex-direction:column; gap:0.2rem; border-bottom:1px dashed #202434; padding-bottom:0.45rem; }
         .trial-row:last-child { border-bottom:none; padding-bottom:0; }
-        .trial-row strong { color:var(--text-muted); font-size:0.72rem; text-transform:uppercase; letter-spacing:0.4px; }
+        .trial-row strong { color:var(--text-muted); font-size:0.7rem; text-transform:uppercase; letter-spacing:0.4px; }
         .trial-row-val { display:flex; justify-content:space-between; align-items:center; color:#fff; font-weight:700; word-break:break-all; }
-        .btn-copy-mini { background:rgba(255,255,255,0.1); border:1px solid rgba(255,255,255,0.2); color:#fff; padding:0.25rem 0.5rem; border-radius:4px; font-size:0.7rem; cursor:pointer; flex-shrink:0; margin-left:0.5rem; }
-        .trial-app-box { background:rgba(255,255,255,0.03); border:1px solid var(--border); border-radius:6px; padding:0.45rem 0.6rem; font-size:0.76rem; color:#cbd5e1; white-space:pre-wrap; line-height:1.4; }
-        .trial-btns { display:grid; grid-template-columns:1fr 1fr; gap:0.55rem; margin-bottom:0.75rem; }
-        .btn-outline { background:var(--bg-card); border:1px solid var(--border); color:#fff; padding:0.75rem; border-radius:8px; font-size:0.8rem; font-weight:700; text-decoration:none; text-align:center; cursor:pointer; }
-        .btn-pay-highlight { background:linear-gradient(135deg, #f59e0b, #d97706); color:#000; font-weight:900; border:none; padding:0.75rem; border-radius:8px; font-size:0.85rem; cursor:pointer; text-align:center; text-decoration:none; display:block; margin-bottom:0.6rem; }
+        .btn-copy-mini { background:rgba(255,255,255,0.08); border:1px solid rgba(255,255,255,0.18); color:#fff; padding:0.2rem 0.6rem; border-radius:var(--radius-pill); font-size:0.68rem; cursor:pointer; flex-shrink:0; margin-left:0.5rem; font-weight:700; }
+        .trial-app-box { background:rgba(255,255,255,0.03); border:1px solid var(--border); border-radius:12px; padding:0.55rem 0.75rem; font-size:0.76rem; color:#cbd5e1; white-space:pre-wrap; line-height:1.45; word-break:break-word; }
 
+        /* TOPBAR & NAVEGAÇÃO */
         .navbar { height:58px; background:var(--bg-glass); backdrop-filter:blur(12px); border-bottom:1px solid var(--border); display:flex; align-items:center; justify-content:space-between; padding:0 1rem; position:sticky; top:0; z-index:120; }
         .nav-left { display:flex; align-items:center; gap:0.6rem; }
-        .btn-nav-back { background:var(--bg-card); border:1px solid var(--border); color:#fff; padding:0.38rem 0.65rem; border-radius:8px; font-size:0.76rem; font-weight:700; cursor:pointer; display:inline-flex; align-items:center; gap:0.3rem; }
         .nav-brand { font-weight:900; font-size:1.18rem; letter-spacing:0.5px; }
         .nav-brand span { color:var(--primary); }
 
@@ -794,7 +852,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .hero-box { position:relative; border-radius:var(--radius-lg); overflow:hidden; height:280px; background:#07070c; border:1px solid var(--border); margin-bottom:1.4rem; }
         .hero-bg { position:absolute; inset:0; background-size:cover; background-position:center; transition:background-image 0.4s ease; }
         .hero-overlay { position:absolute; inset:0; background:linear-gradient(0deg, #000 14%, rgba(0,0,0,0.65) 60%, rgba(0,0,0,0.2) 100%); display:flex; flex-direction:column; justify-content:flex-end; padding:1.25rem; }
-        .hero-tag { align-self:flex-start; background:var(--primary); color:#fff; font-size:0.65rem; font-weight:800; text-transform:uppercase; padding:0.2rem 0.55rem; border-radius:20px; margin-bottom:0.4rem; }
+        .hero-tag { align-self:flex-start; background:var(--primary); color:#fff; font-size:0.65rem; font-weight:800; text-transform:uppercase; padding:0.2rem 0.65rem; border-radius:var(--radius-pill); margin-bottom:0.4rem; }
         .hero-title { font-size:1.35rem; font-weight:900; margin-bottom:0.2rem; }
         .hero-meta { font-size:0.78rem; color:#cbd5e1; margin-bottom:0.85rem; }
         .hero-timer { position:absolute; bottom:0; left:0; right:0; height:4px; background:rgba(255,255,255,0.15); }
@@ -806,62 +864,217 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .vod-carousel { display:flex; gap:0.75rem; overflow-x:auto; padding-bottom:0.4rem; scrollbar-width:none; min-height:160px; }
         .vod-carousel::-webkit-scrollbar { display:none; }
 
-        .poster-card { position:relative; flex:0 0 134px; background:var(--bg-surface); border:1px solid var(--border); border-radius:10px; overflow:hidden; cursor:pointer; }
+        .poster-card { position:relative; flex:0 0 134px; background:var(--bg-surface); border:1px solid var(--border); border-radius:14px; overflow:hidden; cursor:pointer; transition:transform 0.15s, border-color 0.15s; }
         .poster-card:active { transform:scale(0.96); border-color:var(--primary); }
         .poster-aspect { position:relative; width:100%; aspect-ratio:2 / 3; background:#050509; overflow:hidden; }
         .poster-aspect img { width:100%; height:100%; object-fit:cover; display:block; }
-        .poster-badge { position:absolute; top:6px; left:6px; background:rgba(229,9,20,0.92); color:#fff; font-size:0.56rem; font-weight:800; padding:2px 5px; border-radius:4px; text-transform:uppercase; }
+        .poster-badge { position:absolute; top:6px; left:6px; background:rgba(229,9,20,0.92); color:#fff; font-size:0.56rem; font-weight:800; padding:2px 6px; border-radius:var(--radius-pill); text-transform:uppercase; }
         .poster-info { padding:0.5rem; }
         .poster-info h4 { font-size:0.76rem; font-weight:700; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
         .poster-info span { font-size:0.66rem; color:var(--text-muted); display:block; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 
+        /* DRAWER LATERAL OCULTO */
         .drawer-backdrop { position:fixed; inset:0; background:rgba(0,0,0,0.85); z-index:300; opacity:0; pointer-events:none; transition:opacity 0.25s; }
         .drawer-backdrop.active { opacity:1; pointer-events:auto; }
         .drawer-panel { position:fixed; top:0; left:0; bottom:0; width:290px; max-width:85vw; background:#07070c; border-right:1px solid var(--border); z-index:310; transform:translateX(-100%); transition:transform 0.28s ease; display:flex; flex-direction:column; }
         .drawer-panel.active { transform:translateX(0); }
         .drawer-header { height:58px; padding:0 1rem; border-bottom:1px solid var(--border); display:flex; align-items:center; justify-content:space-between; }
         .drawer-list { flex:1; overflow-y:auto; padding:0.6rem; display:flex; flex-direction:column; gap:0.35rem; }
-        .drawer-item { padding:0.75rem 0.85rem; border-radius:8px; color:var(--text-muted); background:transparent; border:none; text-align:left; font-size:0.85rem; font-weight:700; cursor:pointer; display:flex; justify-content:space-between; align-items:center; }
+        .drawer-item { padding:0.7rem 0.9rem; border-radius:var(--radius-pill); color:var(--text-muted); background:transparent; border:none; text-align:left; font-size:0.84rem; font-weight:700; cursor:pointer; display:flex; justify-content:space-between; align-items:center; }
         .drawer-item.active { background:var(--primary); color:#fff; }
 
         .posters-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(122px, 1fr)); gap:0.75rem; padding-bottom:1.5rem; min-height:200px; }
         .posters-grid .poster-card { flex:unset; width:100%; }
 
-        .tmdb-modal { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.92); backdrop-filter:blur(10px); z-index:450; align-items:center; justify-content:center; padding:1rem; }
-        .tmdb-modal.active { display:flex; }
-        .tmdb-box { background:var(--bg-surface); border:1px solid var(--border); border-radius:var(--radius-lg); width:100%; max-width:520px; max-height:92vh; overflow-y:auto; position:relative; }
-        .tmdb-hero { height:180px; background-size:cover; background-position:center; position:relative; }
-        .tmdb-hero-overlay { position:absolute; inset:0; background:linear-gradient(0deg, var(--bg-surface) 10%, transparent 100%); }
-        .tmdb-content { padding:1.2rem; }
+        /* MODAL SÉRIES COM TEMPORADAS E EPISÓDIOS */
+        .series-modal { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.92); backdrop-filter:blur(10px); z-index:450; align-items:center; justify-content:center; padding:1rem; }
+        .series-modal.active { display:flex; animation:fadeIn 0.2s ease forwards; }
+        .series-box { background:var(--bg-surface); border:1px solid var(--border); border-radius:var(--radius-lg); width:100%; max-width:540px; max-height:92vh; overflow-y:auto; position:relative; }
+        .series-hero { height:180px; background-size:cover; background-position:center; position:relative; }
+        .series-hero-overlay { position:absolute; inset:0; background:linear-gradient(0deg, var(--bg-surface) 10%, transparent 100%); }
+        .series-content { padding:1.2rem; }
+        .seasons-bar { display:flex; gap:0.4rem; overflow-x:auto; padding-bottom:0.5rem; margin:0.8rem 0; scrollbar-width:none; }
+        .seasons-bar::-webkit-scrollbar { display:none; }
+        .season-pill { background:var(--bg-card); border:1px solid var(--border); color:var(--text-muted); padding:0.35rem 0.85rem; border-radius:var(--radius-pill); font-size:0.76rem; font-weight:700; cursor:pointer; white-space:nowrap; }
+        .season-pill.active { background:var(--primary); color:#fff; border-color:var(--primary); }
+        .episodes-list { display:flex; flex-direction:column; gap:0.5rem; max-height:280px; overflow-y:auto; }
+        .episode-card { display:flex; align-items:center; justify-content:space-between; gap:0.6rem; padding:0.6rem 0.8rem; background:var(--bg-card); border:1px solid var(--border); border-radius:12px; cursor:pointer; }
+        .episode-card:active { border-color:var(--primary); }
 
+        /* BOTTOM NAVIGATION BAR */
         .bottom-nav { position:fixed; bottom:0; left:0; right:0; height:66px; background:rgba(8,8,12,0.96); backdrop-filter:blur(16px); border-top:1px solid var(--border); display:none; align-items:center; justify-content:space-around; z-index:200; }
         .bottom-nav.active { display:flex; }
         .bnav-item { background:transparent; border:none; color:var(--text-muted); display:flex; flex-direction:column; align-items:center; justify-content:center; gap:0.2rem; font-size:0.68rem; font-weight:700; cursor:pointer; flex:1; height:100%; }
         .bnav-item.active { color:var(--primary); }
 
-        .player-modal { display:none; position:fixed; inset:0; background:#000; z-index:600; flex-direction:column; }
+        /* PLAYER DE VÍDEO COMPLETO E SLIM */
+        .player-modal { display:none; position:fixed; inset:0; background:#000; z-index:600; flex-direction:column; overflow:hidden; }
         .player-modal.active { display:flex; }
-        .player-top { height:52px; background:rgba(10,10,15,0.9); border-bottom:1px solid var(--border); display:flex; align-items:center; justify-content:space-between; padding:0 1rem; z-index:20; }
-        .video-stage { position:relative; flex:1; width:100%; overflow:hidden; background:#000; display:flex; align-items:center; justify-content:center; }
+        .video-stage { position:relative; flex:1; width:100%; height:100%; overflow:hidden; background:#000; display:flex; align-items:center; justify-content:center; }
 
-        /* PREENCHER HORIZONTALMENTE SEM ZOOM */
         #video-player {
-            width: 100vw;
-            height: auto;
-            max-height: 100%;
-            object-fit: fill;
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
             background: #000;
         }
-        #video-player.mode-fit { object-fit: contain; width: 100%; height: 100%; }
+        #video-player.mode-fill-horizontal {
+            width: 100vw;
+            height: 100%;
+            object-fit: cover;
+        }
 
-        .player-controls-deck { padding:0.75rem 1rem; background:rgba(10,10,15,0.95); border-top:1px solid var(--border); display:flex; flex-direction:column; gap:0.6rem; z-index:20; }
-        .deck-row { display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:0.5rem; }
-        .player-btn { background:var(--bg-card); border:1px solid var(--border); color:#fff; font-size:0.75rem; font-weight:800; padding:0.42rem 0.72rem; border-radius:6px; cursor:pointer; display:inline-flex; align-items:center; gap:0.35rem; }
-        .player-btn.active { background:var(--primary); border-color:var(--primary); }
-        .speed-btn { background:var(--bg-card); border:1px solid var(--border); color:var(--text-muted); font-size:0.7rem; font-weight:800; padding:0.28rem 0.55rem; border-radius:4px; cursor:pointer; }
-        .speed-btn.active { background:var(--primary); color:#fff; border-color:var(--primary); }
+        /* OVERLAY DO BOTÃO PLAY CENTRAL (QUANDO AUTOPLAY FOR BLOQUEADO PELO NAVEGADOR) */
+        .center-play-overlay {
+            position: absolute;
+            inset: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: rgba(0,0,0,0.45);
+            z-index: 40;
+            cursor: pointer;
+        }
+        .center-play-circle {
+            width: 64px;
+            height: 64px;
+            border-radius: 50%;
+            background: rgba(229, 9, 20, 0.9);
+            color: #fff;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.6rem;
+            box-shadow: 0 0 25px var(--primary-glow);
+            transition: transform 0.2s;
+        }
+        .center-play-circle:active { transform: scale(0.92); }
 
-        .epg-bar { background:rgba(20,20,30,0.85); border-radius:6px; padding:0.45rem 0.75rem; font-size:0.75rem; display:none; justify-content:space-between; }
+        /* TOPO SLIM DO PLAYER */
+        .player-top-slim {
+            position: absolute;
+            top: 14px;
+            left: 14px;
+            right: 14px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            z-index: 50;
+            pointer-events: none;
+            transition: opacity 0.3s ease;
+        }
+        .player-top-slim > * { pointer-events: auto; }
+        .player-title-badge {
+            background: rgba(10, 10, 16, 0.6);
+            backdrop-filter: blur(12px);
+            border: 1px solid rgba(255,255,255,0.1);
+            color: #fff;
+            font-size: 0.78rem;
+            font-weight: 700;
+            padding: 0.35rem 0.85rem;
+            border-radius: var(--radius-pill);
+            max-width: 65vw;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        /* DOCK MINIMALISTA SLIM (UMA LINHA COM BOTÕES REDONDOS PEQUENOS E SUAVES) */
+        .player-dock-wrap {
+            position: absolute;
+            bottom: 16px;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            z-index: 55;
+            transition: opacity 0.3s ease;
+            max-width: 95vw;
+        }
+        .player-dock {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 5px 10px;
+            background: rgba(12, 12, 18, 0.45);
+            backdrop-filter: blur(14px);
+            -webkit-backdrop-filter: blur(14px);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: var(--radius-pill);
+            box-shadow: 0 8px 30px rgba(0, 0, 0, 0.7);
+            transition: all 0.25s ease;
+        }
+        .player-dock:hover, .player-dock:active, .player-dock.active {
+            background: rgba(12, 12, 18, 0.88);
+            border-color: rgba(255, 255, 255, 0.2);
+        }
+        .mini-btn {
+            width: 36px;
+            height: 36px;
+            border-radius: 50%;
+            background: rgba(255, 255, 255, 0.06);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            color: #cbd5e1;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            font-size: 0.76rem;
+            font-weight: 800;
+            transition: all 0.18s ease;
+            position: relative;
+        }
+        .mini-btn:active, .mini-btn.active {
+            background: var(--primary);
+            color: #fff;
+            border-color: var(--primary);
+            box-shadow: 0 0 12px var(--primary-glow);
+        }
+
+        /* POPUP BUBBLE FLUTUANTE QUE APARECE POR CIMA AO CLICAR NO BOTÃO */
+        .dock-bubble {
+            position: absolute;
+            bottom: 50px;
+            left: 50%;
+            transform: translateX(-50%) translateY(8px);
+            background: rgba(10, 10, 16, 0.95);
+            backdrop-filter: blur(16px);
+            border: 1px solid rgba(255, 255, 255, 0.14);
+            border-radius: 16px;
+            padding: 6px;
+            display: none;
+            flex-direction: column;
+            gap: 4px;
+            box-shadow: 0 14px 35px rgba(0,0,0,0.9);
+            min-width: 140px;
+            z-index: 60;
+        }
+        .dock-bubble.open {
+            display: flex;
+            animation: fadeIn 0.18s ease forwards;
+        }
+        .bubble-item {
+            padding: 0.45rem 0.8rem;
+            border-radius: var(--radius-pill);
+            color: #cbd5e1;
+            background: transparent;
+            border: none;
+            font-size: 0.76rem;
+            font-weight: 700;
+            cursor: pointer;
+            text-align: left;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        .bubble-item:active, .bubble-item.active {
+            background: var(--primary);
+            color: #fff;
+        }
+
+        /* EPG BAR */
+        .epg-bar { background:rgba(20,20,30,0.85); border-radius:var(--radius-pill); padding:0.45rem 0.85rem; font-size:0.75rem; display:none; justify-content:space-between; margin-bottom:6px; max-width:85vw; }
         .epg-bar.active { display:flex; }
 
         .config-card { background:var(--bg-surface); border:1px solid var(--border); border-radius:var(--radius-lg); padding:1.2rem; margin-bottom:1rem; }
@@ -870,7 +1083,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .admin-table { width:100%; border-collapse:collapse; font-size:0.76rem; margin-top:0.7rem; }
         .admin-table th, .admin-table td { border-bottom:1px solid var(--border); padding:0.55rem 0.5rem; text-align:left; }
         .admin-table th { color:var(--text-muted); text-transform:uppercase; font-size:0.68rem; }
-        .badge-live { background:rgba(239,68,68,0.2); color:#f87171; border:1px solid #ef4444; padding:2px 6px; border-radius:10px; font-weight:800; font-size:0.65rem; }
+        .badge-live { background:rgba(239,68,68,0.2); color:#f87171; border:1px solid #ef4444; padding:2px 8px; border-radius:var(--radius-pill); font-weight:800; font-size:0.65rem; }
 
         .loading-cover { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.82); backdrop-filter:blur(5px); z-index:900; align-items:center; justify-content:center; flex-direction:column; gap:0.8rem; }
         .loading-cover.active { display:flex; }
@@ -887,7 +1100,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
     <div id="loading-cover" class="loading-cover">
         <div class="spinner"></div>
-        <span id="loading-msg" style="font-size:0.88rem; color:#e2e8f0; font-weight:700;">Sincronizando conteúdos com o servidor...</span>
+        <span id="loading-msg" style="font-size:0.88rem; color:#e2e8f0; font-weight:700;">Conectando ao servidor IPTV...</span>
     </div>
 
     <!-- 1. LOGIN -->
@@ -898,18 +1111,16 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             <form id="form-login">
                 <div class="form-group"><label>Usuário</label><div class="input-wrap"><input type="text" id="l-user" required></div></div>
                 <div class="form-group"><label>Senha</label><div class="input-wrap"><input type="password" id="l-pass" required></div></div>
-                <button type="submit" class="btn-primary">Entrar e Assistir</button>
+                <button type="submit" class="btn-pill btn-pill-primary" style="width:100%; margin-top:0.4rem;">Entrar e Assistir</button>
             </form>
-            <button type="button" class="btn-trial" id="btn-trial">⚡ Gerar Teste Grátis Automático</button>
-            <div style="display:flex; justify-content:space-between; margin-top:1.2rem; font-size:0.74rem; color:var(--text-muted);">
-                <span id="btn-open-file-m3u" style="cursor:pointer; text-decoration:underline;">Importar arquivo .M3U</span>
+            <button type="button" class="btn-pill btn-pill-success" id="btn-trial" style="width:100%; margin-top:0.75rem;">⚡ Gerar Teste Grátis Automático</button>
+            <div style="display:flex; justify-content:flex-end; margin-top:1.2rem; font-size:0.74rem; color:var(--text-muted);">
                 <span id="btn-go-admin" style="cursor:pointer;">Área Admin</span>
             </div>
-            <input type="file" id="local-m3u-input" accept=".m3u,.m3u8,.txt" class="hidden">
         </div>
     </div>
 
-    <!-- 2. CARD DO TESTE GRÁTIS GERADO DINAMICAMENTE -->
+    <!-- 2. CARD DO TESTE GRÁTIS GERADO DINAMICAMENTE (COM ANIMAÇÃO DE POPUP) -->
     <div id="trial-modal" class="modal-sheet">
         <div class="modal-box">
             <h3 style="color:var(--success); font-size:1.15rem; font-weight:900; margin-bottom:0.25rem;">✅ Teste Grátis Liberado!</h3>
@@ -946,24 +1157,24 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 </div>
             </div>
 
-            <a href="#" target="_blank" class="btn-pay-highlight hidden" id="btn-pay-link">💳 Pagar / Assinar Plano Oficial</a>
+            <a href="#" target="_blank" class="btn-pill btn-pill-primary hidden" id="btn-pay-link" style="width:100%; margin-bottom:0.6rem; background:linear-gradient(135deg, #f59e0b, #d97706); color:#000; font-weight:900;">💳 Pagar / Assinar Plano Oficial</a>
 
-            <div class="trial-btns">
-                <button type="button" class="btn-outline" id="btn-copy-tr">📋 Copiar Todos os Dados</button>
-                <a href="#" target="_blank" class="btn-outline" id="btn-wa-tr" style="background:rgba(37,211,102,0.18); border-color:#25d366; color:#4ade80;">📲 WhatsApp</a>
+            <div style="display:grid; grid-template-columns:1fr 1fr; gap:0.55rem; margin-bottom:0.65rem;">
+                <button type="button" class="btn-pill btn-pill-outline" id="btn-copy-tr">📋 Copiar Dados</button>
+                <a href="#" target="_blank" class="btn-pill btn-pill-outline" id="btn-wa-tr" style="background:rgba(37,211,102,0.18); border-color:#25d366; color:#4ade80;">📲 WhatsApp</a>
             </div>
-            <button type="button" class="btn-primary" id="btn-proceed-tr" style="background:var(--success);">▶ Prosseguir e Assistir Agora</button>
+            <button type="button" class="btn-pill btn-pill-success" id="btn-proceed-tr" style="width:100%;">▶ Prosseguir e Assistir Agora</button>
         </div>
     </div>
 
     <!-- 3. TOPBAR GERAL -->
     <header class="navbar hidden" id="main-navbar">
         <div class="nav-left">
-            <button class="btn-nav-back hidden" id="btn-global-back">‹ Voltar</button>
+            <button class="btn-pill btn-pill-outline hidden" id="btn-global-back" style="padding:0.35rem 0.75rem; font-size:0.75rem;">‹ Voltar</button>
             <div class="nav-brand">STREAM<span>FLIX</span></div>
         </div>
         <div style="display:flex; gap:0.4rem; align-items:center;">
-            <button class="btn-nav-back" id="btn-open-drawer">📂 Categorias</button>
+            <button class="btn-pill btn-pill-outline" id="btn-open-drawer" style="padding:0.35rem 0.75rem; font-size:0.75rem;">📂 Categorias</button>
         </div>
     </header>
 
@@ -972,7 +1183,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <aside class="drawer-panel" id="drawer-panel">
         <div class="drawer-header">
             <strong style="font-size:0.9rem;" id="drawer-title">Categorias</strong>
-            <button class="btn-nav-back" id="btn-close-drawer">✕ Fechar</button>
+            <button class="btn-pill btn-pill-outline" id="btn-close-drawer" style="padding:0.3rem 0.65rem; font-size:0.72rem;">✕ Fechar</button>
         </div>
         <div class="drawer-list" id="drawer-list"></div>
     </aside>
@@ -987,7 +1198,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     <span class="hero-tag">RECÉM ADICIONADO (5s)</span>
                     <h2 class="hero-title" id="hero-title">Carregando Destaques...</h2>
                     <p class="hero-meta" id="hero-meta">Prévia automática exclusiva de Filmes e Séries</p>
-                    <button class="btn-primary" id="btn-hero-play" style="width:auto; padding:0.6rem 1.2rem;">▶ Assistir Agora</button>
+                    <button class="btn-pill btn-pill-primary" id="btn-hero-play" style="align-self:flex-start;">▶ Assistir Agora</button>
                 </div>
                 <div class="hero-timer"><div class="hero-timer-fill" id="hero-timer-fill"></div></div>
             </div>
@@ -1010,7 +1221,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
         <!-- TELA CATÁLOGO (FILMES / SÉRIES / TV) -->
         <div id="view-catalog" class="hidden">
-            <div class="input-wrap" style="margin-bottom:0.75rem;">
+            <div class="input-wrap" style="margin-bottom:0.75rem; border-radius:var(--radius-pill);">
                 <input type="text" id="catalog-search" placeholder="🔍 Pesquisar por título ou canal...">
             </div>
             <div style="display:flex; justify-content:space-between; font-size:0.75rem; color:var(--text-muted); margin-bottom:0.6rem;">
@@ -1035,40 +1246,62 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 <div class="config-title">🔒 Controle Parental (+18 / Adultos)</div>
                 <p style="font-size:0.75rem; color:var(--text-muted); margin-bottom:0.5rem;">Conteúdos adultos ficam ocultos das prévias e da lista geral. Senha padrão: <strong>0000</strong>.</p>
                 <div class="input-wrap" style="margin-bottom:0.5rem;"><input type="password" id="cfg-adult-pin" maxlength="4" placeholder="Novo PIN (4 dígitos)"></div>
-                <button class="btn-primary" id="btn-save-pin" style="padding:0.65rem;">Alterar Senha Adultos</button>
+                <button class="btn-pill btn-pill-primary" id="btn-save-pin">Alterar Senha Adultos</button>
             </div>
 
             <div class="config-card">
                 <div class="config-title">🎨 Aparência e Armazenamento</div>
                 <div style="display:flex; gap:0.5rem; margin-bottom:0.75rem;">
-                    <button class="btn-outline" id="btn-theme-oled" style="flex:1;">OLED Pure Black</button>
-                    <button class="btn-outline" id="btn-theme-midnight" style="flex:1;">Midnight Blue</button>
+                    <button class="btn-pill btn-pill-outline" id="btn-theme-oled" style="flex:1;">OLED Pure Black</button>
+                    <button class="btn-pill btn-pill-outline" id="btn-theme-midnight" style="flex:1;">Midnight Blue</button>
                 </div>
-                <button class="btn-outline" id="btn-clear-cache" style="width:100%; color:#fca5a5;">🗑️ Limpar Cache e Recarregar</button>
+                <button class="btn-pill btn-pill-outline" id="btn-clear-cache" style="width:100%; color:#fca5a5; border-color:#e50914;">🗑️ Limpar Cache e Recarregar</button>
             </div>
 
             <div class="config-card">
                 <div class="config-title">💬 Suporte e Atendimento</div>
                 <p style="font-size:0.75rem; color:var(--text-muted); margin-bottom:0.6rem;">Fale diretamente conosco pelo WhatsApp:</p>
-                <a href="#" target="_blank" class="btn-primary" id="btn-support-wa" style="text-decoration:none; text-align:center; background:#25d366; display:block;">📲 Chamar no WhatsApp</a>
+                <a href="#" target="_blank" class="btn-pill btn-pill-success" id="btn-support-wa" style="width:100%;">📲 Chamar no WhatsApp</a>
             </div>
 
-            <button class="btn-outline" id="btn-logout-cfg" style="width:100%; border-color:#e50914; color:#fca5a5; padding:0.85rem;">Sair da Conta</button>
+            <button class="btn-pill btn-pill-outline" id="btn-logout-cfg" style="width:100%; border-color:#e50914; color:#fca5a5;">Sair da Conta</button>
         </div>
     </main>
 
-    <!-- MODAL DETALHES TMDB / VOD -->
-    <div id="tmdb-modal" class="tmdb-modal">
-        <div class="tmdb-box">
-            <div class="tmdb-hero" id="tmdb-hero"><div class="tmdb-hero-overlay"></div></div>
-            <div class="tmdb-content">
+    <!-- MODAL DETALHES DE FILMES (COM SINOPSE REAL) -->
+    <div id="tmdb-modal" class="series-modal">
+        <div class="series-box">
+            <div class="series-hero" id="tmdb-hero"><div class="series-hero-overlay"></div></div>
+            <div class="series-content">
                 <h3 id="tmdb-title" style="font-size:1.25rem; font-weight:900; margin-bottom:0.25rem;">Título</h3>
-                <p id="tmdb-meta" style="font-size:0.78rem; color:var(--gold); margin-bottom:0.7rem;">Ano • Avaliação TMDB</p>
-                <p id="tmdb-plot" style="font-size:0.82rem; color:#cbd5e1; line-height:1.45; margin-bottom:1rem;">Sinopse...</p>
+                <p id="tmdb-meta" style="font-size:0.78rem; color:var(--gold); margin-bottom:0.7rem;">Ano • Avaliação</p>
+                <p id="tmdb-plot" style="font-size:0.82rem; color:#cbd5e1; line-height:1.45; margin-bottom:1rem;">Carregando sinopse do filme...</p>
                 <div style="display:flex; gap:0.55rem;">
-                    <button class="btn-primary" id="btn-tmdb-play" style="flex:2;">▶ Assistir Título</button>
-                    <button class="btn-outline" id="btn-tmdb-close" style="flex:1;">Fechar</button>
+                    <button class="btn-pill btn-pill-primary" id="btn-tmdb-play" style="flex:2;">▶ Assistir Filme</button>
+                    <button class="btn-pill btn-pill-outline" id="btn-tmdb-close" style="flex:1;">Fechar</button>
                 </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- MODAL SÉRIES COM TEMPORADAS E EPISÓDIOS SELECIONÁVEIS -->
+    <div id="series-modal" class="series-modal">
+        <div class="series-box">
+            <div class="series-hero" id="series-hero"><div class="series-hero-overlay"></div></div>
+            <div class="series-content">
+                <h3 id="series-title" style="font-size:1.25rem; font-weight:900; margin-bottom:0.25rem;">Nome da Série</h3>
+                <p id="series-meta" style="font-size:0.78rem; color:var(--gold); margin-bottom:0.5rem;">Ano • Gênero</p>
+                <p id="series-plot" style="font-size:0.82rem; color:#cbd5e1; line-height:1.45; margin-bottom:0.8rem;">Carregando sinopse da série...</p>
+
+                <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:0.3rem;">
+                    <span style="font-size:0.78rem; font-weight:800; color:#fff;">Escolher Temporada:</span>
+                    <button class="btn-pill btn-pill-outline" id="btn-close-series" style="padding:0.25rem 0.65rem; font-size:0.7rem;">✕ Fechar</button>
+                </div>
+
+                <div class="seasons-bar" id="seasons-bar"></div>
+
+                <div style="font-size:0.76rem; font-weight:800; color:var(--text-muted); margin:0.4rem 0;">Episódios Disponíveis:</div>
+                <div class="episodes-list" id="episodes-list"></div>
             </div>
         </div>
     </div>
@@ -1082,63 +1315,76 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <button class="bnav-item" data-tab="config"><span>⚙️</span><span>Ajustes</span></button>
     </nav>
 
-    <!-- 6. PLAYER DE VÍDEO COMPLETO -->
+    <!-- 6. PLAYER DE VÍDEO COMPLETO E SLIM -->
     <div id="player-modal" class="player-modal">
-        <div class="player-top">
-            <button class="btn-nav-back" id="btn-player-back">‹ Voltar</button>
-            <strong id="player-title" style="font-size:0.85rem; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">Reproduzindo</strong>
-            <span id="player-aspect-indicator" style="font-size:0.7rem; color:var(--gold);">100% Horizontal</span>
+        <!-- Topo Slim do Player -->
+        <div class="player-top-slim" id="player-top-slim">
+            <button class="btn-pill btn-pill-outline" id="btn-player-back" style="padding:0.35rem 0.75rem; font-size:0.72rem;">‹ Sair</button>
+            <div class="player-title-badge" id="player-title">Reproduzindo...</div>
+            <div style="width:50px;"></div>
         </div>
 
-        <div class="video-stage">
+        <div class="video-stage" id="video-stage">
             <video id="video-player" playsinline preload="auto"></video>
+            
+            <!-- Botão Play Central Overlay caso o navegador bloqueie autoplay -->
+            <div class="center-play-overlay hidden" id="center-play-overlay">
+                <div class="center-play-circle">▶</div>
+            </div>
         </div>
 
-        <div class="player-controls-deck">
+        <!-- DOCK SLIM MINIMALISTA (UMA LINHA COM BOTÕES REDONDOS PEQUENOS E SUAVES) -->
+        <div class="player-dock-wrap" id="player-dock-wrap">
             <div class="epg-bar" id="epg-bar">
-                <span id="epg-now">Agora: Carregando Guia EPG...</span>
+                <span id="epg-now">Agora: Ao Vivo</span>
                 <span id="epg-time" style="color:var(--text-muted);">--:--</span>
             </div>
 
-            <!-- Botões Principais: Play/Pause, -10s, +10s, Preenchimento Horizontal -->
-            <div class="deck-row">
-                <div style="display:flex; gap:0.4rem; align-items:center;">
-                    <button class="player-btn" id="btn-rw">⏪ -10s</button>
-                    <button class="player-btn active" id="btn-play-pause">⏸ Pausar</button>
-                    <button class="player-btn" id="btn-ff">⏩ +10s</button>
-                </div>
-
-                <div style="display:flex; gap:0.35rem; align-items:center;">
-                    <button class="player-btn active" id="btn-aspect-fill">Preencher Horizontalmente</button>
-                    <button class="player-btn" id="btn-aspect-fit">Original</button>
-                </div>
+            <!-- BUBBLES QUE ABREM POR CIMA AO CLICAR NO BOTÃO -->
+            <div class="dock-bubble" id="bubble-speed">
+                <button class="bubble-item active" data-speed="1.0">1.0x (Normal)</button>
+                <button class="bubble-item" data-speed="1.3">1.3x</button>
+                <button class="bubble-item" data-speed="1.5">1.5x</button>
+                <button class="bubble-item" data-speed="1.8">1.8x</button>
+                <button class="bubble-item" data-speed="2.0">2.0x</button>
             </div>
 
-            <!-- Seletor de Velocidades: 1.0, 1.3, 1.5, 1.8, 2.0 -->
-            <div class="deck-row">
-                <span style="font-size:0.7rem; color:var(--text-muted);">Velocidade:</span>
-                <div style="display:flex; gap:0.3rem;">
-                    <button class="speed-btn active" data-speed="1.0">1.0x</button>
-                    <button class="speed-btn" data-speed="1.3">1.3x</button>
-                    <button class="speed-btn" data-speed="1.5">1.5x</button>
-                    <button class="speed-btn" data-speed="1.8">1.8x</button>
-                    <button class="speed-btn" data-speed="2.0">2.0x</button>
-                </div>
+            <div class="dock-bubble" id="bubble-aspect">
+                <button class="bubble-item active" id="opt-aspect-fill">Preencher Horizontal</button>
+                <button class="bubble-item" id="opt-aspect-fit">Original (16:9)</button>
+            </div>
+
+            <div class="dock-bubble" id="bubble-engine">
+                <button class="bubble-item active" data-engine="auto">Auto (Decodificador)</button>
+                <button class="bubble-item" data-engine="hls">HLS (.m3u8)</button>
+                <button class="bubble-item" data-engine="mpegts">MPEG-TS (.ts)</button>
+                <button class="bubble-item" data-engine="native">Nativo (MP4)</button>
+                <a href="#" target="_blank" class="bubble-item" id="opt-vlc-ext" style="text-decoration:none; color:var(--gold);">Abrir no VLC ↗</a>
+            </div>
+
+            <!-- LINHA ÚNICA MINIMALISTA -->
+            <div class="player-dock" id="player-dock">
+                <button class="mini-btn" id="dock-btn-rw" title="Voltar 10s">⏪</button>
+                <button class="mini-btn active" id="dock-btn-play" title="Play/Pause">⏸</button>
+                <button class="mini-btn" id="dock-btn-ff" title="Avançar 10s">⏩</button>
+                <button class="mini-btn" id="dock-btn-speed" title="Velocidade">1.0x</button>
+                <button class="mini-btn" id="dock-btn-aspect" title="Ajuste de Tela">📐</button>
+                <button class="mini-btn" id="dock-btn-engine" title="Decodificador">⚙️</button>
             </div>
         </div>
     </div>
 
-    <!-- 7. TELA ADMIN -->
+    <!-- 7. TELA ADMIN COM BANCO SEPARADO DE DISPOSITIVOS E MONITORAMENTO -->
     <div id="screen-admin" class="screen">
         <div style="max-width:960px; margin:1.5rem auto; padding:1rem;">
             <div style="display:flex; justify-content:space-between; margin-bottom:1rem; align-items:center;">
                 <h2>⚙️ Painel Administrador</h2>
-                <button class="btn-nav-back" id="btn-exit-admin">Voltar ao Player</button>
+                <button class="btn-pill btn-pill-outline" id="btn-exit-admin">Voltar ao Player</button>
             </div>
 
             <div id="adm-login-box" class="config-card">
                 <div class="form-group"><label>Senha Admin</label><div class="input-wrap"><input type="password" id="adm-pass" placeholder="admin123"></div></div>
-                <button class="btn-primary" id="btn-adm-login">Acessar Painel</button>
+                <button class="btn-pill btn-pill-primary" id="btn-adm-login">Acessar Painel</button>
             </div>
 
             <div id="adm-content" class="hidden">
@@ -1168,10 +1414,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     </div>
                 </div>
 
-                <!-- BANCO SEPARADO: REGISTRO DE MACs, IPs E LOCALIZAÇÃO -->
+                <!-- BANCO SEPARADO: REGISTRO DE MACs, IPs E LOCALIZAÇÃO COM BOTÃO DELETAR QUE LIBERA NOVO TESTE -->
                 <div class="config-card">
                     <div class="config-title">🛡️ Banco de Dispositivos Registrados (MAC, IP e Localização)</div>
-                    <p style="font-size:0.75rem; color:var(--text-muted); margin-bottom:0.6rem;">Salvo no banco de dados separado <code>devices_tracking.db</code> com geolocalização e histórico de acesso.</p>
+                    <p style="font-size:0.75rem; color:var(--text-muted); margin-bottom:0.6rem;">Salvo no banco de dados separado <code>devices_tracking.db</code>. Ao deletar, todos os registros daquele aparelho são apagados permitindo novo teste.</p>
                     <div style="overflow-x:auto;">
                         <table class="admin-table">
                             <thead>
@@ -1197,7 +1443,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     <div class="form-group"><label>URL API de Teste Automático</label><div class="input-wrap"><input type="text" id="adm-trial-api"></div></div>
                     <div class="form-group"><label>Link Padrão de Pagamento (Fallback opcional)</label><div class="input-wrap"><input type="url" id="adm-pay-link"></div></div>
                     <div class="form-group"><label>WhatsApp de Suporte (Link Completo)</label><div class="input-wrap"><input type="text" id="adm-wa-link" placeholder="https://wa.me/55..."></div></div>
-                    <button class="btn-primary" id="btn-adm-save">Salvar Alterações</button>
+                    <button class="btn-pill btn-pill-primary" id="btn-adm-save">Salvar Alterações</button>
                 </div>
             </div>
         </div>
@@ -1219,6 +1465,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         let adultPin = "0000";
         let monitorInterval = null;
         let playSecondsCounter = 0;
+        let currentActiveEngine = "auto";
+        let dockTimeout = null;
 
         const ADULT_REGEX = /\b(adult[os]?|\+18|xxx|porn[oa]?|erotic[oa]?|sexy|playboy|venus|for adults)\b/i;
 
@@ -1281,8 +1529,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             if (!it) return;
             document.getElementById("hero-bg").style.backgroundImage = `url('${it.logo}')`;
             document.getElementById("hero-title").textContent = it.name;
-            document.getElementById("hero-meta").textContent = `${it.group} • 5s Destaque`;
-            document.getElementById("btn-hero-play").onclick = () => openItemPlay(it);
+            document.getElementById("hero-meta").textContent = `${it.group} • Destaque 5s`;
+            document.getElementById("btn-hero-play").onclick = () => {
+                if (it.type === 'movies') openTmdbDetails(it);
+                else if (it.type === 'series') openSeriesDetails(it);
+                else openItemPlay(it);
+            };
         }
 
         // CARREGA DADOS XTREAM CODES DIRETO DO SERVIDOR (BASE ORIGINAL COMPROVADA v5)
@@ -1315,7 +1567,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 xtreamCategories.movies = await rVodCat.json();
                 xtreamCategories.series = await rSerCat.json();
 
-                // Cria mapas de nomes de categorias para não exibir "Filmes" genérico
                 const vodCatMap = {};
                 (Array.isArray(xtreamCategories.movies) ? xtreamCategories.movies : []).forEach(c => vodCatMap[c.category_id] = c.category_name);
 
@@ -1346,7 +1597,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 catalog.series = (Array.isArray(series) ? series : []).map(s => ({
                     id: s.series_id, name: s.name, group: s.category_name || serCatMap[s.category_id] || "Séries", category_id: s.category_id,
                     type: "series", logo: s.cover, rating: s.rating, tmdb_id: s.tmdb_id,
-                    url: `${dns}/series/${currentAuth.username}/${currentAuth.password}/${s.series_id}.mp4`
+                    url: ""
                 }));
 
                 catalog.tv = (Array.isArray(live) ? live : []).map(l => ({
@@ -1368,7 +1619,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             }
         }
 
-        // RENDERIZA HOME
         function renderHomeCarousels() {
             const fillC = (id, list) => {
                 const el = document.getElementById(id);
@@ -1397,18 +1647,132 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 </div>
             `;
             card.onclick = () => {
-                if (it.type === "movies" || it.type === "series") openTmdbDetails(it);
+                if (it.type === "movies") openTmdbDetails(it);
+                else if (it.type === "series") openSeriesDetails(it);
                 else openItemPlay(it);
             };
             return card;
         }
 
-        // DETALHES TMDB DO TÍTULO
+        // ==========================================================
+        // SÉRIES: MODAL COM ESCOLHER TEMPORADA E EPISÓDIOS REAIS
+        // ==========================================================
+        async function openSeriesDetails(it) {
+            document.getElementById("series-modal").classList.add("active");
+            document.getElementById("series-title").textContent = it.name;
+            document.getElementById("series-meta").textContent = `Carregando informações da série...`;
+            document.getElementById("series-plot").textContent = `Buscando temporadas e episódios...`;
+            document.getElementById("series-hero").style.backgroundImage = `url('${it.logo}')`;
+            document.getElementById("seasons-bar").innerHTML = "";
+            document.getElementById("episodes-list").innerHTML = `<div style="text-align:center; padding:1.5rem; color:var(--text-muted); font-size:0.8rem;">Carregando temporadas...</div>`;
+
+            if (!currentAuth) return;
+            let dns = currentAuth.dns.replace(/\/$/, "");
+            if (!dns.startsWith("http://") && !dns.startsWith("https://")) dns = "http://" + dns;
+
+            try {
+                const r = await fetch(`${dns}/player_api.php?username=${encodeURIComponent(currentAuth.username)}&password=${encodeURIComponent(currentAuth.password)}&action=get_series_info&series_id=${it.id}`);
+                const data = await r.json();
+
+                const info = data.info || {};
+                const seasons = data.seasons || [];
+                const episodes = data.episodes || {};
+
+                // Sinopse da série
+                const plot = info.plot || info.description || "Sinopse não disponível para esta série.";
+                const rating = info.rating ? `⭐ Avaliação: ${info.rating}/10` : "⭐ Série Completa";
+                const releaseYear = info.releaseDate ? ` • ${info.releaseDate.split('-')[0]}` : "";
+                const genre = info.genre ? ` • ${info.genre}` : "";
+
+                document.getElementById("series-meta").textContent = `${rating}${releaseYear}${genre}`;
+                document.getElementById("series-plot").textContent = plot;
+
+                if (info.backdrop_path && info.backdrop_path[0]) {
+                    document.getElementById("series-hero").style.backgroundImage = `url('${info.backdrop_path[0]}')`;
+                }
+
+                // Renderiza botões das temporadas
+                const sBar = document.getElementById("seasons-bar");
+                sBar.innerHTML = "";
+
+                const seasonKeys = Object.keys(episodes);
+                if (seasonKeys.length === 0) {
+                    document.getElementById("episodes-list").innerHTML = `<div style="text-align:center; padding:1.5rem; color:var(--text-muted); font-size:0.8rem;">Nenhum episódio cadastrado nesta série.</div>`;
+                    return;
+                }
+
+                let currentSeasonKey = seasonKeys[0];
+
+                const renderEpisodes = (sKey) => {
+                    const epList = document.getElementById("episodes-list");
+                    epList.innerHTML = "";
+                    const eps = episodes[sKey] || [];
+
+                    if (eps.length === 0) {
+                        epList.innerHTML = `<div style="padding:1rem; color:var(--text-muted); font-size:0.8rem;">Nenhum episódio nesta temporada.</div>`;
+                        return;
+                    }
+
+                    eps.forEach(ep => {
+                        const epCard = document.createElement("div");
+                        epCard.className = "episode-card";
+                        const epNum = ep.episode_num || ep.id;
+                        const epTitle = ep.title ? `Ep. ${epNum} - ${ep.title}` : `Episódio ${epNum}`;
+                        const epDur = (ep.info && ep.info.duration) ? ep.info.duration : "";
+                        const epExt = ep.container_extension || "mp4";
+                        const playUrl = `${dns}/series/${currentAuth.username}/${currentAuth.password}/${ep.id}.${epExt}`;
+
+                        epCard.innerHTML = `
+                            <div style="display:flex; align-items:center; gap:0.6rem; overflow:hidden;">
+                                <div style="width:28px; height:28px; border-radius:50%; background:var(--primary); color:#fff; display:flex; align-items:center; justify-content:center; font-size:0.75rem; flex-shrink:0;">▶</div>
+                                <div style="overflow:hidden;">
+                                    <div style="font-size:0.8rem; font-weight:700; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${epTitle}</div>
+                                    <span style="font-size:0.68rem; color:var(--text-muted);">${epDur}</span>
+                                </div>
+                            </div>
+                            <span class="btn-pill btn-pill-outline" style="padding:0.25rem 0.65rem; font-size:0.68rem;">Assistir</span>
+                        `;
+
+                        epCard.onclick = () => {
+                            document.getElementById("series-modal").classList.remove("active");
+                            openItemPlay({
+                                name: `${info.name || it.name} (${epTitle})`,
+                                url: playUrl,
+                                type: "series",
+                                logo: (ep.info && ep.info.movie_image) || it.logo
+                            });
+                        };
+                        epList.appendChild(epCard);
+                    });
+                };
+
+                seasonKeys.forEach((sKey, idx) => {
+                    const pill = document.createElement("button");
+                    pill.className = `season-pill ${idx === 0 ? "active" : ""}`;
+                    pill.textContent = `Temporada ${sKey}`;
+                    pill.onclick = () => {
+                        document.querySelectorAll(".season-pill").forEach(p => p.classList.remove("active"));
+                        pill.classList.add("active");
+                        renderEpisodes(sKey);
+                    };
+                    sBar.appendChild(pill);
+                });
+
+                renderEpisodes(currentSeasonKey);
+
+            } catch (err) {
+                console.error("Erro ao carregar série:", err);
+                document.getElementById("series-plot").textContent = "Erro ao buscar detalhes da série no servidor.";
+            }
+        }
+        document.getElementById("btn-close-series").onclick = () => document.getElementById("series-modal").classList.remove("active");
+
+        // DETALHES DE FILMES (COM SINOPSE REAL)
         async function openTmdbDetails(it) {
             document.getElementById("tmdb-modal").classList.add("active");
             document.getElementById("tmdb-title").textContent = it.name;
             document.getElementById("tmdb-meta").textContent = `Carregando informações...`;
-            document.getElementById("tmdb-plot").textContent = `Buscando sinopse do título...`;
+            document.getElementById("tmdb-plot").textContent = `Buscando sinopse do filme...`;
             document.getElementById("tmdb-hero").style.backgroundImage = `url('${it.logo}')`;
 
             document.getElementById("btn-tmdb-play").onclick = () => {
@@ -1505,8 +1869,35 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         }
         document.getElementById("catalog-search").oninput = renderCatalogGrid;
 
-        // PLAYER DE VÍDEO COMPLETO (CONTROLES, 5 VELOCIDADES, EPG E HORIZONTAL)
+        // ==========================================================
+        // PLAYER DE VÍDEO COMPLETO E RESILIENTE COM CONTROLES SLIM
+        // ==========================================================
         const vEl = document.getElementById("video-player");
+
+        function closeAllBubbles() {
+            document.querySelectorAll(".dock-bubble").forEach(b => b.classList.remove("open"));
+        }
+
+        function resetDockTimer() {
+            const dockWrap = document.getElementById("player-dock-wrap");
+            const topSlim = document.getElementById("player-top-slim");
+            dockWrap.style.opacity = "1";
+            topSlim.style.opacity = "1";
+
+            if (dockTimeout) clearTimeout(dockTimeout);
+            dockTimeout = setTimeout(() => {
+                if (!vEl.paused && !document.querySelector(".dock-bubble.open")) {
+                    dockWrap.style.opacity = "0.22"; // quase oculto, revelando 100% do vídeo
+                    topSlim.style.opacity = "0.22";
+                }
+            }, 3500);
+        }
+
+        document.getElementById("video-stage").addEventListener("mousemove", resetDockTimer);
+        document.getElementById("video-stage").addEventListener("touchstart", resetDockTimer);
+        document.getElementById("player-dock").addEventListener("mouseenter", () => {
+            document.getElementById("player-dock-wrap").style.opacity = "1";
+        });
 
         function sendMonitorHeartbeat(isPlaying) {
             if (!currentPlayingItem) return;
@@ -1525,15 +1916,24 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             }).catch(()=>{});
         }
 
-        function openItemPlay(it) {
+        function openItemPlay(it, forceEngine = "auto") {
             currentPlayingItem = it;
             playSecondsCounter = 0;
+            currentActiveEngine = forceEngine;
+
             document.getElementById("player-modal").classList.add("active");
             document.getElementById("player-title").textContent = it.name;
+            document.getElementById("center-play-overlay").classList.add("hidden");
 
             stopPlayerEngines();
             vEl.className = "";
+            closeAllBubbles();
+            resetDockTimer();
 
+            // Link externo para VLC
+            document.getElementById("opt-vlc-ext").href = it.url;
+
+            // EPG para canais ao vivo
             const epgBar = document.getElementById("epg-bar");
             if (it.type === "tv") {
                 epgBar.classList.add("active");
@@ -1543,28 +1943,98 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             }
 
             const url = it.url;
-            if (url.includes(".m3u8") && typeof Hls !== "undefined" && Hls.isSupported()) {
-                hlsInstance = new Hls();
-                hlsInstance.loadSource(url);
-                hlsInstance.attachMedia(vEl);
-                hlsInstance.on(Hls.Events.MANIFEST_PARSED, () => vEl.play().catch(()=>{}));
-            } else if (url.includes(".ts") && typeof mpegts !== "undefined" && mpegts.isSupported()) {
-                mpegtsInstance = mpegts.createPlayer({ type: "mpegts", isLive: true, url: url });
-                mpegtsInstance.attachMediaElement(vEl);
-                mpegtsInstance.load();
-                vEl.play().catch(()=>{});
-            } else {
-                vEl.src = url;
-                vEl.play().catch(()=>{});
+            let engine = forceEngine;
+
+            if (engine === "auto") {
+                if (url.includes(".m3u8")) engine = "hls";
+                else if (it.type === "tv" || url.endsWith(".ts")) engine = "ts_or_hls";
+                else engine = "native";
             }
 
-            if (monitorInterval) clearInterval(monitorInterval);
-            sendMonitorHeartbeat(true);
-            monitorInterval = setInterval(() => {
-                if (!vEl.paused) playSecondsCounter += 4;
-                sendMonitorHeartbeat(!vEl.paused);
-            }, 4000);
+            // REPRODUÇÃO RESILIENTE DE TV AO VIVO (HLS OU MPEGTS COM AUTO-FALLBACK)
+            if (engine === "ts_or_hls" || engine === "hls") {
+                // Converte .ts em .m3u8 para decodificação HLS nativa de alta compatibilidade
+                const hlsUrl = url.endsWith('.ts') ? url.replace(/\.ts$/i, '.m3u8') : url;
+
+                if (typeof Hls !== "undefined" && Hls.isSupported()) {
+                    hlsInstance = new Hls({ enableWorker: true });
+                    hlsInstance.loadSource(hlsUrl);
+                    hlsInstance.attachMedia(vEl);
+
+                    hlsInstance.on(Hls.Events.MANIFEST_PARSED, () => {
+                        vEl.play().catch(() => {
+                            document.getElementById("center-play-overlay").classList.remove("hidden");
+                        });
+                    });
+
+                    hlsInstance.on(Hls.Events.ERROR, (event, data) => {
+                        if (data.fatal) {
+                            console.log("HLS fatal error, tentando MPEG-TS ou nativo...");
+                            startMpegTsOrNative(url);
+                        }
+                    });
+                    return;
+                } else if (vEl.canPlayType('application/vnd.apple.mpegurl')) {
+                    // Suporte nativo HLS no iOS Safari
+                    vEl.src = hlsUrl;
+                    vEl.play().catch(() => {
+                        document.getElementById("center-play-overlay").classList.remove("hidden");
+                    });
+                    return;
+                }
+            }
+
+            if (engine === "mpegts") {
+                startMpegTsOrNative(url);
+                return;
+            }
+
+            // Reprodução direta Nativa (MP4 / Streams diretos)
+            startNativePlay(url);
         }
+
+        function startMpegTsOrNative(url) {
+            stopPlayerEngines();
+            if (typeof mpegts !== "undefined" && mpegts.isSupported()) {
+                try {
+                    mpegtsInstance = mpegts.createPlayer({
+                        type: 'mpegts',
+                        isLive: true,
+                        url: url,
+                        cors: true
+                    }, {
+                        enableWorker: true,
+                        enableStashBuffer: false,
+                        stashInitialSize: 128
+                    });
+                    mpegtsInstance.attachMediaElement(vEl);
+                    mpegtsInstance.load();
+                    vEl.play().catch(() => {
+                        document.getElementById("center-play-overlay").classList.remove("hidden");
+                    });
+                    return;
+                } catch(e) {
+                    startNativePlay(url);
+                    return;
+                }
+            }
+            startNativePlay(url);
+        }
+
+        function startNativePlay(url) {
+            stopPlayerEngines();
+            vEl.src = url;
+            vEl.load();
+            vEl.play().catch(() => {
+                document.getElementById("center-play-overlay").classList.remove("hidden");
+            });
+        }
+
+        // Toque no overlay central para despausar com som imediato
+        document.getElementById("center-play-overlay").onclick = () => {
+            document.getElementById("center-play-overlay").classList.add("hidden");
+            vEl.play().catch(()=>{});
+        };
 
         async function fetchEpg(it) {
             if (!currentAuth || !it.id) return;
@@ -1599,35 +2069,100 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             document.getElementById("player-modal").classList.remove("active");
         };
 
-        const btnPlay = document.getElementById("btn-play-pause");
+        // CONTROLES SLIM DO DOCK
+        const btnPlay = document.getElementById("dock-btn-play");
         btnPlay.onclick = () => {
-            if (vEl.paused) { vEl.play(); btnPlay.textContent = "⏸ Pausar"; }
-            else { vEl.pause(); btnPlay.textContent = "▶ Play"; }
+            closeAllBubbles();
+            if (vEl.paused) { vEl.play(); btnPlay.textContent = "⏸"; }
+            else { vEl.pause(); btnPlay.textContent = "▶"; }
+            resetDockTimer();
         };
 
-        document.getElementById("btn-rw").onclick = () => { vEl.currentTime = Math.max(0, vEl.currentTime - 10); };
-        document.getElementById("btn-ff").onclick = () => { vEl.currentTime += 10; };
-
-        document.getElementById("btn-aspect-fill").onclick = () => {
-            vEl.className = "";
-            document.getElementById("player-aspect-indicator").textContent = "100% Horizontal";
-            document.getElementById("btn-aspect-fill").classList.add("active");
-            document.getElementById("btn-aspect-fit").classList.remove("active");
+        document.getElementById("dock-btn-rw").onclick = () => {
+            closeAllBubbles();
+            vEl.currentTime = Math.max(0, vEl.currentTime - 10);
+            resetDockTimer();
         };
-        document.getElementById("btn-aspect-fit").onclick = () => {
-            vEl.className = "mode-fit";
-            document.getElementById("player-aspect-indicator").textContent = "Original 16:9";
-            document.getElementById("btn-aspect-fit").classList.add("active");
-            document.getElementById("btn-aspect-fill").classList.remove("active");
+        document.getElementById("dock-btn-ff").onclick = () => {
+            closeAllBubbles();
+            vEl.currentTime += 10;
+            resetDockTimer();
         };
 
-        document.querySelectorAll(".speed-btn").forEach(btn => {
-            btn.onclick = () => {
-                document.querySelectorAll(".speed-btn").forEach(b => b.classList.remove("active"));
-                btn.classList.add("active");
-                vEl.playbackRate = parseFloat(btn.dataset.speed);
+        // BOTÃO VELOCIDADE COM POPUP POR CIMA
+        const btnSpeed = document.getElementById("dock-btn-speed");
+        const bubbleSpeed = document.getElementById("bubble-speed");
+        btnSpeed.onclick = (e) => {
+            e.stopPropagation();
+            const isOpen = bubbleSpeed.classList.contains("open");
+            closeAllBubbles();
+            if (!isOpen) bubbleSpeed.classList.add("open");
+            resetDockTimer();
+        };
+
+        document.querySelectorAll("#bubble-speed .bubble-item").forEach(item => {
+            item.onclick = (e) => {
+                e.stopPropagation();
+                const sp = parseFloat(item.dataset.speed);
+                vEl.playbackRate = sp;
+                btnSpeed.textContent = `${sp}x`;
+                document.querySelectorAll("#bubble-speed .bubble-item").forEach(i => i.classList.remove("active"));
+                item.classList.add("active");
+                closeAllBubbles(); // Volta ao estado original minimalista na hora!
+                resetDockTimer();
             };
         });
+
+        // BOTÃO TELA COM POPUP POR CIMA
+        const btnAspect = document.getElementById("dock-btn-aspect");
+        const bubbleAspect = document.getElementById("bubble-aspect");
+        btnAspect.onclick = (e) => {
+            e.stopPropagation();
+            const isOpen = bubbleAspect.classList.contains("open");
+            closeAllBubbles();
+            if (!isOpen) bubbleAspect.classList.add("open");
+            resetDockTimer();
+        };
+
+        document.getElementById("opt-aspect-fill").onclick = (e) => {
+            e.stopPropagation();
+            vEl.className = "mode-fill-horizontal";
+            btnAspect.classList.add("active");
+            closeAllBubbles();
+            resetDockTimer();
+        };
+
+        document.getElementById("opt-aspect-fit").onclick = (e) => {
+            e.stopPropagation();
+            vEl.className = "";
+            btnAspect.classList.remove("active");
+            closeAllBubbles();
+            resetDockTimer();
+        };
+
+        // BOTÃO MOTOR COM POPUP POR CIMA
+        const btnEngine = document.getElementById("dock-btn-engine");
+        const bubbleEngine = document.getElementById("bubble-engine");
+        btnEngine.onclick = (e) => {
+            e.stopPropagation();
+            const isOpen = bubbleEngine.classList.contains("open");
+            closeAllBubbles();
+            if (!isOpen) bubbleEngine.classList.add("open");
+            resetDockTimer();
+        };
+
+        document.querySelectorAll("#bubble-engine [data-engine]").forEach(item => {
+            item.onclick = (e) => {
+                e.stopPropagation();
+                if (!currentPlayingItem) return;
+                closeAllBubbles();
+                openItemPlay(currentPlayingItem, item.dataset.engine);
+                resetDockTimer();
+            };
+        });
+
+        // Fecha bubbles ao tocar fora
+        document.addEventListener("click", () => closeAllBubbles());
 
         // NAVEGAÇÃO BOTTOM BAR
         document.querySelectorAll(".bottom-nav .bnav-item").forEach(btn => {
@@ -1703,7 +2238,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             enterApp();
         };
 
-        // GERAÇÃO DE TESTE GRÁTIS AUTOMÁTICO
+        // GERAÇÃO DE TESTE GRÁTIS AUTOMÁTICO COM ANIMAÇÃO DE CARD
         document.getElementById("btn-trial").onclick = async () => {
             const btn = document.getElementById("btn-trial");
             btn.textContent = "⏳ Conectando ao servidor e gerando seu teste...";
@@ -1723,6 +2258,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 currentAuth = tr;
                 localStorage.setItem("sf_session", JSON.stringify(tr));
 
+                // Popula os dados DINÂMICOS do servidor
                 document.getElementById("tr-u").textContent = tr.username || "-";
                 document.getElementById("tr-p").textContent = tr.password || "-";
                 document.getElementById("tr-exp").textContent = tr.expires_formatted || "-";
@@ -1770,6 +2306,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 };
                 document.getElementById("btn-wa-tr").href = `https://wa.me/?text=${encodeURIComponent(shareText)}`;
 
+                // Abre modal com animação suave e imersiva
                 document.getElementById("trial-modal").classList.add("active");
             } catch (e) {
                 alert("Erro de conexão ao gerar o teste.");
@@ -1797,6 +2334,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             location.reload();
         };
 
+        // ADMIN
         let adminPolling = null;
 
         document.getElementById("btn-go-admin").onclick = () => {
@@ -1832,6 +2370,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 document.getElementById("adm-pay-link").value = d.settings.default_payment_link || "";
                 document.getElementById("adm-wa-link").value = d.settings.support_whatsapp || "";
 
+                // 1. Tabela Monitoramento em Tempo Real
                 const monTbody = document.getElementById("adm-monitoring-tbody");
                 monTbody.innerHTML = "";
                 document.getElementById("live-count").textContent = `${d.monitoring.length} assistindo agora`;
@@ -1854,6 +2393,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     });
                 }
 
+                // 2. Tabela de Dispositivos com Deletar que Libera Novo Teste Imediatamente
                 const devTbody = document.getElementById("adm-devices-tbody");
                 devTbody.innerHTML = "";
                 d.devices.forEach(dev => {
@@ -1865,7 +2405,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                         <td>${dev.device}</td>
                         <td><strong>${dev.username}</strong></td>
                         <td>${dev.last_seen}</td>
-                        <td><button class="btn-nav-back" style="color:#fca5a5; border-color:#e50914;" onclick="deleteDeviceRecord(${dev.id})">🗑️ Deletar</button></td>
+                        <td><button class="btn-pill btn-pill-outline" style="color:#fca5a5; border-color:#e50914; padding:0.25rem 0.65rem; font-size:0.7rem;" onclick="deleteDeviceRecord(${dev.id})">🗑️ Deletar</button></td>
                     `;
                     devTbody.appendChild(tr);
                 });
@@ -1873,7 +2413,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         }
 
         window.deleteDeviceRecord = async (id) => {
-            if (!confirm("Deseja realmente deletar este registro de dispositivo?")) return;
+            if (!confirm("Deseja realmente deletar este registro de dispositivo? Isso liberará este aparelho para gerar um novo teste.")) return;
             await fetch(`/api/admin/delete-device/${id}`, { method: "DELETE" });
             loadAdminDashboard();
         };
