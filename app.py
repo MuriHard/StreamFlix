@@ -4,6 +4,7 @@ import json
 import time
 import sqlite3
 import hashlib
+import ssl
 import urllib.request
 import urllib.parse
 from datetime import datetime
@@ -16,11 +17,15 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MAIN_DB_PATH = os.path.join(BASE_DIR, "streamflix.db")
 DEVICES_DB_PATH = os.path.join(BASE_DIR, "devices_tracking.db")
 
-# Cache de geolocalização em memória para não estourar limite de API
 GEO_CACHE = {}
 
+# Contexto SSL permissivo para servidores IPTV com certificados autoassinados ou portas http
+SSL_CTX = ssl.create_default_context()
+SSL_CTX.check_hostname = False
+SSL_CTX.verify_mode = ssl.CERT_NONE
+
 # ==========================================================
-# 1. BANCOS DE DADOS (STREAMFLIX E BANCO SEPARADO DE DISPOSITIVOS)
+# 1. BANCOS DE DADOS
 # ==========================================================
 def get_main_db():
     conn = sqlite3.connect(MAIN_DB_PATH)
@@ -33,7 +38,6 @@ def get_devices_db():
     return conn
 
 def init_dbs():
-    # Banco 1: Configurações, Usuários e Testes
     conn1 = get_main_db()
     cur1 = conn1.cursor()
     cur1.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
@@ -71,15 +75,13 @@ def init_dbs():
         "support_whatsapp": "https://wa.me/5500000000000?text=Preciso%20de%20suporte%20no%20StreamFlix",
         "adult_pin": "0000",
         "apps_smart_tv": "IBO Player, DuplexPlay, SmartOne, SS IPTV",
-        "apps_android": "XCIPTV, IPTV Smarters Pro, TiviMate",
-        "custom_domain": ""
+        "apps_android": "XCIPTV, IPTV Smarters Pro, TiviMate"
     }
     for k, v in defaults.items():
         cur1.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v))
     conn1.commit()
     conn1.close()
 
-    # Banco 2: BANCO SEPARADO PARA MACs, IPs, LOCALIZAÇÃO E MONITORAMENTO
     conn2 = get_devices_db()
     cur2 = conn2.cursor()
     cur2.execute("""CREATE TABLE IF NOT EXISTS devices (
@@ -124,7 +126,7 @@ def save_settings(new_data):
     conn.close()
 
 # ==========================================================
-# 2. LOCALIZAÇÃO E RASTREAMENTO SILENCIOSO DE DISPOSITIVOS
+# 2. LOCALIZAÇÃO E DISPOSITIVOS
 # ==========================================================
 def resolve_ip_location(ip):
     if not ip or ip in ("127.0.0.1", "0.0.0.0", "localhost") or ip.startswith("192.168.") or ip.startswith("10."):
@@ -137,10 +139,7 @@ def resolve_ip_location(ip):
         with urllib.request.urlopen(req, timeout=3) as resp:
             data = json.loads(resp.read().decode())
             if data.get("status") == "success":
-                c = data.get("city") or ""
-                r = data.get("regionName") or ""
-                co = data.get("country") or ""
-                loc = f"{c}, {r} - {co}".strip(", -")
+                loc = f"{data.get('city','')}, {data.get('regionName','')} - {data.get('country','')}".strip(", -")
                 GEO_CACHE[ip] = loc
                 return loc
     except Exception:
@@ -152,20 +151,19 @@ def parse_user_agent(ua_string):
     if not ua_string:
         return "Dispositivo Web"
     ua = ua_string.lower()
-    dev = "PC / Desktop"
     if "android" in ua:
-        dev = "Android Mobile" if "mobile" in ua else "Android TV / Box"
+        return "Android Mobile" if "mobile" in ua else "Android TV / Box"
     elif "iphone" in ua:
-        dev = "Apple iPhone"
+        return "Apple iPhone"
     elif "ipad" in ua:
-        dev = "Apple iPad"
+        return "Apple iPad"
     elif "smart-tv" in ua or "tizen" in ua or "webos" in ua:
-        dev = "Smart TV"
+        return "Smart TV"
     elif "windows" in ua:
-        dev = "Windows PC"
+        return "Windows PC"
     elif "linux" in ua:
-        dev = "Linux PC"
-    return dev
+        return "Linux PC"
+    return "PC / Desktop"
 
 def record_device_entry(mac, ip, ua_string, username="Desconhecido"):
     if not mac:
@@ -188,14 +186,10 @@ def record_device_entry(mac, ip, ua_string, username="Desconhecido"):
     conn.close()
 
 # ==========================================================
-# 3. PROXY INTELIGENTE XTREAM (RESOLVE CORS SEM USAR BANDA DE VÍDEO)
+# 3. PROXY INTELIGENTE XTREAM (ANTI-CORS E ALTA ESTABILIDADE)
 # ==========================================================
 @app.route("/api/xtream/proxy")
 def api_xtream_proxy():
-    """
-    Busca os metadados JSON do servidor Xtream pelo backend em Python.
-    Isso elimina 100% dos bloqueios de CORS do navegador, mantendo o consumo de vídeo ZERO na VPS.
-    """
     dns = request.args.get("dns", "").strip().rstrip("/")
     username = request.args.get("username", "").strip()
     password = request.args.get("password", "").strip()
@@ -206,6 +200,9 @@ def api_xtream_proxy():
 
     if not dns or not username or not password or not action:
         return jsonify({"error": "Parâmetros incompletos"}), 400
+
+    if not dns.startswith("http://") and not dns.startswith("https://"):
+        dns = "http://" + dns
 
     params = {
         "username": username,
@@ -219,11 +216,18 @@ def api_xtream_proxy():
     target_url = f"{dns}/player_api.php?{urllib.parse.urlencode(params)}"
 
     try:
-        req = urllib.request.Request(target_url, headers={"User-Agent": "StreamFlixProxy/5.5"})
-        with urllib.request.urlopen(req, timeout=14) as resp:
+        req = urllib.request.Request(
+            target_url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+                "Accept": "application/json, text/plain, */*"
+            }
+        )
+        with urllib.request.urlopen(req, timeout=45, context=SSL_CTX) as resp:
             content = resp.read()
             return Response(content, mimetype="application/json")
     except Exception as e:
+        print(f"[XtreamProxy Erro] {target_url} -> {e}")
         return jsonify([]), 200
 
 # ==========================================================
@@ -265,7 +269,7 @@ def api_monitor_heartbeat():
     return jsonify({"ok": True})
 
 # ==========================================================
-# 5. ROTAS DE LOGIN, TESTE GRÁTIS E ADMINISTRAÇÃO
+# 5. ROTAS DE LOGIN E ADMINISTRAÇÃO
 # ==========================================================
 @app.route("/api/config")
 def api_config():
@@ -307,7 +311,7 @@ def api_login():
         return jsonify({
             "ok": False, "expired": True,
             "payment_link": existing["payment_link"] or cfg.get("default_payment_link", ""),
-            "error": "Sua assinatura ou teste expirou! Redirecionando..."
+            "error": "Sua assinatura expirou! Redirecionando..."
         }), 403
 
     chosen_dns = primary_dns
@@ -315,12 +319,13 @@ def api_login():
     max_conns = "1"
     plan_type = "Assinatura IPTV"
 
-    # Autenticação leve na Xtream Codes API do servidor
     for dns in dns_list:
+        if not dns.startswith("http://") and not dns.startswith("https://"):
+            dns = "http://" + dns
         try:
             api_url = f"{dns}/player_api.php?username={urllib.parse.quote(username)}&password={urllib.parse.quote(password)}"
-            req = urllib.request.Request(api_url, headers={"User-Agent": "StreamFlix/5.5"})
-            with urllib.request.urlopen(req, timeout=6) as resp:
+            req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=8, context=SSL_CTX) as resp:
                 info = json.loads(resp.read().decode("utf-8", errors="ignore"))
                 u_info = info.get("user_info", {})
                 if str(u_info.get("auth")) == "1" or str(u_info.get("status")).lower() in ["active", "trial"]:
@@ -397,13 +402,12 @@ def api_request_trial():
 
     if trial_api_url:
         try:
-            req = urllib.request.Request(trial_api_url, headers={"User-Agent": "StreamFlixTrial/1.0"})
-            with urllib.request.urlopen(req, timeout=12) as resp:
+            req = urllib.request.Request(trial_api_url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=12, context=SSL_CTX) as resp:
                 raw_api_resp = resp.read().decode("utf-8", errors="ignore")
         except Exception:
             pass
 
-    # Parser dinâmico de teste
     now_ts = int(time.time())
     hours = float(cfg.get("trial_duration_hours") or 4)
     exp_ts = now_ts + int(hours * 3600)
@@ -468,7 +472,7 @@ def api_request_trial():
         }
     })
 
-# --- ROTAS DE GESTÃO ADMIN (DISPOSITIVOS, MONITORAMENTO, CONFIG) ---
+# --- GESTÃO ADMIN ---
 @app.route("/api/admin/login", methods=["POST"])
 def api_admin_login():
     data = request.get_json(silent=True) or {}
@@ -533,14 +537,14 @@ def api_update_adult_pin():
     return jsonify({"ok": True, "pin": new_pin})
 
 # ==========================================================
-# 6. TEMPLATE HTML DO FRONTEND
+# 6. FRONTEND OTIMIZADO
 # ==========================================================
 HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-    <title>StreamFlix Pro v5.6</title>
+    <title>StreamFlix Pro v5.7</title>
     <script src="https://unpkg.com/lucide@latest"></script>
     <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
     <script src="https://cdn.jsdelivr.net/npm/mpegts.js@latest/dist/mpegts.js"></script>
@@ -571,7 +575,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .screen.active { display:block; }
         .hidden { display:none !important; }
 
-        /* TELA DE LOGIN */
         #screen-login { display:none; align-items:center; justify-content:center; padding:1.2rem; min-height:100vh; background:radial-gradient(circle at top, #240508 0%, #000 75%); }
         #screen-login.active { display:flex; }
         .login-box { background:var(--bg-surface); border:1px solid var(--border); border-radius:var(--radius-lg); padding:2rem 1.6rem; width:100%; max-width:410px; box-shadow:0 25px 60px rgba(0,0,0,0.95); }
@@ -585,7 +588,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .btn-primary { width:100%; padding:0.92rem; background:var(--primary); border:none; border-radius:var(--radius-md); color:#fff; font-size:0.95rem; font-weight:800; cursor:pointer; }
         .btn-trial { width:100%; padding:0.9rem; margin-top:0.75rem; background:linear-gradient(135deg, #10b981, #059669); border:none; border-radius:var(--radius-md); color:#fff; font-size:0.92rem; font-weight:800; cursor:pointer; }
 
-        /* MODAL DO TESTE GRÁTIS GERADO DINAMICAMENTE */
         .modal-sheet { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.92); backdrop-filter:blur(10px); z-index:500; align-items:center; justify-content:center; padding:1rem; }
         .modal-sheet.active { display:flex; }
         .modal-box { background:var(--bg-surface); border:1px solid var(--success); border-radius:var(--radius-lg); width:100%; max-width:440px; padding:1.5rem; max-height:92vh; overflow-y:auto; }
@@ -597,14 +599,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .trial-btns { display:grid; grid-template-columns:1fr 1fr; gap:0.55rem; margin-bottom:0.75rem; }
         .btn-outline { background:var(--bg-card); border:1px solid var(--border); color:#fff; padding:0.75rem; border-radius:8px; font-size:0.8rem; font-weight:700; text-decoration:none; text-align:center; cursor:pointer; }
 
-        /* TOPBAR & NAVEGAÇÃO */
         .navbar { height:58px; background:var(--bg-glass); backdrop-filter:blur(12px); border-bottom:1px solid var(--border); display:flex; align-items:center; justify-content:space-between; padding:0 1rem; position:sticky; top:0; z-index:120; }
         .nav-left { display:flex; align-items:center; gap:0.6rem; }
         .btn-nav-back { background:var(--bg-card); border:1px solid var(--border); color:#fff; padding:0.38rem 0.65rem; border-radius:8px; font-size:0.76rem; font-weight:700; cursor:pointer; display:inline-flex; align-items:center; gap:0.3rem; }
         .nav-brand { font-weight:900; font-size:1.18rem; letter-spacing:0.5px; }
         .nav-brand span { color:var(--primary); }
 
-        /* HERO CAROUSEL 5 SEGUNDOS (EXCLUSIVO FILMES E SÉRIES - ZERO CANAIS E ZERO ADULTO) */
         .content-wrap { max-width:1180px; margin:0 auto; padding:0.9rem; }
         .hero-box { position:relative; border-radius:var(--radius-lg); overflow:hidden; height:280px; background:#07070c; border:1px solid var(--border); margin-bottom:1.4rem; }
         .hero-bg { position:absolute; inset:0; background-size:cover; background-position:center; transition:background-image 0.4s ease; }
@@ -615,11 +615,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .hero-timer { position:absolute; bottom:0; left:0; right:0; height:4px; background:rgba(255,255,255,0.15); }
         .hero-timer-fill { height:100%; width:0%; background:var(--primary); transition:width 0.1s linear; }
 
-        /* FILEIRAS & PÔSTERES VERTICAIS */
         .home-row { margin-bottom:1.5rem; }
         .row-header { display:flex; align-items:center; justify-content:space-between; margin-bottom:0.65rem; }
         .row-title { font-size:0.95rem; font-weight:800; display:flex; align-items:center; gap:0.4rem; }
-        .vod-carousel { display:flex; gap:0.75rem; overflow-x:auto; padding-bottom:0.4rem; scrollbar-width:none; }
+        .vod-carousel { display:flex; gap:0.75rem; overflow-x:auto; padding-bottom:0.4rem; scrollbar-width:none; min-height:160px; }
         .vod-carousel::-webkit-scrollbar { display:none; }
 
         .poster-card { position:relative; flex:0 0 134px; background:var(--bg-surface); border:1px solid var(--border); border-radius:10px; overflow:hidden; cursor:pointer; }
@@ -631,7 +630,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .poster-info h4 { font-size:0.76rem; font-weight:700; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
         .poster-info span { font-size:0.66rem; color:var(--text-muted); display:block; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 
-        /* MENU LATERAL OCULTO (DRAWER AUTOMÁTICO DE CATEGORIAS XTREAM) */
         .drawer-backdrop { position:fixed; inset:0; background:rgba(0,0,0,0.85); z-index:300; opacity:0; pointer-events:none; transition:opacity 0.25s; }
         .drawer-backdrop.active { opacity:1; pointer-events:auto; }
         .drawer-panel { position:fixed; top:0; left:0; bottom:0; width:290px; max-width:85vw; background:#07070c; border-right:1px solid var(--border); z-index:310; transform:translateX(-100%); transition:transform 0.28s ease; display:flex; flex-direction:column; }
@@ -641,10 +639,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .drawer-item { padding:0.75rem 0.85rem; border-radius:8px; color:var(--text-muted); background:transparent; border:none; text-align:left; font-size:0.85rem; font-weight:700; cursor:pointer; display:flex; justify-content:space-between; align-items:center; }
         .drawer-item.active { background:var(--primary); color:#fff; }
 
-        .posters-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(122px, 1fr)); gap:0.75rem; padding-bottom:1.5rem; }
+        .posters-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(122px, 1fr)); gap:0.75rem; padding-bottom:1.5rem; min-height:200px; }
         .posters-grid .poster-card { flex:unset; width:100%; }
 
-        /* MODAL DE DETALHES TMDB / VOD INFO */
         .tmdb-modal { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.92); backdrop-filter:blur(10px); z-index:450; align-items:center; justify-content:center; padding:1rem; }
         .tmdb-modal.active { display:flex; }
         .tmdb-box { background:var(--bg-surface); border:1px solid var(--border); border-radius:var(--radius-lg); width:100%; max-width:520px; max-height:92vh; overflow-y:auto; position:relative; }
@@ -652,19 +649,16 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .tmdb-hero-overlay { position:absolute; inset:0; background:linear-gradient(0deg, var(--bg-surface) 10%, transparent 100%); }
         .tmdb-content { padding:1.2rem; }
 
-        /* BOTTOM NAVIGATION BAR */
         .bottom-nav { position:fixed; bottom:0; left:0; right:0; height:66px; background:rgba(8,8,12,0.96); backdrop-filter:blur(16px); border-top:1px solid var(--border); display:none; align-items:center; justify-content:space-around; z-index:200; }
         .bottom-nav.active { display:flex; }
         .bnav-item { background:transparent; border:none; color:var(--text-muted); display:flex; flex-direction:column; align-items:center; justify-content:center; gap:0.2rem; font-size:0.68rem; font-weight:700; cursor:pointer; flex:1; height:100%; }
         .bnav-item.active { color:var(--primary); }
 
-        /* PLAYER DE VÍDEO (PREENCHER HORIZONTALMENTE + CONTROLES COMPLETOS) */
         .player-modal { display:none; position:fixed; inset:0; background:#000; z-index:600; flex-direction:column; }
         .player-modal.active { display:flex; }
         .player-top { height:52px; background:rgba(10,10,15,0.9); border-bottom:1px solid var(--border); display:flex; align-items:center; justify-content:space-between; padding:0 1rem; z-index:20; }
         .video-stage { position:relative; flex:1; width:100%; overflow:hidden; background:#000; display:flex; align-items:center; justify-content:center; }
 
-        /* Preencher Horizontalmente Sem Zoom */
         #video-player {
             width: 100vw;
             height: auto;
@@ -681,24 +675,20 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .speed-btn { background:var(--bg-card); border:1px solid var(--border); color:var(--text-muted); font-size:0.7rem; font-weight:800; padding:0.28rem 0.55rem; border-radius:4px; cursor:pointer; }
         .speed-btn.active { background:var(--primary); color:#fff; border-color:var(--primary); }
 
-        /* EPG BAR */
         .epg-bar { background:rgba(20,20,30,0.85); border-radius:6px; padding:0.45rem 0.75rem; font-size:0.75rem; display:none; justify-content:space-between; }
         .epg-bar.active { display:flex; }
 
-        /* TELA CONFIGURAÇÕES */
         .config-card { background:var(--bg-surface); border:1px solid var(--border); border-radius:var(--radius-lg); padding:1.2rem; margin-bottom:1rem; }
         .config-title { font-size:0.92rem; font-weight:800; color:var(--primary); margin-bottom:0.75rem; display:flex; align-items:center; gap:0.4rem; }
 
-        /* TABELAS ADMIN */
         .admin-table { width:100%; border-collapse:collapse; font-size:0.76rem; margin-top:0.7rem; }
         .admin-table th, .admin-table td { border-bottom:1px solid var(--border); padding:0.55rem 0.5rem; text-align:left; }
         .admin-table th { color:var(--text-muted); text-transform:uppercase; font-size:0.68rem; }
         .badge-live { background:rgba(239,68,68,0.2); color:#f87171; border:1px solid #ef4444; padding:2px 6px; border-radius:10px; font-weight:800; font-size:0.65rem; }
 
-        /* LOADING SPINNER */
-        .loading-cover { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.7); z-index:900; align-items:center; justify-content:center; flex-direction:column; gap:0.8rem; }
+        .loading-cover { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.78); backdrop-filter:blur(4px); z-index:900; align-items:center; justify-content:center; flex-direction:column; gap:0.8rem; }
         .loading-cover.active { display:flex; }
-        .spinner { width:38px; height:38px; border:3px solid rgba(255,255,255,0.2); border-top-color:var(--primary); border-radius:50%; animation:spin 0.7s linear infinite; }
+        .spinner { width:42px; height:42px; border:3px solid rgba(255,255,255,0.2); border-top-color:var(--primary); border-radius:50%; animation:spin 0.7s linear infinite; }
         @keyframes spin { to { transform:rotate(360deg); } }
 
         @media (min-width: 640px) {
@@ -711,7 +701,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
     <div id="loading-cover" class="loading-cover">
         <div class="spinner"></div>
-        <span id="loading-msg" style="font-size:0.85rem; color:#e2e8f0;">Sincronizando conteúdos com o servidor...</span>
+        <span id="loading-msg" style="font-size:0.88rem; color:#e2e8f0; font-weight:700;">Conectando ao servidor IPTV...</span>
     </div>
 
     <!-- 1. LOGIN -->
@@ -778,7 +768,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <main class="content-wrap hidden" id="main-content">
         <!-- TELA HOME -->
         <div id="view-home">
-            <!-- Hero Carousel 5s exclusivo Filmes/Séries -->
             <div class="hero-box">
                 <div class="hero-bg" id="hero-bg"></div>
                 <div class="hero-overlay">
@@ -809,7 +798,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <!-- TELA CATÁLOGO (FILMES / SÉRIES / TV) -->
         <div id="view-catalog" class="hidden">
             <div class="input-wrap" style="margin-bottom:0.75rem;">
-                <input type="text" id="catalog-search" placeholder="🔍 Pesquisar por nome ou canal...">
+                <input type="text" id="catalog-search" placeholder="🔍 Pesquisar por título ou canal...">
             </div>
             <div style="display:flex; justify-content:space-between; font-size:0.75rem; color:var(--text-muted); margin-bottom:0.6rem;">
                 <span id="cat-selected-label">Categoria: Todas</span>
@@ -898,7 +887,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 <span id="epg-time" style="color:var(--text-muted);">--:--</span>
             </div>
 
-            <!-- Botões Principais: Play/Pause, -10s, +10s, Preenchimento Horizontal -->
             <div class="deck-row">
                 <div style="display:flex; gap:0.4rem; align-items:center;">
                     <button class="player-btn" id="btn-rw">⏪ -10s</button>
@@ -912,7 +900,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 </div>
             </div>
 
-            <!-- Seletor de Velocidades: 1.0, 1.3, 1.5, 1.8, 2.0 -->
             <div class="deck-row">
                 <span style="font-size:0.7rem; color:var(--text-muted);">Velocidade:</span>
                 <div style="display:flex; gap:0.3rem;">
@@ -926,7 +913,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         </div>
     </div>
 
-    <!-- 7. TELA ADMIN (COM MONITORAMENTO EM TEMPO REAL E BANCO SEPARADO DE MACS) -->
+    <!-- 7. TELA ADMIN -->
     <div id="screen-admin" class="screen">
         <div style="max-width:960px; margin:1.5rem auto; padding:1rem;">
             <div style="display:flex; justify-content:space-between; margin-bottom:1rem; align-items:center;">
@@ -940,7 +927,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             </div>
 
             <div id="adm-content" class="hidden">
-                <!-- MONITORAMENTO EM TEMPO REAL -->
                 <div class="config-card" style="border-color:var(--primary);">
                     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.75rem;">
                         <div class="config-title" style="margin:0;">🔴 Monitoramento em Tempo Real (Transmissões Ativas)</div>
@@ -966,7 +952,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     </div>
                 </div>
 
-                <!-- BANCO SEPARADO: REGISTRO DE MACs, IPs E LOCALIZAÇÃO -->
                 <div class="config-card">
                     <div class="config-title">🛡️ Banco de Dispositivos Registrados (MAC, IP e Localização)</div>
                     <p style="font-size:0.75rem; color:var(--text-muted); margin-bottom:0.6rem;">Salvo no banco de dados separado <code>devices_tracking.db</code> com geolocalização e histórico de acesso.</p>
@@ -988,7 +973,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     </div>
                 </div>
 
-                <!-- CONFIGURAÇÕES GERAIS -->
                 <div class="config-card">
                     <div class="config-title">⚙️ Configurações de Conexão</div>
                     <div class="form-group"><label>DNS Servidor IPTV (Xtream Codes)</label><div class="input-wrap"><textarea id="adm-dns" rows="2"></textarea></div></div>
@@ -1004,7 +988,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <script>
         lucide.createIcons();
 
-        // ESTADO GLOBAL
         let activeTab = "home";
         let activeCategory = "Todas";
         let currentAuth = JSON.parse(localStorage.getItem("sf_session") || "null");
@@ -1018,11 +1001,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         let monitorInterval = null;
         let playSecondsCounter = 0;
 
-        const ADULT_KEYWORDS = ["adult", "+18", "xxx", "porn", "erotic", "sexy", "playboy", "venus", "for adults", "hot"];
+        const ADULT_REGEX = /\b(adult[os]?|\+18|xxx|porn[oa]?|erotic[oa]?|sexy|playboy|venus|for adults)\b/i;
 
         function isAdultItem(item) {
-            const txt = ((item.name || "") + " " + (item.group || "")).toLowerCase();
-            return ADULT_KEYWORDS.some(kw => txt.includes(kw));
+            const txt = (item.name || "") + " " + (item.group || "");
+            return ADULT_REGEX.test(txt);
         }
 
         function getOrCreateMac() {
@@ -1050,7 +1033,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         }
         loadPublicConfig();
 
-        // HERO CAROUSEL 5s (EXCLUSIVO FILMES E SÉRIES)
         let heroItems = [];
         let heroIdx = 0;
         let heroMs = 0;
@@ -1075,18 +1057,23 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             document.getElementById("btn-hero-play").onclick = () => openItemPlay(it);
         }
 
-        // CARREGA DADOS VIA PROXY PYTHON (ZERO CORS E ZERO BANDA DE VÍDEO NA VPS)
+        // CARREGAMENTO PROGRESSIVO EM SEQUÊNCIA (UI FLUIDA E ZERO DEADLOCK)
         async function fetchXtreamData() {
-            if (!currentAuth || !currentAuth.dns) return;
-            const dns = currentAuth.dns;
+            const dns = (currentAuth && currentAuth.dns) || serverConfig.dns;
+            if (!currentAuth || !dns) {
+                alert("Servidor IPTV não configurado. Verifique o DNS na Área Admin.");
+                return;
+            }
             const u = currentAuth.username;
             const p = currentAuth.password;
 
             const cover = document.getElementById("loading-cover");
+            const msgEl = document.getElementById("loading-msg");
             cover.classList.add("active");
 
             try {
-                // 1. Categorias via Proxy Python
+                // Passo 1: Categorias
+                msgEl.textContent = "Obtendo categorias do servidor...";
                 const [rTvCat, rVodCat, rSerCat] = await Promise.all([
                     fetch(`/api/xtream/proxy?dns=${encodeURIComponent(dns)}&username=${encodeURIComponent(u)}&password=${encodeURIComponent(p)}&action=get_live_categories`),
                     fetch(`/api/xtream/proxy?dns=${encodeURIComponent(dns)}&username=${encodeURIComponent(u)}&password=${encodeURIComponent(p)}&action=get_vod_categories`),
@@ -1096,57 +1083,68 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 xtreamCategories.movies = await rVodCat.json();
                 xtreamCategories.series = await rSerCat.json();
 
-                // 2. Streams via Proxy Python
-                const [rVod, rSer, rLive] = await Promise.all([
-                    fetch(`/api/xtream/proxy?dns=${encodeURIComponent(dns)}&username=${encodeURIComponent(u)}&password=${encodeURIComponent(p)}&action=get_vod_streams`),
-                    fetch(`/api/xtream/proxy?dns=${encodeURIComponent(dns)}&username=${encodeURIComponent(u)}&password=${encodeURIComponent(p)}&action=get_series`),
-                    fetch(`/api/xtream/proxy?dns=${encodeURIComponent(dns)}&username=${encodeURIComponent(u)}&password=${encodeURIComponent(p)}&action=get_live_streams`)
-                ]);
-                const vods = await rVod.json();
-                const series = await rSer.json();
-                const live = await rLive.json();
+                // Cria Mapas ID -> Nome da Categoria
+                const vodCatMap = {};
+                (Array.isArray(xtreamCategories.movies) ? xtreamCategories.movies : []).forEach(c => vodCatMap[c.category_id] = c.category_name);
 
-                // URL Direta de Vídeo (O vídeo NÃO passa pela VPS!)
+                const serCatMap = {};
+                (Array.isArray(xtreamCategories.series) ? xtreamCategories.series : []).forEach(c => serCatMap[c.category_id] = c.category_name);
+
+                const liveCatMap = {};
+                (Array.isArray(xtreamCategories.tv) ? xtreamCategories.tv : []).forEach(c => liveCatMap[c.category_id] = c.category_name);
+
+                // Passo 2: Filmes (Carrega e já exibe na Home)
+                msgEl.textContent = "Sincronizando Filmes Recentes...";
+                const rVod = await fetch(`/api/xtream/proxy?dns=${encodeURIComponent(dns)}&username=${encodeURIComponent(u)}&password=${encodeURIComponent(p)}&action=get_vod_streams`);
+                const vods = await rVod.json();
                 catalog.movies = (Array.isArray(vods) ? vods : []).map(v => ({
-                    id: v.stream_id, name: v.name, group: v.category_name || "Filmes", category_id: v.category_id,
+                    id: v.stream_id, name: v.name, group: vodCatMap[v.category_id] || "Filmes", category_id: v.category_id,
                     type: "movies", logo: v.stream_icon, container_extension: v.container_extension || "mp4",
                     rating: v.rating,
                     url: `${dns}/movie/${u}/${p}/${v.stream_id}.${v.container_extension || 'mp4'}`
                 }));
 
+                heroItems = [...catalog.movies].filter(it => !isAdultItem(it)).slice(0, 15);
+                if (heroItems.length > 0) renderHeroSlide(heroItems[0]);
+                renderRowList("carousel-home-movies", catalog.movies);
+
+                // Passo 3: Séries
+                msgEl.textContent = "Sincronizando Séries...";
+                const rSer = await fetch(`/api/xtream/proxy?dns=${encodeURIComponent(dns)}&username=${encodeURIComponent(u)}&password=${encodeURIComponent(p)}&action=get_series`);
+                const series = await rSer.json();
                 catalog.series = (Array.isArray(series) ? series : []).map(s => ({
-                    id: s.series_id, name: s.name, group: s.category_name || "Séries", category_id: s.category_id,
+                    id: s.series_id, name: s.name, group: serCatMap[s.category_id] || "Séries", category_id: s.category_id,
                     type: "series", logo: s.cover, rating: s.rating,
                     url: `${dns}/series/${u}/${p}/${s.series_id}.mp4`
                 }));
 
+                heroItems = [...catalog.movies, ...catalog.series].filter(it => !isAdultItem(it)).slice(0, 15);
+                renderRowList("carousel-home-series", catalog.series);
+
+                // Passo 4: Canais de TV
+                msgEl.textContent = "Sincronizando TV ao Vivo...";
+                const rLive = await fetch(`/api/xtream/proxy?dns=${encodeURIComponent(dns)}&username=${encodeURIComponent(u)}&password=${encodeURIComponent(p)}&action=get_live_streams`);
+                const live = await rLive.json();
                 catalog.tv = (Array.isArray(live) ? live : []).map(l => ({
-                    id: l.stream_id, name: l.name, group: l.category_name || "Canais", category_id: l.category_id,
+                    id: l.stream_id, name: l.name, group: liveCatMap[l.category_id] || "Canais", category_id: l.category_id,
                     type: "tv", logo: l.stream_icon,
                     url: `${dns}/live/${u}/${p}/${l.stream_id}.ts`
                 }));
 
-                // Prepara Hero Carousel (Exclusivo Filmes e Séries - ZERO Adulto e ZERO Canais)
-                heroItems = [...catalog.movies, ...catalog.series].filter(it => !isAdultItem(it)).slice(0, 15);
-                if (heroItems.length > 0) renderHeroSlide(heroItems[0]);
+                renderRowList("carousel-home-tv", catalog.tv);
 
-                renderHomeCarousels();
             } catch (e) {
-                console.error("Erro ao carregar conteúdos:", e);
+                console.error("Erro no carregamento:", e);
+                alert("Houve uma oscilação na resposta do servidor IPTV. Tente recarregar pelo menu Ajustes.");
             } finally {
                 cover.classList.remove("active");
             }
         }
 
-        function renderHomeCarousels() {
-            const fillC = (id, list) => {
-                const el = document.getElementById(id);
-                el.innerHTML = "";
-                list.filter(it => !isAdultItem(it)).slice(0, 16).forEach(it => el.appendChild(createPosterCard(it)));
-            };
-            fillC("carousel-home-movies", catalog.movies);
-            fillC("carousel-home-series", catalog.series);
-            fillC("carousel-home-tv", catalog.tv);
+        function renderRowList(containerId, list) {
+            const el = document.getElementById(containerId);
+            el.innerHTML = "";
+            list.filter(it => !isAdultItem(it)).slice(0, 16).forEach(it => el.appendChild(createPosterCard(it)));
         }
 
         function createPosterCard(it) {
@@ -1172,7 +1170,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             return card;
         }
 
-        // MODAL TMDB DETALHES
         async function openTmdbDetails(it) {
             document.getElementById("tmdb-modal").classList.add("active");
             document.getElementById("tmdb-title").textContent = it.name;
@@ -1191,7 +1188,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     const d = await r.json();
                     const info = d.info || {};
                     const plot = info.plot || info.description || "Sinopse não informada pelo servidor.";
-                    const rating = info.rating ? `⭐ TMDB: ${info.rating}/10` : "⭐ TMDB Disponível";
+                    const rating = info.rating ? `⭐ Avaliação: ${info.rating}/10` : "⭐ Disponível";
                     const year = info.releasedate ? ` • ${info.releasedate.split('-')[0]}` : "";
 
                     document.getElementById("tmdb-meta").textContent = `${rating}${year} • ${it.group}`;
@@ -1204,7 +1201,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         }
         document.getElementById("btn-tmdb-close").onclick = () => document.getElementById("tmdb-modal").classList.remove("active");
 
-        // DRAWER LATERAL AUTOMÁTICO DE CATEGORIAS
         function openCategoriesDrawer() {
             const list = document.getElementById("drawer-list");
             list.innerHTML = "";
@@ -1217,13 +1213,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             bAll.onclick = () => { selectCategory("Todas"); closeDrawer(); };
             list.appendChild(bAll);
 
-            cats.forEach(c => {
+            (Array.isArray(cats) ? cats : []).forEach(c => {
                 const b = document.createElement("button");
                 b.className = `drawer-item ${activeCategory === c.category_name ? "active" : ""}`;
                 b.innerHTML = `<span>${c.category_name}</span>`;
                 b.onclick = () => {
-                    const isAdult = ADULT_KEYWORDS.some(k => c.category_name.toLowerCase().includes(k));
-                    if (isAdult) {
+                    if (ADULT_REGEX.test(c.category_name)) {
                         const entered = prompt("🔒 Digite o PIN de 4 dígitos para conteúdo Adulto:");
                         if (entered !== adultPin) return alert("PIN incorreto!");
                     }
@@ -1269,11 +1264,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             document.getElementById("cat-total-label").textContent = `${filtered.length} títulos`;
             const grid = document.getElementById("posters-grid");
             grid.innerHTML = "";
-            filtered.slice(0, 120).forEach(it => grid.appendChild(createPosterCard(it)));
+            filtered.slice(0, 150).forEach(it => grid.appendChild(createPosterCard(it)));
         }
         document.getElementById("catalog-search").oninput = renderCatalogGrid;
 
-        // PLAYER DE VÍDEO (COM MONITORAMENTO EM TEMPO REAL)
         const vEl = document.getElementById("video-player");
 
         function sendMonitorHeartbeat(isPlaying) {
@@ -1326,7 +1320,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 vEl.play().catch(()=>{});
             }
 
-            // Inicia Batimento de Monitoramento a cada 4 segundos
             if (monitorInterval) clearInterval(monitorInterval);
             sendMonitorHeartbeat(true);
             monitorInterval = setInterval(() => {
@@ -1396,7 +1389,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             };
         });
 
-        // NAVEGAÇÃO BOTTOM BAR
         document.querySelectorAll(".bottom-nav .bnav-item").forEach(btn => {
             btn.onclick = () => {
                 activeTab = btn.dataset.tab;
@@ -1456,7 +1448,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         document.getElementById("btn-theme-midnight").onclick = () => document.body.className = "theme-midnight";
         document.getElementById("btn-clear-cache").onclick = () => { localStorage.clear(); location.reload(); };
 
-        // LOGIN E TESTE GRÁTIS
         document.getElementById("form-login").onsubmit = async (e) => {
             e.preventDefault();
             const u = document.getElementById("l-user").value.trim();
@@ -1522,7 +1513,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             location.reload();
         };
 
-        // ADMIN (MONITORAMENTO EM TEMPO REAL E DISPOSITIVOS)
         let adminPolling = null;
 
         document.getElementById("btn-go-admin").onclick = () => {
@@ -1543,7 +1533,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 document.getElementById("adm-content").classList.remove("hidden");
                 loadAdminDashboard();
                 if (adminPolling) clearInterval(adminPolling);
-                adminPolling = setInterval(loadAdminDashboard, 3500); // Polling em tempo real a cada 3.5s
+                adminPolling = setInterval(loadAdminDashboard, 3500);
             } else alert("Senha incorreta");
         };
 
@@ -1558,7 +1548,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 document.getElementById("adm-pay-link").value = d.settings.default_payment_link || "";
                 document.getElementById("adm-wa-link").value = d.settings.support_whatsapp || "";
 
-                // 1. Tabela Monitoramento em Tempo Real
                 const monTbody = document.getElementById("adm-monitoring-tbody");
                 monTbody.innerHTML = "";
                 document.getElementById("live-count").textContent = `${d.monitoring.length} assistindo agora`;
@@ -1581,7 +1570,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     });
                 }
 
-                // 2. Tabela de Dispositivos (Banco Separado com Botão Deletar)
                 const devTbody = document.getElementById("adm-devices-tbody");
                 devTbody.innerHTML = "";
                 d.devices.forEach(dev => {
@@ -1616,7 +1604,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             alert("✅ Configurações salvas!");
         };
 
-        // AUTO-LOGIN
         if (currentAuth && currentAuth.username) enterApp();
     </script>
 </body>
