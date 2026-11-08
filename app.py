@@ -2527,26 +2527,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 currentAuth = tr;
                 localStorage.setItem("sf_session", JSON.stringify(tr));
 
-                // Popula os dados reais sem mensagem modelo do sistema
-                document.getElementById("tr-u").textContent = tr.username || "-";
-                document.getElementById("tr-p").textContent = tr.password || "-";
-                document.getElementById("tr-exp").textContent = tr.expires_formatted || "-";
-                document.getElementById("tr-plan").textContent = tr.plan_type || "Teste Grátis";
-
-                if (tr.apps_smart_tv) {
-                    document.getElementById("row-tr-tv").classList.remove("hidden");
-                    document.getElementById("tr-tv").textContent = tr.apps_smart_tv;
-                } else {
-                    document.getElementById("row-tr-tv").classList.add("hidden");
-                }
-
-                if (tr.apps_android) {
-                    document.getElementById("row-tr-and").classList.remove("hidden");
-                    document.getElementById("tr-and").textContent = tr.apps_android;
-                } else {
-                    document.getElementById("row-tr-and").classList.add("hidden");
-                }
-
                 if (tr.payment_link) {
                     const payBtn = document.getElementById("btn-pay-link");
                     payBtn.classList.remove("hidden");
@@ -2555,14 +2535,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     document.getElementById("btn-pay-link").classList.add("hidden");
                 }
 
-                if (tr.raw_message && tr.raw_message.length > 30) {
-                    document.getElementById("row-tr-raw").classList.remove("hidden");
+                if (tr.raw_message) {
                     document.getElementById("tr-raw").textContent = tr.raw_message;
                 } else {
-                    document.getElementById("row-tr-raw").classList.add("hidden");
+                    document.getElementById("tr-raw").textContent = "Teste criado com sucesso!\nUsuário: " + tr.username + "\nSenha: " + tr.password;
                 }
 
-                const shareText = tr.raw_message || "Teste criado com sucesso!";
+                const shareText = tr.raw_message || ("Usuário: " + tr.username + "\nSenha: " + tr.password);
 
                 document.getElementById("btn-copy-tr").onclick = () => {
                     navigator.clipboard.writeText(shareText);
@@ -2571,9 +2550,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 document.getElementById("btn-wa-tr").href = `https://wa.me/?text=${encodeURIComponent(shareText)}`;
 
                 document.getElementById("trial-modal").classList.add("active");
+
             } catch (e) {
-                console.error(e);
-                alert("Erro de conexão ao gerar o teste: " + e.message);
+                alert("Erro de conexão ao gerar o teste.");
             } finally {
                 btn.textContent = "⚡ Gerar Teste Grátis Automático";
                 btn.disabled = false;
