@@ -2572,7 +2572,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
                 document.getElementById("trial-modal").classList.add("active");
             } catch (e) {
-                alert("Erro de conexão ao gerar o teste.");
+                console.error(e);
+                alert("Erro de conexão ao gerar o teste: " + e.message);
             } finally {
                 btn.textContent = "⚡ Gerar Teste Grátis Automático";
                 btn.disabled = false;
