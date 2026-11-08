@@ -45,7 +45,7 @@ def migrate_table_columns(conn, table_name, columns_dict):
             if col_name not in existing_cols:
                 cur.execute(f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_type}")
         conn.commit()
-    except Exception:
+    except Exception as e:
         pass
 
 def init_dbs():
@@ -76,6 +76,7 @@ def init_dbs():
         is_trial INTEGER DEFAULT 0
     )""")
 
+    # Garante que nenhuma coluna falte em bancos pré-existentes
     migrate_table_columns(conn1, "active_users", {
         "dns_used": "TEXT",
         "m3u_url": "TEXT",
@@ -108,7 +109,10 @@ def init_dbs():
         "default_payment_link": "",
         "support_whatsapp": "https://wa.me/5500000000000?text=Preciso%20de%20suporte%20no%20StreamFlix",
         "tmdb_api_key": "",
-        "adult_pin": "0000"
+        "adult_pin": "0000",
+        "apps_smart_tv": "",
+        "apps_android": "",
+        "custom_domain": ""
     }
     for k, v in defaults.items():
         cur1.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v))
@@ -219,7 +223,7 @@ def record_device_entry(mac, ip, ua_string, username="Desconhecido"):
     conn.close()
 
 # ==========================================================
-# 3. PARSER DINÂMICO FORMATADO APROPRIADAMENTE (MODELO SOLICITADO)
+# 3. PARSER DINÂMICO DE TESTES (CAPTURA 100% DOS DADOS DO SERVIDOR)
 # ==========================================================
 def format_custom_trial_message(data):
     msg = "*SEGUE OS DADOS DE ACESSO*\n\n"
@@ -229,7 +233,7 @@ def format_custom_trial_message(data):
     msg += f"🔗 Assinar/Renovar Plano: {data.get('payment_link','')}\n\n"
     msg += f"🗓️ *Criado em:* {data.get('created_formatted', datetime.now().strftime('%d/%m/%Y %H:%M:%S'))}\n"
     msg += f"🗓️ *Vencimento:* {data.get('expires_formatted','')}\n"
-    msg += f"📶 *Conexões:* {data.get('max_connections', '1')}\n"
+    msg += f"📶 *Conexões:* {data.get('max_connections', '1')}\n\n"
     msg += "—————————————————\n"
     
     if data.get('apps_smart_tv'):
@@ -243,6 +247,7 @@ def format_custom_trial_message(data):
     return msg.strip()
 
 def parse_trial_api_response(raw_text, cfg):
+    """Extrai dinamicamente dados do servidor IPTV sem fixar valores modelo."""
     now_ts = int(time.time())
     hours = float(cfg.get("trial_duration_hours") or 6)
     fallback_exp_ts = now_ts + int(hours * 3600)
@@ -269,23 +274,26 @@ def parse_trial_api_response(raw_text, cfg):
         return res
 
     cleaned = raw_text.strip()
+
+    # 1. Tenta decodificar como JSON estruturado
     try:
         data = json.loads(cleaned)
         if isinstance(data, dict):
-            u = data.get("username")
-            p = data.get("password")
-            dns = data.get("dns")
-            plan = data.get("package")
-            pay = data.get("payUrl") or data.get("payment_link")
-            exp_formatted = data.get("expiresAtFormatted") or data.get("expiresAt")
-            created_formatted = data.get("createdAtFormatted") or data.get("createdAt")
-            conns = data.get("connections")
+            sub = data.get("data") or data.get("result") or data.get("user_info") or data
+            u = sub.get("username") or sub.get("user") or sub.get("login") or data.get("username")
+            p = sub.get("password") or sub.get("pass") or sub.get("senha") or data.get("password")
+            dns = sub.get("dns") or sub.get("server") or data.get("dns")
+            plan = sub.get("plan") or sub.get("plan_type") or sub.get("package") or sub.get("pacote") or data.get("plan")
+            pay = sub.get("payUrl") or sub.get("payment_link") or sub.get("checkout_url") or sub.get("pix_url") or data.get("payUrl")
+            exp_formatted = data.get("expiresAtFormatted") or data.get("expiresAt") or data.get("expires_formatted")
+            created_formatted = data.get("createdAtFormatted") or data.get("createdAt") or data.get("created_formatted")
+            conns = data.get("connections") or data.get("max_connections")
             reply = data.get("reply") or ""
 
             if u: res["username"] = str(u).strip()
             if p: res["password"] = str(p).strip()
             if dns: res["dns"] = str(dns).strip().rstrip("/")
-            if plan: res["plan_type"] = str(plan).replace("🔹", "").strip()
+            if plan: res["plan_type"] = str(plan).replace("🔹", "").replace("TESTE", "Teste").strip()
             if conns: res["max_connections"] = str(conns).strip()
             if pay: res["payment_link"] = str(pay).strip()
             if exp_formatted: res["expires_formatted"] = str(exp_formatted).strip()
@@ -295,14 +303,14 @@ def parse_trial_api_response(raw_text, cfg):
                 # Extrai parcerias de TV
                 tv_matches = []
                 for p_match in re.findall(r'(\*?Parce?ria[^\n*]+\*?[\s\S]*?\*COD:\*?\s*[^\n]+)', reply, re.IGNORECASE):
-                    clean_p = p_match.replace("*", "").replace("—", "").replace("🟣", "").replace("🟢", "").replace("🛑", "").replace("", "").strip()
+                    clean_p = p_match.replace("*", "").replace("—", "").replace("🟣", "").replace("🟢", "").replace("🛑", "").replace("🟡", "").strip()
                     if clean_p: tv_matches.append(clean_p)
                 if tv_matches: res["apps_smart_tv"] = "\n\n".join(tv_matches)
 
                 # Extrai apps Android
                 and_matches = []
                 for a_match in re.findall(r'(App:\s*[^\n*]+[\s\S]*?(?=——|—|\n\n\ud83d|\n\n\u26a0|$))', reply, re.IGNORECASE):
-                    clean_a = a_match.replace("*", "").replace("—", "").replace("⚠️", "").replace("▫️", "").replace("🔹", "").replace("", "").strip()
+                    clean_a = a_match.replace("*", "").replace("—", "").replace("⚠️", "").replace("▫️", "").replace("🔹", "").replace("⚫️", "").replace("🔵", "").strip()
                     if clean_a: and_matches.append(clean_a)
                 if and_matches: res["apps_android"] = "\n\n".join(and_matches)
 
@@ -311,15 +319,19 @@ def parse_trial_api_response(raw_text, cfg):
     except Exception:
         pass
 
+    # 2. Extrai de texto formatado / mensagem via Regex
     if not res["username"]:
         u_m = re.search(r"(?:usu[aá]rio|user|login)\s*[:=\-*]+\s*([A-Za-z0-9_.\-]+)", cleaned, re.I)
         if u_m: res["username"] = u_m.group(1).strip()
+
     if not res["password"]:
         p_m = re.search(r"(?:senha|password|pass)\s*[:=\-*]+\s*([A-Za-z0-9_.\-]+)", cleaned, re.I)
         if p_m: res["password"] = p_m.group(1).strip()
+
     if not res["payment_link"]:
         pay_m = re.search(r"(https?://[^\s\"'<>]+(?:checkout|fatura|pagamento|mercadopago|pix|assinar|pay)[^\s\"'<>]*)", cleaned, re.I)
         if pay_m: res["payment_link"] = pay_m.group(1).strip()
+
     if not res["m3u_url"] and res["username"] and res["password"] and res["dns"]:
         res["m3u_url"] = f"{res['dns']}/get.php?username={urllib.parse.quote(res['username'])}&password={urllib.parse.quote(res['password'])}&type=m3u_plus&output=ts"
 
@@ -395,7 +407,7 @@ def api_monitor_heartbeat():
     return jsonify({"ok": True})
 
 # ==========================================================
-# 6. ROTAS DE LOGIN E TESTE GRÁTIS
+# 6. ROTAS DE LOGIN, TESTE GRÁTIS E ADMINISTRAÇÃO
 # ==========================================================
 @app.route("/api/config")
 def api_config():
@@ -791,7 +803,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             box-shadow: 0 20px 60px rgba(0,0,0,0.95), 0 0 35px rgba(16, 185, 129, 0.22);
             animation: cardPop 0.32s cubic-bezier(0.16, 1, 0.3, 1) forwards;
         }
-        .trial-app-box { background:rgba(255,255,255,0.03); border:1px solid var(--border); border-radius:12px; padding:0.85rem; font-size:0.78rem; color:#cbd5e1; white-space:pre-wrap; line-height:1.55; word-break:break-word; margin:1rem 0; font-family:monospace; }
+        .trial-app-box { background:rgba(255,255,255,0.03); border:1px solid var(--border); border-radius:12px; padding:0.85rem; font-size:0.78rem; color:#cbd5e1; white-space:pre-wrap; line-height:1.55; word-break:break-word; margin:1rem 0; text-align:left; }
         
         /* TOPBAR & NAVEGAÇÃO */
         .navbar { height:58px; background:var(--bg-glass); backdrop-filter:blur(12px); border-bottom:1px solid var(--border); display:flex; align-items:center; justify-content:space-between; padding:0 1rem; position:sticky; top:0; z-index:120; }
@@ -1054,15 +1066,20 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             border: 1px solid rgba(255, 255, 255, 0.14);
             border-radius: 16px;
             padding: 6px;
-            display: none;
+            display: none; /* Só exibe ao clicar, com a classe open */
             flex-direction: column;
             gap: 4px;
             box-shadow: 0 14px 35px rgba(0,0,0,0.9);
             min-width: 145px;
             z-index: 60;
+            pointer-events: none; /* Garante que não bloqueie cliques se invisível */
+            opacity: 0;
+            transition: opacity 0.2s;
         }
         .dock-bubble.open {
             display: flex;
+            opacity: 1;
+            pointer-events: auto;
             animation: fadeIn 0.18s ease forwards;
         }
         .bubble-item {
@@ -1250,12 +1267,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 <a href="#" target="_blank" class="btn-pill btn-pill-success" id="btn-support-wa" style="width:100%;">📲 Chamar no WhatsApp</a>
             </div>
             
-            <a href="/admin" class="btn-pill btn-pill-outline" style="width:100%; margin-bottom:1rem; border-color:var(--gold); color:var(--gold);">⚙️ Acessar Painel Administrador da VPS</a>
             <button class="btn-pill btn-pill-outline" id="btn-logout-cfg" style="width:100%; border-color:#e50914; color:#fca5a5;">Sair da Conta</button>
         </div>
     </main>
 
-    <!-- MODAL DETALHES DE FILMES -->
+    <!-- MODAL DETALHES DE FILMES (COM SINOPSE REAL) -->
     <div id="tmdb-modal" class="series-modal">
         <div class="series-box">
             <div class="series-hero" id="tmdb-hero"><div class="series-hero-overlay"></div></div>
@@ -1337,7 +1353,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 <span class="seek-time-label" id="seek-total-time">00:00</span>
             </div>
 
-            <!-- BUBBLES QUE ABREM POR CIMA AO CLICAR NO BOTÃO -->
+            <!-- BUBBLES QUE ABREM POR CIMA AO CLICAR NO BOTÃO E SOMEM IMEDIATAMENTE APÓS USO -->
             <div class="dock-bubble" id="bubble-speed">
                 <button class="bubble-item active" data-speed="1.0">1.0x (Normal)</button>
                 <button class="bubble-item" data-speed="1.3">1.3x</button>
@@ -1367,6 +1383,81 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 <button class="mini-btn" id="dock-btn-speed" title="Velocidade">1.0x</button>
                 <button class="mini-btn" id="dock-btn-aspect" title="Ajuste de Tela">📐</button>
                 <button class="mini-btn" id="dock-btn-engine" title="Decodificador">⚙️</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 7. TELA ADMIN -->
+    <div id="screen-admin" class="screen">
+        <div style="max-width:960px; margin:1.5rem auto; padding:1rem;">
+            <div style="display:flex; justify-content:space-between; margin-bottom:1rem; align-items:center;">
+                <h2>⚙️ Painel Administrador</h2>
+                <button class="btn-pill btn-pill-outline" id="btn-exit-admin">Voltar ao Player</button>
+            </div>
+
+            <div id="adm-login-box" class="config-card">
+                <div class="form-group"><label>Senha Admin</label><div class="input-wrap"><input type="password" id="adm-pass" placeholder="admin123"></div></div>
+                <button class="btn-pill btn-pill-primary" id="btn-adm-login">Acessar Painel</button>
+            </div>
+
+            <div id="adm-content" class="hidden">
+                <!-- MONITORAMENTO EM TEMPO REAL -->
+                <div class="config-card" style="border-color:var(--primary);">
+                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.75rem;">
+                        <div class="config-title" style="margin:0;">🔴 Monitoramento em Tempo Real (Transmissões Ativas)</div>
+                        <span class="badge-live" id="live-count">0 assistindo agora</span>
+                    </div>
+                    <div style="overflow-x:auto;">
+                        <table class="admin-table">
+                            <thead>
+                                <tr>
+                                    <th>Usuário</th>
+                                    <th>Conteúdo Reproduzido</th>
+                                    <th>Tempo</th>
+                                    <th>IP</th>
+                                    <th>Localização</th>
+                                    <th>MAC</th>
+                                    <th>Dispositivo</th>
+                                </tr>
+                            </thead>
+                            <tbody id="adm-monitoring-tbody">
+                                <tr><td colspan="7" style="text-align:center; color:var(--text-muted); padding:1rem;">Nenhum usuário assistindo no momento.</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- BANCO SEPARADO: REGISTRO DE MACs, IPs E LOCALIZAÇÃO COM BOTÃO DELETAR QUE LIBERA NOVO TESTE -->
+                <div class="config-card">
+                    <div class="config-title">🛡️ Banco de Dispositivos Registrados (MAC, IP e Localização)</div>
+                    <p style="font-size:0.75rem; color:var(--text-muted); margin-bottom:0.6rem;">Salvo no banco de dados separado <code>devices_tracking.db</code>. Ao deletar, todos os registros daquele aparelho são apagados permitindo novo teste.</p>
+                    <div style="overflow-x:auto;">
+                        <table class="admin-table">
+                            <thead>
+                                <tr>
+                                    <th>MAC</th>
+                                    <th>Último IP</th>
+                                    <th>Localização</th>
+                                    <th>Dispositivo</th>
+                                    <th>Usuário</th>
+                                    <th>Último Acesso</th>
+                                    <th>Ação</th>
+                                </tr>
+                            </thead>
+                            <tbody id="adm-devices-tbody"></tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- CONFIGURAÇÕES GERAIS -->
+                <div class="config-card">
+                    <div class="config-title">⚙️ Configurações de Conexão</div>
+                    <div class="form-group"><label>DNS Servidor IPTV (Xtream Codes)</label><div class="input-wrap"><textarea id="adm-dns" rows="2"></textarea></div></div>
+                    <div class="form-group"><label>URL API de Teste Automático</label><div class="input-wrap"><input type="text" id="adm-trial-api"></div></div>
+                    <div class="form-group"><label>Link Padrão de Pagamento (Fallback opcional)</label><div class="input-wrap"><input type="url" id="adm-pay-link"></div></div>
+                    <div class="form-group"><label>WhatsApp de Suporte (Link Completo)</label><div class="input-wrap"><input type="text" id="adm-wa-link" placeholder="https://wa.me/55..."></div></div>
+                    <button class="btn-pill btn-pill-primary" id="btn-adm-save">Salvar Alterações</button>
+                </div>
             </div>
         </div>
     </div>
@@ -1606,7 +1697,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 if (!text || !text.includes("#EXTINF")) throw new Error("Resposta da playlist vazia ou inválida");
                 await parseM3UContent(text);
             } catch (err) {
-                alert("Não foi possível carregar a playlist automaticamente do servidor. Entre em contato com o suporte.");
+                alert("Não foi possível carregar a playlist automaticamente do servidor.");
             } finally {
                 cover.classList.remove("active");
             }
@@ -1646,9 +1737,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             return card;
         }
 
-        // ==========================================================
         // SÉRIES: MODAL COM ESCOLHER TEMPORADA E EPISÓDIOS REAIS
-        // ==========================================================
         async function openSeriesDetails(it) {
             document.getElementById("series-modal").classList.add("active");
             document.getElementById("series-title").textContent = it.name;
@@ -2085,8 +2174,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 document.getElementById("seek-track-fill").style.width = "0%";
             }
 
-            document.getElementById("opt-vlc-ext").href = it.url;
-
             const epgBar = document.getElementById("epg-bar");
             if (it.type === "tv") {
                 epgBar.classList.add("active");
@@ -2112,8 +2199,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     hlsInstance = new Hls({
                         enableWorker: true,
                         lowLatencyMode: true,
-                        maxBufferLength: 5,
-                        maxMaxBufferLength: 10,
+                        maxBufferLength: 4,
+                        maxMaxBufferLength: 8,
                         liveSyncDurationCount: 3,
                         startLevel: -1,
                         autoStartLoad: true
@@ -2446,13 +2533,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 document.getElementById("tr-exp").textContent = tr.expires_formatted || "-";
                 document.getElementById("tr-plan").textContent = tr.plan_type || "Teste Grátis";
 
-                if (tr.m3u_url) {
-                    document.getElementById("row-tr-m3u").classList.remove("hidden");
-                    document.getElementById("tr-m3u").textContent = tr.m3u_url;
-                } else {
-                    document.getElementById("row-tr-m3u").classList.add("hidden");
-                }
-
                 if (tr.apps_smart_tv) {
                     document.getElementById("row-tr-tv").classList.remove("hidden");
                     document.getElementById("tr-tv").textContent = tr.apps_smart_tv;
@@ -2517,13 +2597,15 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             location.reload();
         };
 
-        // ADMIN
+        // ROTA ADMINISTRATIVA (INVISÍVEL NA INTERFACE DO CLIENTE)
         let adminPolling = null;
 
-        document.getElementById("btn-go-admin").onclick = () => {
+        // Injeção direta pelo JS para ativar a rota Admin se o path for /admin
+        if (window.location.pathname === "/admin") {
             document.getElementById("screen-login").classList.remove("active");
             document.getElementById("screen-admin").classList.add("active");
-        };
+        }
+
         document.getElementById("btn-exit-admin").onclick = () => {
             if (adminPolling) clearInterval(adminPolling);
             document.getElementById("screen-admin").classList.remove("active");
@@ -2609,7 +2691,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             alert("✅ Configurações salvas!");
         };
 
-        if (currentAuth && currentAuth.username) enterApp();
+        if (currentAuth && currentAuth.username && window.location.pathname !== "/admin") {
+            enterApp();
+        }
     </script>
 </body>
 </html>
