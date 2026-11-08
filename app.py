@@ -76,7 +76,6 @@ def init_dbs():
         is_trial INTEGER DEFAULT 0
     )""")
 
-    # Auto-migração que impede qualquer erro de coluna inexistente
     migrate_table_columns(conn1, "active_users", {
         "dns_used": "TEXT",
         "plan_type": "TEXT",
@@ -102,8 +101,8 @@ def init_dbs():
         "admin_user": "admin",
         "admin_pass": "admin123",
         "dns_list": "http://zavryqonix.online:80",
-        "trial_api_url": "",
-        "trial_duration_hours": "4",
+        "trial_api_url": "https://infinity.panelbr.site/api/chatbot/lKWOwGbWzo/boQ1Ye1ONY",
+        "trial_duration_hours": "6",
         "default_payment_link": "",
         "support_whatsapp": "https://wa.me/5500000000000?text=Preciso%20de%20suporte%20no%20StreamFlix",
         "tmdb_api_key": "",
@@ -221,12 +220,12 @@ def record_device_entry(mac, ip, ua_string, username="Desconhecido"):
     conn.close()
 
 # ==========================================================
-# 3. PARSER DINÂMICO DE TESTES (CAPTURA 100% DOS DADOS DO SERVIDOR)
+# 3. PARSER DINÂMICO DE TESTES (EXTRAÇÃO 100% REAL DO SERVIDOR)
 # ==========================================================
 def parse_trial_api_response(raw_text, cfg):
-    """Extrai dinamicamente dados do servidor IPTV sem fixar valores modelo."""
+    """Extrai os dados reais da API Infinity/PanelBR sem valores fictícios de modelo."""
     now_ts = int(time.time())
-    hours = float(cfg.get("trial_duration_hours") or 4)
+    hours = float(cfg.get("trial_duration_hours") or 6)
     fallback_exp_ts = now_ts + int(hours * 3600)
     fallback_exp_str = datetime.fromtimestamp(fallback_exp_ts).strftime("%d/%m/%Y às %H:%M")
     fallback_dns = (cfg.get("dns_list", "").splitlines()[0] if cfg.get("dns_list") else "").strip().rstrip("/")
@@ -235,7 +234,8 @@ def parse_trial_api_response(raw_text, cfg):
         "username": "",
         "password": "",
         "dns": fallback_dns,
-        "plan_type": "Teste Grátis IPTV",
+        "m3u_url": "",
+        "plan_type": "Teste Completo",
         "expires_at": fallback_exp_ts,
         "expires_formatted": fallback_exp_str,
         "payment_link": "",
@@ -249,48 +249,52 @@ def parse_trial_api_response(raw_text, cfg):
 
     cleaned = raw_text.strip()
 
-    # 1. Tenta decodificar como JSON estruturado
     try:
         data = json.loads(cleaned)
         if isinstance(data, dict):
-            sub = data.get("data") or data.get("result") or data.get("user_info") or data
-            u = sub.get("username") or sub.get("user") or sub.get("login") or data.get("username")
-            p = sub.get("password") or sub.get("pass") or sub.get("senha") or data.get("password")
-            dns = sub.get("dns") or sub.get("server") or data.get("dns")
-            plan = sub.get("plan") or sub.get("plan_type") or sub.get("package") or sub.get("pacote") or data.get("plan")
-            pay = sub.get("payment_link") or sub.get("checkout_url") or sub.get("pix_url") or sub.get("payment_url") or data.get("payment_link")
-            exp = sub.get("expires_at") or sub.get("exp_date") or sub.get("vencimento") or data.get("expires_at")
-            tv_apps = sub.get("apps_smart_tv") or sub.get("smart_tv") or sub.get("tv_apps") or data.get("apps_smart_tv")
-            and_apps = sub.get("apps_android") or sub.get("android_apps") or sub.get("mobile_apps") or data.get("apps_android")
-            msg = sub.get("message") or sub.get("msg") or sub.get("text") or data.get("message")
+            # 1. Chaves diretas JSON retornadas pelo painel Infinity
+            u = data.get("username")
+            p = data.get("password")
+            dns = data.get("dns")
+            plan = data.get("package")
+            pay = data.get("payUrl") or data.get("payment_link")
+            exp_formatted = data.get("expiresAtFormatted") or data.get("expiresAt")
+            reply = data.get("reply") or ""
 
             if u: res["username"] = str(u).strip()
             if p: res["password"] = str(p).strip()
             if dns: res["dns"] = str(dns).strip().rstrip("/")
-            if plan: res["plan_type"] = str(plan).strip()
+            if plan: res["plan_type"] = str(plan).replace("🔹", "").replace("TESTE", "Teste").strip()
             if pay: res["payment_link"] = str(pay).strip()
-            if tv_apps: res["apps_smart_tv"] = str(tv_apps).strip() if isinstance(tv_apps, str) else "\n".join(tv_apps)
-            if and_apps: res["apps_android"] = str(and_apps).strip() if isinstance(and_apps, str) else "\n".join(and_apps)
-            if msg and isinstance(msg, str) and not res["raw_message"]: res["raw_message"] = msg.strip()
+            if exp_formatted: res["expires_formatted"] = str(exp_formatted).strip()
+            if reply: res["raw_message"] = reply.strip()
 
-            if exp:
-                try:
-                    if str(exp).isdigit():
-                        res["expires_at"] = int(exp)
-                        res["expires_formatted"] = datetime.fromtimestamp(int(exp)).strftime("%d/%m/%Y às %H:%M")
-                    else:
-                        dt = datetime.fromisoformat(str(exp).replace("Z", "+00:00"))
-                        res["expires_at"] = int(dt.timestamp())
-                        res["expires_formatted"] = dt.strftime("%d/%m/%Y às %H:%M")
-                except Exception:
-                    res["expires_formatted"] = str(exp).strip()
+            # 2. Extrai aplicativos Smart TV e Android formatados do texto 'reply'
+            if reply:
+                # Smart TV: Parcerias e Códigos
+                tv_matches = []
+                for p_match in re.findall(r'(\*?Parce?ria[^\n*]+\*?[\s\S]*?\*COD:\*?\s*[^\n]+)', reply, re.IGNORECASE):
+                    clean_p = p_match.replace("*", "").replace("—", "").strip()
+                    if clean_p: tv_matches.append(clean_p)
+                if tv_matches:
+                    res["apps_smart_tv"] = "\n\n".join(tv_matches)
 
-            if msg and isinstance(msg, str):
-                cleaned = msg
-    except Exception:
+                # Android: Apps, Links, Códigos Downloader e PINs
+                and_matches = []
+                for a_match in re.findall(r'(\*?App:\s*[^\n*]+[\s\S]*?(?=——|—|\n\n\ud83d|\n\n\u26a0|$))', reply, re.IGNORECASE):
+                    clean_a = a_match.replace("*", "").replace("—", "").strip()
+                    if clean_a: and_matches.append(clean_a)
+                if and_matches:
+                    res["apps_android"] = "\n\n".join(and_matches)
+
+                # Link M3U direto caso venha no reply
+                m3u_find = re.search(r'(https?://[^\s\"\'<>]+(?:get\.php|\.m3u8?)[^\s\"\'<>]*)', reply, re.I)
+                if m3u_find:
+                    res["m3u_url"] = m3u_find.group(1).strip()
+    except Exception as e:
         pass
 
-    # 2. Extrai de texto formatado / mensagem via Regex
+    # Fallback Regex caso a resposta venha puramente em texto
     if not res["username"]:
         u_m = re.search(r"(?:usu[aá]rio|user|login)\s*[:=\-*]+\s*([A-Za-z0-9_.\-]+)", cleaned, re.I)
         if u_m: res["username"] = u_m.group(1).strip()
@@ -299,42 +303,12 @@ def parse_trial_api_response(raw_text, cfg):
         p_m = re.search(r"(?:senha|password|pass)\s*[:=\-*]+\s*([A-Za-z0-9_.\-]+)", cleaned, re.I)
         if p_m: res["password"] = p_m.group(1).strip()
 
-    exp_m = re.search(r"(?:vencimento|expir[a-zçãõ]*|validade)\s*[:=\-*]+\s*([^\r\n]+)", cleaned, re.I)
-    if exp_m:
-        res["expires_formatted"] = exp_m.group(1).replace("*", "").strip()
-
-    plan_m = re.search(r"(?:plano|pacote|tipo)\s*[:=\-*]+\s*([^\r\n]+)", cleaned, re.I)
-    if plan_m:
-        res["plan_type"] = plan_m.group(1).replace("*", "").strip()
-
     if not res["payment_link"]:
         pay_m = re.search(r"(https?://[^\s\"'<>]+(?:checkout|fatura|pagamento|mercadopago|pix|assinar|pay)[^\s\"'<>]*)", cleaned, re.I)
-        if pay_m:
-            res["payment_link"] = pay_m.group(1).strip()
-        else:
-            pay_block_m = re.search(r"(?:pagamento|assinar|renovar|fatura|pix)[\s\S]*?(https?://[^\s\"'<>]+)", cleaned, re.I)
-            if pay_block_m:
-                cand = pay_block_m.group(1).strip()
-                if not ("get.php" in cand or ".m3u" in cand or ".apk" in cand):
-                    res["payment_link"] = cand
+        if pay_m: res["payment_link"] = pay_m.group(1).strip()
 
-    if not res["apps_smart_tv"]:
-        tv_block = re.search(r"(?:smart\s*tv|tv\s*apps?|aplicativos?\s*smart)[\s\S]*?(?=(?:📱|android|pagamento|link|\n\n\n|$))", cleaned, re.I)
-        if tv_block:
-            txt = tv_block.group(0).strip()
-            txt = re.sub(r"^[^:\n]+[:*]+\s*", "", txt).strip()
-            res["apps_smart_tv"] = txt
-
-    if not res["apps_android"]:
-        and_block = re.search(r"(?:android|mobile|celular|tv\s*box)[\s\S]*?(?=(?:💳|pagamento|assinar|link\s*de|\n\n\n|$))", cleaned, re.I)
-        if and_block:
-            txt = and_block.group(0).strip()
-            txt = re.sub(r"^[^:\n]+[:*]+\s*", "", txt).strip()
-            res["apps_android"] = txt
-
-    dns_m = re.search(r"(https?://[A-Za-z0-9_.\-]+(?::\d+)?)", cleaned, re.I)
-    if dns_m and not res["dns"]:
-        res["dns"] = dns_m.group(1).strip().rstrip("/")
+    if not res["m3u_url"] and res["username"] and res["password"] and res["dns"]:
+        res["m3u_url"] = f"{res['dns']}/get.php?username={urllib.parse.quote(res['username'])}&password={urllib.parse.quote(res['password'])}&type=m3u_plus&output=ts"
 
     return res
 
@@ -513,31 +487,34 @@ def api_request_trial():
     trial_api_url = (cfg.get("trial_api_url") or "").strip()
     raw_api_resp = ""
 
+    # Dispara a requisição POST diretamente para a API configurada
     if trial_api_url:
         try:
-            req = urllib.request.Request(trial_api_url, headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-            })
-            with urllib.request.urlopen(req, timeout=14, context=SSL_CTX) as resp:
+            req_post = urllib.request.Request(
+                trial_api_url,
+                data=b"{}",
+                headers={
+                    "Content-Type": "application/json",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+                    "Accept": "*/*"
+                },
+                method="POST"
+            )
+            with urllib.request.urlopen(req_post, timeout=15, context=SSL_CTX) as resp:
                 raw_api_resp = resp.read().decode("utf-8", errors="ignore")
         except Exception:
             try:
-                req_post = urllib.request.Request(
-                    trial_api_url,
-                    data=b"{}",
-                    headers={
-                        "Content-Type": "application/json",
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-                    },
-                    method="POST"
-                )
-                with urllib.request.urlopen(req_post, timeout=14, context=SSL_CTX) as resp2:
+                req_get = urllib.request.Request(trial_api_url, headers={
+                    "User-Agent": "Mozilla/5.0", "Accept": "*/*"
+                })
+                with urllib.request.urlopen(req_get, timeout=15, context=SSL_CTX) as resp2:
                     raw_api_resp = resp2.read().decode("utf-8", errors="ignore")
             except Exception:
                 pass
 
     parsed = parse_trial_api_response(raw_api_resp, cfg)
 
+    # Se a API falhar completamente em responder usuário e senha, gera fallback
     if not parsed["username"]:
         rand_suffix = hashlib.md5(f"{client_ip}{time.time()}".encode()).hexdigest()[:5]
         parsed["username"] = f"teste_{rand_suffix}"
@@ -563,6 +540,7 @@ def api_request_trial():
             "username": parsed["username"],
             "password": parsed["password"],
             "dns": parsed["dns"],
+            "m3u_url": parsed["m3u_url"],
             "plan_type": parsed["plan_type"],
             "expires_at": parsed["expires_at"],
             "expires_formatted": parsed["expires_formatted"],
@@ -606,7 +584,7 @@ def api_check_session():
         })
     return jsonify({"valid": True, "expired": False, "remaining_seconds": 86400})
 
-# --- GESTÃO ADMIN COM PURGE TOTAL DE REGISTROS ---
+# --- GESTÃO ADMIN COM PURGE TOTAL DE REGISTROS (LIBERA NOVO TESTE NA HORA) ---
 @app.route("/api/admin/login", methods=["POST"])
 def api_admin_login():
     data = request.get_json(silent=True) or {}
@@ -649,7 +627,6 @@ def purge_device_and_trials(target_mac=None, target_ip=None, target_username=Non
     conn1 = get_main_db()
     conn2 = get_devices_db()
 
-    # Busca dados adicionais se só temos dev_id
     if dev_id and (not target_mac or not target_ip):
         r = conn2.execute("SELECT * FROM devices WHERE id = ?", (dev_id,)).fetchone()
         if r:
@@ -657,7 +634,6 @@ def purge_device_and_trials(target_mac=None, target_ip=None, target_username=Non
             target_ip = r["ip"] or target_ip
             target_username = r["username"] or target_username
 
-    # 1. Apaga do banco 1 (streamflix.db)
     if target_mac or target_ip or target_username:
         conn1.execute("""DELETE FROM trial_records WHERE 
             (? IS NOT NULL AND device_mac = ?) OR 
@@ -669,7 +645,6 @@ def purge_device_and_trials(target_mac=None, target_ip=None, target_username=Non
             conn1.execute("DELETE FROM active_users WHERE username = ?", (target_username,))
         conn1.commit()
 
-    # 2. Apaga do banco 2 (devices_tracking.db)
     if dev_id:
         conn2.execute("DELETE FROM devices WHERE id = ?", (dev_id,))
     if target_mac:
@@ -721,7 +696,7 @@ def api_update_adult_pin():
     return jsonify({"ok": True, "pin": new_pin})
 
 # ==========================================================
-# 6. FRONTEND ESTILO NETFLIX COM CONTROLES MINIMALISTAS SLIM
+# 6. FRONTEND ESTILO NETFLIX COM CONTROLES SLIM E SEEK BAR
 # ==========================================================
 HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="pt-BR">
@@ -907,10 +882,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .bnav-item { background:transparent; border:none; color:var(--text-muted); display:flex; flex-direction:column; align-items:center; justify-content:center; gap:0.2rem; font-size:0.68rem; font-weight:700; cursor:pointer; flex:1; height:100%; }
         .bnav-item.active { color:var(--primary); }
 
-        /* PLAYER DE VÍDEO COMPLETO E SLIM */
+        /* ==========================================================
+           PLAYER DE VÍDEO SLIM: CONTROLES OCULTOS DURANTE REPRODUÇÃO
+           ========================================================== */
         .player-modal { display:none; position:fixed; inset:0; background:#000; z-index:600; flex-direction:column; overflow:hidden; }
         .player-modal.active { display:flex; }
-        .video-stage { position:relative; flex:1; width:100%; height:100%; overflow:hidden; background:#000; display:flex; align-items:center; justify-content:center; }
+        .video-stage { position:relative; flex:1; width:100%; height:100%; overflow:hidden; background:#000; display:flex; align-items:center; justify-content:center; cursor:pointer; }
 
         #video-player {
             width: 100%;
@@ -924,7 +901,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             object-fit: cover;
         }
 
-        /* OVERLAY DO BOTÃO PLAY CENTRAL (QUANDO AUTOPLAY FOR BLOQUEADO PELO NAVEGADOR) */
         .center-play-overlay {
             position: absolute;
             inset: 0;
@@ -950,7 +926,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         }
         .center-play-circle:active { transform: scale(0.92); }
 
-        /* TOPO SLIM DO PLAYER */
+        /* TOPO SLIM DO PLAYER - TOTALMENTE INVISÍVEL EM REPRODUÇÃO */
         .player-top-slim {
             position: absolute;
             top: 14px;
@@ -960,12 +936,16 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             align-items: center;
             justify-content: space-between;
             z-index: 50;
+            opacity: 0;
             pointer-events: none;
             transition: opacity 0.3s ease;
         }
-        .player-top-slim > * { pointer-events: auto; }
+        .player-top-slim.visible {
+            opacity: 1;
+            pointer-events: auto;
+        }
         .player-title-badge {
-            background: rgba(10, 10, 16, 0.6);
+            background: rgba(10, 10, 16, 0.65);
             backdrop-filter: blur(12px);
             border: 1px solid rgba(255,255,255,0.1);
             color: #fff;
@@ -979,7 +959,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             text-overflow: ellipsis;
         }
 
-        /* DOCK MINIMALISTA SLIM (UMA LINHA COM BOTÕES REDONDOS PEQUENOS E SUAVES) */
+        /* DOCK SLIM FLUTUANTE - TOTALMENTE INVISÍVEL EM REPRODUÇÃO (SÓ APARECE AO CLICAR) */
         .player-dock-wrap {
             position: absolute;
             bottom: 16px;
@@ -989,32 +969,80 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             flex-direction: column;
             align-items: center;
             z-index: 55;
+            opacity: 0;
+            pointer-events: none;
             transition: opacity 0.3s ease;
             max-width: 95vw;
+            width: 100%;
+            padding: 0 1rem;
         }
+        .player-dock-wrap.visible {
+            opacity: 1;
+            pointer-events: auto;
+        }
+
+        /* BARRA DE PROGRESSO (SEEK BAR) EXCLUSIVA PARA VOD (FILMES/SÉRIES) */
+        .vod-seek-bar-wrap {
+            width: 100%;
+            max-width: 440px;
+            display: none;
+            align-items: center;
+            gap: 8px;
+            background: rgba(10, 10, 16, 0.75);
+            backdrop-filter: blur(12px);
+            border: 1px solid rgba(255,255,255,0.08);
+            border-radius: var(--radius-pill);
+            padding: 5px 12px;
+            margin-bottom: 8px;
+        }
+        .vod-seek-bar-wrap.active {
+            display: flex;
+        }
+        .seek-time-label {
+            font-size: 0.68rem;
+            font-weight: 700;
+            color: var(--text-muted);
+            min-width: 42px;
+            text-align: center;
+        }
+        .seek-track-bg {
+            position: relative;
+            flex: 1;
+            height: 6px;
+            background: rgba(255,255,255,0.18);
+            border-radius: var(--radius-pill);
+            cursor: pointer;
+            overflow: hidden;
+        }
+        .seek-track-fill {
+            position: absolute;
+            top: 0;
+            left: 0;
+            height: 100%;
+            width: 0%;
+            background: var(--primary);
+            border-radius: var(--radius-pill);
+            transition: width 0.1s linear;
+        }
+
         .player-dock {
             display: flex;
             align-items: center;
             gap: 6px;
-            padding: 5px 10px;
-            background: rgba(12, 12, 18, 0.45);
+            padding: 5px 12px;
+            background: rgba(12, 12, 18, 0.75);
             backdrop-filter: blur(14px);
             -webkit-backdrop-filter: blur(14px);
-            border: 1px solid rgba(255, 255, 255, 0.08);
+            border: 1px solid rgba(255, 255, 255, 0.1);
             border-radius: var(--radius-pill);
             box-shadow: 0 8px 30px rgba(0, 0, 0, 0.7);
-            transition: all 0.25s ease;
-        }
-        .player-dock:hover, .player-dock:active, .player-dock.active {
-            background: rgba(12, 12, 18, 0.88);
-            border-color: rgba(255, 255, 255, 0.2);
         }
         .mini-btn {
             width: 36px;
             height: 36px;
             border-radius: 50%;
-            background: rgba(255, 255, 255, 0.06);
-            border: 1px solid rgba(255, 255, 255, 0.1);
+            background: rgba(255, 255, 255, 0.08);
+            border: 1px solid rgba(255, 255, 255, 0.12);
             color: #cbd5e1;
             display: inline-flex;
             align-items: center;
@@ -1035,7 +1063,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         /* POPUP BUBBLE FLUTUANTE QUE APARECE POR CIMA AO CLICAR NO BOTÃO */
         .dock-bubble {
             position: absolute;
-            bottom: 50px;
+            bottom: 58px;
             left: 50%;
             transform: translateX(-50%) translateY(8px);
             background: rgba(10, 10, 16, 0.95);
@@ -1047,7 +1075,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             flex-direction: column;
             gap: 4px;
             box-shadow: 0 14px 35px rgba(0,0,0,0.9);
-            min-width: 140px;
+            min-width: 145px;
             z-index: 60;
         }
         .dock-bubble.open {
@@ -1317,7 +1345,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
     <!-- 6. PLAYER DE VÍDEO COMPLETO E SLIM -->
     <div id="player-modal" class="player-modal">
-        <!-- Topo Slim do Player -->
+        <!-- Topo Slim do Player: Oculto durante reprodução, aparece ao tocar -->
         <div class="player-top-slim" id="player-top-slim">
             <button class="btn-pill btn-pill-outline" id="btn-player-back" style="padding:0.35rem 0.75rem; font-size:0.72rem;">‹ Sair</button>
             <div class="player-title-badge" id="player-title">Reproduzindo...</div>
@@ -1327,17 +1355,25 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <div class="video-stage" id="video-stage">
             <video id="video-player" playsinline preload="auto"></video>
             
-            <!-- Botão Play Central Overlay caso o navegador bloqueie autoplay -->
             <div class="center-play-overlay hidden" id="center-play-overlay">
                 <div class="center-play-circle">▶</div>
             </div>
         </div>
 
-        <!-- DOCK SLIM MINIMALISTA (UMA LINHA COM BOTÕES REDONDOS PEQUENOS E SUAVES) -->
+        <!-- DOCK SLIM FLUTUANTE: INVISÍVEL EM REPRODUÇÃO, SURGE AO CLICAR NA TELA E SOME EM 3 SEGUNDOS -->
         <div class="player-dock-wrap" id="player-dock-wrap">
             <div class="epg-bar" id="epg-bar">
                 <span id="epg-now">Agora: Ao Vivo</span>
                 <span id="epg-time" style="color:var(--text-muted);">--:--</span>
+            </div>
+
+            <!-- BARRA DE PROGRESSO (SEEK BAR) EXCLUSIVA PARA FILMES E SÉRIES -->
+            <div class="vod-seek-bar-wrap" id="vod-seek-wrap">
+                <span class="seek-time-label" id="seek-cur-time">00:00</span>
+                <div class="seek-track-bg" id="seek-track-bg">
+                    <div class="seek-track-fill" id="seek-track-fill"></div>
+                </div>
+                <span class="seek-time-label" id="seek-total-time">00:00</span>
             </div>
 
             <!-- BUBBLES QUE ABREM POR CIMA AO CLICAR NO BOTÃO -->
@@ -1496,6 +1532,30 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             }
         }
 
+        function formatTime(sec) {
+            if (isNaN(sec) || sec < 0) return "00:00";
+            const s = Math.floor(sec % 60);
+            const m = Math.floor((sec / 60) % 60);
+            const h = Math.floor(sec / 3600);
+            const pad = (n) => String(n).padStart(2, "0");
+            return h > 0 ? `${pad(h)}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`;
+        }
+
+        // DECODIFICADOR ROBUSTO DE EPG (RESOLVE STRINGS BRUTAS E BASE64 DO XTREAM)
+        function decodeEpgString(str) {
+            if (!str) return "";
+            try {
+                const s = str.trim();
+                if (/^[A-Za-z0-9+/=]+$/.test(s) && s.length % 4 === 0 && s.length > 8) {
+                    const dec = decodeURIComponent(escape(atob(s)));
+                    if (dec && !/[\x00-\x08\x0E-\x1F]/.test(dec)) return dec;
+                }
+            } catch(e) {}
+            const txt = document.createElement("textarea");
+            txt.innerHTML = str;
+            return txt.value;
+        }
+
         async function loadPublicConfig() {
             try {
                 const r = await fetch("/api/config");
@@ -1557,7 +1617,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
             try {
                 msgEl.textContent = "Obtendo categorias do servidor...";
-                // 1. Categorias
                 const [rTvCat, rVodCat, rSerCat] = await Promise.all([
                     fetch(`${dns}/player_api.php?username=${u}&password=${p}&action=get_live_categories`).catch(()=>({json:()=>[]})),
                     fetch(`${dns}/player_api.php?username=${u}&password=${p}&action=get_vod_categories`).catch(()=>({json:()=>[]})),
@@ -1576,7 +1635,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 const liveCatMap = {};
                 (Array.isArray(xtreamCategories.tv) ? xtreamCategories.tv : []).forEach(c => liveCatMap[c.category_id] = c.category_name);
 
-                // 2. Streams
                 msgEl.textContent = "Sincronizando conteúdos...";
                 const [rVod, rSer, rLive] = await Promise.all([
                     fetch(`${dns}/player_api.php?username=${u}&password=${p}&action=get_vod_streams`).catch(()=>({json:()=>[]})),
@@ -1606,7 +1664,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     url: `${dns}/live/${currentAuth.username}/${currentAuth.password}/${l.stream_id}.ts`
                 }));
 
-                // Prepara itens de prévia (Apenas Filmes e Séries - ZERO Adulto e ZERO Canais)
                 heroItems = [...catalog.movies, ...catalog.series].filter(it => !isAdultItem(it)).slice(0, 15);
                 if (heroItems.length > 0) renderHeroSlide(heroItems[0]);
 
@@ -1654,9 +1711,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             return card;
         }
 
-        // ==========================================================
         // SÉRIES: MODAL COM ESCOLHER TEMPORADA E EPISÓDIOS REAIS
-        // ==========================================================
         async function openSeriesDetails(it) {
             document.getElementById("series-modal").classList.add("active");
             document.getElementById("series-title").textContent = it.name;
@@ -1675,10 +1730,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 const data = await r.json();
 
                 const info = data.info || {};
-                const seasons = data.seasons || [];
                 const episodes = data.episodes || {};
 
-                // Sinopse da série
                 const plot = info.plot || info.description || "Sinopse não disponível para esta série.";
                 const rating = info.rating ? `⭐ Avaliação: ${info.rating}/10` : "⭐ Série Completa";
                 const releaseYear = info.releaseDate ? ` • ${info.releaseDate.split('-')[0]}` : "";
@@ -1691,7 +1744,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     document.getElementById("series-hero").style.backgroundImage = `url('${info.backdrop_path[0]}')`;
                 }
 
-                // Renderiza botões das temporadas
                 const sBar = document.getElementById("seasons-bar");
                 sBar.innerHTML = "";
 
@@ -1870,7 +1922,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         document.getElementById("catalog-search").oninput = renderCatalogGrid;
 
         // ==========================================================
-        // PLAYER DE VÍDEO COMPLETO E RESILIENTE COM CONTROLES SLIM
+        // PLAYER DE VÍDEO SLIM: CONTROLES OCULTOS DURANTE REPRODUÇÃO
         // ==========================================================
         const vEl = document.getElementById("video-player");
 
@@ -1878,25 +1930,57 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             document.querySelectorAll(".dock-bubble").forEach(b => b.classList.remove("open"));
         }
 
+        // ESMAECIMENTO AUTOMÁTICO APÓS 3 SEGUNDOS DE INATIVIDADE
         function resetDockTimer() {
             const dockWrap = document.getElementById("player-dock-wrap");
             const topSlim = document.getElementById("player-top-slim");
-            dockWrap.style.opacity = "1";
-            topSlim.style.opacity = "1";
+            dockWrap.classList.add("visible");
+            topSlim.classList.add("visible");
 
             if (dockTimeout) clearTimeout(dockTimeout);
             dockTimeout = setTimeout(() => {
-                if (!vEl.paused && !document.querySelector(".dock-bubble.open")) {
-                    dockWrap.style.opacity = "0.22"; // quase oculto, revelando 100% do vídeo
-                    topSlim.style.opacity = "0.22";
+                if (!vEl.paused) {
+                    closeAllBubbles();
+                    dockWrap.classList.remove("visible");
+                    topSlim.classList.remove("visible");
                 }
-            }, 3500);
+            }, 3000);
         }
 
-        document.getElementById("video-stage").addEventListener("mousemove", resetDockTimer);
-        document.getElementById("video-stage").addEventListener("touchstart", resetDockTimer);
-        document.getElementById("player-dock").addEventListener("mouseenter", () => {
-            document.getElementById("player-dock-wrap").style.opacity = "1";
+        // AO CLICAR NA TELA DO VÍDEO: ATIVA OU ESCONDE OS CONTROLES SLIM
+        document.getElementById("video-stage").addEventListener("click", (e) => {
+            if (e.target.closest("#center-play-overlay")) return;
+            const dockWrap = document.getElementById("player-dock-wrap");
+            if (dockWrap.classList.contains("visible")) {
+                closeAllBubbles();
+                dockWrap.classList.remove("visible");
+                document.getElementById("player-top-slim").classList.remove("visible");
+                if (dockTimeout) clearTimeout(dockTimeout);
+            } else {
+                resetDockTimer();
+            }
+        });
+
+        // BARRA DE PROGRESSO (SEEK BAR) DE VOD
+        vEl.addEventListener("timeupdate", () => {
+            if (!currentPlayingItem || currentPlayingItem.type === "tv") return;
+            const cur = vEl.currentTime || 0;
+            const dur = vEl.duration || 0;
+            document.getElementById("seek-cur-time").textContent = formatTime(cur);
+            document.getElementById("seek-total-time").textContent = formatTime(dur);
+            if (dur > 0) {
+                const pct = (cur / dur) * 100;
+                document.getElementById("seek-track-fill").style.width = `${pct}%`;
+            }
+        });
+
+        document.getElementById("seek-track-bg").addEventListener("click", (e) => {
+            e.stopPropagation();
+            if (!vEl.duration) return;
+            const rect = e.currentTarget.getBoundingClientRect();
+            const clickPos = (e.clientX - rect.left) / rect.width;
+            vEl.currentTime = clickPos * vEl.duration;
+            resetDockTimer();
         });
 
         function sendMonitorHeartbeat(isPlaying) {
@@ -1928,12 +2012,23 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             stopPlayerEngines();
             vEl.className = "";
             closeAllBubbles();
+
+            // Ativa controles inicialmente e agenda sumiço em 3 segundos
             resetDockTimer();
 
-            // Link externo para VLC
+            // Barra de progresso visível exclusivamente para VOD
+            const seekWrap = document.getElementById("vod-seek-wrap");
+            if (it.type === "tv") {
+                seekWrap.classList.remove("active");
+            } else {
+                seekWrap.classList.add("active");
+                document.getElementById("seek-cur-time").textContent = "00:00";
+                document.getElementById("seek-total-time").textContent = "00:00";
+                document.getElementById("seek-track-fill").style.width = "0%";
+            }
+
             document.getElementById("opt-vlc-ext").href = it.url;
 
-            // EPG para canais ao vivo
             const epgBar = document.getElementById("epg-bar");
             if (it.type === "tv") {
                 epgBar.classList.add("active");
@@ -1951,13 +2046,20 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 else engine = "native";
             }
 
-            // REPRODUÇÃO RESILIENTE DE TV AO VIVO (HLS OU MPEGTS COM AUTO-FALLBACK)
+            // OTIMIZAÇÃO DE BAIXA LATÊNCIA PARA BUFFER RÁPIDO
             if (engine === "ts_or_hls" || engine === "hls") {
-                // Converte .ts em .m3u8 para decodificação HLS nativa de alta compatibilidade
                 const hlsUrl = url.endsWith('.ts') ? url.replace(/\.ts$/i, '.m3u8') : url;
 
                 if (typeof Hls !== "undefined" && Hls.isSupported()) {
-                    hlsInstance = new Hls({ enableWorker: true });
+                    hlsInstance = new Hls({
+                        enableWorker: true,
+                        lowLatencyMode: true,
+                        maxBufferLength: 4,
+                        maxMaxBufferLength: 8,
+                        liveSyncDurationCount: 3,
+                        startLevel: -1,
+                        autoStartLoad: true
+                    });
                     hlsInstance.loadSource(hlsUrl);
                     hlsInstance.attachMedia(vEl);
 
@@ -1969,13 +2071,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
                     hlsInstance.on(Hls.Events.ERROR, (event, data) => {
                         if (data.fatal) {
-                            console.log("HLS fatal error, tentando MPEG-TS ou nativo...");
                             startMpegTsOrNative(url);
                         }
                     });
                     return;
                 } else if (vEl.canPlayType('application/vnd.apple.mpegurl')) {
-                    // Suporte nativo HLS no iOS Safari
                     vEl.src = hlsUrl;
                     vEl.play().catch(() => {
                         document.getElementById("center-play-overlay").classList.remove("hidden");
@@ -1989,7 +2089,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 return;
             }
 
-            // Reprodução direta Nativa (MP4 / Streams diretos)
             startNativePlay(url);
         }
 
@@ -2030,12 +2129,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             });
         }
 
-        // Toque no overlay central para despausar com som imediato
-        document.getElementById("center-play-overlay").onclick = () => {
+        document.getElementById("center-play-overlay").onclick = (e) => {
+            e.stopPropagation();
             document.getElementById("center-play-overlay").classList.add("hidden");
             vEl.play().catch(()=>{});
+            resetDockTimer();
         };
 
+        // EPG DECODIFICADO CORRETAMENTE
         async function fetchEpg(it) {
             if (!currentAuth || !it.id) return;
             try {
@@ -2044,7 +2145,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 const r = await fetch(`${dns}/player_api.php?username=${encodeURIComponent(currentAuth.username)}&password=${encodeURIComponent(currentAuth.password)}&action=get_short_epg&stream_id=${it.id}`);
                 const d = await r.json();
                 const prog = (d.epg_listings && d.epg_listings[0]) || {};
-                document.getElementById("epg-now").textContent = `Agora: ${prog.title || it.name}`;
+                
+                const rawTitle = prog.title || it.name;
+                const decodedTitle = decodeEpgString(rawTitle);
+                
+                document.getElementById("epg-now").textContent = `Agora: ${decodedTitle}`;
                 document.getElementById("epg-time").textContent = prog.start ? `${prog.start} - ${prog.end}` : "Ao Vivo";
             } catch (e) {
                 document.getElementById("epg-now").textContent = `Agora: ${it.name}`;
@@ -2064,32 +2169,35 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             vEl.load();
         }
 
-        document.getElementById("btn-player-back").onclick = () => {
+        document.getElementById("btn-player-back").onclick = (e) => {
+            e.stopPropagation();
             stopPlayerEngines();
             document.getElementById("player-modal").classList.remove("active");
         };
 
         // CONTROLES SLIM DO DOCK
         const btnPlay = document.getElementById("dock-btn-play");
-        btnPlay.onclick = () => {
+        btnPlay.onclick = (e) => {
+            e.stopPropagation();
             closeAllBubbles();
             if (vEl.paused) { vEl.play(); btnPlay.textContent = "⏸"; }
             else { vEl.pause(); btnPlay.textContent = "▶"; }
             resetDockTimer();
         };
 
-        document.getElementById("dock-btn-rw").onclick = () => {
+        document.getElementById("dock-btn-rw").onclick = (e) => {
+            e.stopPropagation();
             closeAllBubbles();
             vEl.currentTime = Math.max(0, vEl.currentTime - 10);
             resetDockTimer();
         };
-        document.getElementById("dock-btn-ff").onclick = () => {
+        document.getElementById("dock-btn-ff").onclick = (e) => {
+            e.stopPropagation();
             closeAllBubbles();
             vEl.currentTime += 10;
             resetDockTimer();
         };
 
-        // BOTÃO VELOCIDADE COM POPUP POR CIMA
         const btnSpeed = document.getElementById("dock-btn-speed");
         const bubbleSpeed = document.getElementById("bubble-speed");
         btnSpeed.onclick = (e) => {
@@ -2108,12 +2216,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 btnSpeed.textContent = `${sp}x`;
                 document.querySelectorAll("#bubble-speed .bubble-item").forEach(i => i.classList.remove("active"));
                 item.classList.add("active");
-                closeAllBubbles(); // Volta ao estado original minimalista na hora!
+                closeAllBubbles();
                 resetDockTimer();
             };
         });
 
-        // BOTÃO TELA COM POPUP POR CIMA
         const btnAspect = document.getElementById("dock-btn-aspect");
         const bubbleAspect = document.getElementById("bubble-aspect");
         btnAspect.onclick = (e) => {
@@ -2140,7 +2247,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             resetDockTimer();
         };
 
-        // BOTÃO MOTOR COM POPUP POR CIMA
         const btnEngine = document.getElementById("dock-btn-engine");
         const bubbleEngine = document.getElementById("bubble-engine");
         btnEngine.onclick = (e) => {
@@ -2161,7 +2267,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             };
         });
 
-        // Fecha bubbles ao tocar fora
         document.addEventListener("click", () => closeAllBubbles());
 
         // NAVEGAÇÃO BOTTOM BAR
@@ -2258,7 +2363,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 currentAuth = tr;
                 localStorage.setItem("sf_session", JSON.stringify(tr));
 
-                // Popula os dados DINÂMICOS do servidor
                 document.getElementById("tr-u").textContent = tr.username || "-";
                 document.getElementById("tr-p").textContent = tr.password || "-";
                 document.getElementById("tr-exp").textContent = tr.expires_formatted || "-";
@@ -2306,7 +2410,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 };
                 document.getElementById("btn-wa-tr").href = `https://wa.me/?text=${encodeURIComponent(shareText)}`;
 
-                // Abre modal com animação suave e imersiva
                 document.getElementById("trial-modal").classList.add("active");
             } catch (e) {
                 alert("Erro de conexão ao gerar o teste.");
@@ -2370,7 +2473,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 document.getElementById("adm-pay-link").value = d.settings.default_payment_link || "";
                 document.getElementById("adm-wa-link").value = d.settings.support_whatsapp || "";
 
-                // 1. Tabela Monitoramento em Tempo Real
                 const monTbody = document.getElementById("adm-monitoring-tbody");
                 monTbody.innerHTML = "";
                 document.getElementById("live-count").textContent = `${d.monitoring.length} assistindo agora`;
@@ -2393,7 +2495,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     });
                 }
 
-                // 2. Tabela de Dispositivos com Deletar que Libera Novo Teste Imediatamente
                 const devTbody = document.getElementById("adm-devices-tbody");
                 devTbody.innerHTML = "";
                 d.devices.forEach(dev => {
