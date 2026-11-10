@@ -667,10 +667,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-    <title>StreamFlix Pro · Player Fix 2026-11-10</title>
+    <meta http-equiv="Cache-Control" content="no-store, max-age=0">
+    <title>StreamFlix Pro</title>
     <script src="https://unpkg.com/lucide@latest"></script>
-    <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.20"></script>
-    <script src="https://cdn.jsdelivr.net/npm/mpegts.js@1.7.3/dist/mpegts.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+    <script src="https://cdn.jsdelivr.net/npm/mpegts.js@latest/dist/mpegts.js"></script>
     <style>
         :root {
             --bg-base: #000000;
@@ -851,7 +852,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .bottom-nav.active { display:flex; }
         body.player-open .bottom-nav.active { display:none; }
         body.player-open.player-list-mode .bottom-nav.active { display:flex; }
-        body.player-open.player-controls-visible:not(.player-list-mode) .bottom-nav.active { display:none; }
+        body.player-open.player-controls-visible:not(.player-list-mode) .bottom-nav.active { display:flex; }
         .bnav-item { background:transparent; border:none; color:var(--text-muted); display:flex; flex-direction:column; align-items:center; justify-content:center; gap:0.2rem; font-size:0.68rem; font-weight:700; cursor:pointer; flex:1; height:100%; }
         .bnav-item.active { color:var(--primary); }
 
@@ -893,10 +894,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .player-modal.tv-list-open .player-top-slim,
         .player-modal.tv-list-open .player-dock-wrap { display:none !important; }
         .player-modal.tv-list-open .epg-bar { display:none !important; }
-        .player-modal.tv-list-open #playback-status { font-size:.65rem; padding:5px; }
-        .player-modal.tv-list-open #video-player { pointer-events:auto; }
-        .player-modal.tv-list-open .center-play-overlay { z-index:42; }
-        .player-modal.tv-list-open #playback-status { max-width:95%; }
+        .player-modal.tv-list-open #playback-status { font-size:.65rem; padding:5px; max-height:45%; overflow:hidden; }
+        .player-modal.tv-list-open .center-play-overlay { pointer-events:none; }
+        .player-modal.tv-list-open .video-stage { cursor:pointer; }
+        .player-modal:not(.tv-list-open) .player-dock-wrap.visible,
+        .player-modal:not(.tv-list-open) .player-top-slim.visible { pointer-events:auto; }
         body.player-open:not(.player-list-mode) .drawer-panel, body.player-open:not(.player-list-mode) .drawer-backdrop { display:none !important; }
         body.player-open .drawer-backdrop.active { background:transparent; pointer-events:none; }
         body.player-open .drawer-panel { width:min(52vw, 270px); max-width:52vw; }
@@ -1346,7 +1348,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         </div>
 
         <div class="video-stage" id="video-stage">
-            <video id="video-player" playsinline webkit-playsinline preload="metadata" controls></video>
+            <video id="video-player" playsinline webkit-playsinline preload="auto"></video>
             <div id="playback-status" class="playback-status hidden" role="status" aria-live="polite"></div>
             <div class="center-play-overlay hidden" id="center-play-overlay">
                 <div class="center-play-circle">▶</div>
@@ -1501,8 +1503,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         let playbackCandidates = [];
         let playbackCandidateIndex = 0;
         let playbackToken = 0;
-        let playerTeardown = false;
-        let lastPlaybackFailure = "";
+        let playbackSwitching = false;
+        let playbackAttemptStarted = 0;
+        let playbackLastError = "";
 
         const ADULT_REGEX = /(?:18\s*\+|\+\s*18|\b18\s*anos\b|\badult[oa]s?\b|\bxxx\b|\bporn\w*\b|\berotic\w*\b|\bsexy\b|\bplayboy\b|\bvenus\b|\bfor adults\b)/i;
         let adultUnlocked = false;
@@ -1871,10 +1874,18 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             }
         }
         function expandTvPlayer() {
+            if (!currentPlayingItem || currentPlayingItem.type !== "tv") return;
             closeDrawer();
             setTvMiniMode(false);
             resetDockTimer();
         }
+        // The area to the right of the category drawer is the mini-player's expansion target.
+        document.getElementById("player-modal").addEventListener("click", (e) => {
+            const modal = document.getElementById("player-modal");
+            if (!modal.classList.contains("tv-list-open")) return;
+            if (e.target.closest(".video-stage, .player-top-slim, .player-dock-wrap")) return;
+            expandTvPlayer();
+        });
         function openTvChannelList(catName) {
             if (document.getElementById("player-modal").classList.contains("active")) {
                 setTvMiniMode(true);
@@ -2168,94 +2179,96 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
              playbackWatchdog = null;
          }
 
-         // Reprodutor: URLs originais preservadas; não se presume que .ts tenha um .m3u8 equivalente.
          function makePlaybackCandidates(item, requestedEngine) {
-             const url = String(item.url || "").trim();
-             const isHls = /\.m3u8(?:[?#]|$)/i.test(url);
+             const url = item.url || "";
              const isTs = /\.ts(?:[?#]|$)/i.test(url);
-             const list = [];
-             const add = (engine) => { if (!list.some(c => c.engine === engine)) list.push({engine, url}); };
-             if (requestedEngine === "native") add("native");
-             else if (requestedEngine === "hls") { add("hls"); add("native"); }
-             else if (requestedEngine === "mpegts") { add("mpegts"); add("native"); }
-             else if (isHls) { add("hls"); add("native"); }
-             else if (isTs || item.type === "tv") { add("mpegts"); add("native"); }
-             else { add("native"); }
-             return list;
-         }
-
-         function playbackFailureText() {
-             const source = currentPlayingItem && currentPlayingItem.url || "";
-             if (location.protocol === "https:" && /^http:\/\//i.test(source)) {
-                 return "O site usa HTTPS, mas o streaming usa HTTP. O navegador pode bloquear conteúdo misto. Use uma origem HTTPS compatível.";
+             const isHls = /\.m3u8(?:[?#]|$)/i.test(url);
+             const hlsUrl = isTs ? url.replace(/\.ts(?=[?#]|$)/i, ".m3u8") : url;
+             const options = [];
+             const add = (engine, source) => {
+                 if (source && !options.some(x => x.engine === engine && x.url === source)) options.push({engine, url:source});
+             };
+             if (requestedEngine === "native") add("native", url);
+             else if (requestedEngine === "mpegts") { add("mpegts", url); add("native", url); }
+             else if (requestedEngine === "hls") { add("hls", hlsUrl); if (isTs) add("mpegts", url); add("native", url); }
+             else if (isTs || item.type === "tv") {
+                 if (isHls) add("hls", url);
+                 else { add("mpegts", url); if (isTs) add("hls", hlsUrl); }
+                 add("native", url);
              }
-             return "Falha ao reproduzir. Verifique acesso ao servidor, CORS, formato e codecs. " + lastPlaybackFailure;
+             else if (isHls) { add("hls", url); add("native", url); }
+             else { add("native", url); }
+             return options;
          }
 
          function tryPlaybackCandidate() {
              clearPlaybackWatchdog();
              const token = ++playbackToken;
+             playbackSwitching = true;
              if (playbackCandidateIndex >= playbackCandidates.length) {
                  stopPlayerEngines(false);
-                 setPlaybackStatus(playbackFailureText());
+                 playbackSwitching = false;
+                 setPlaybackStatus("Não foi possível reproduzir. Confira o formato, a conexão, HTTPS/CORS e o servidor. " + playbackLastError);
                  document.getElementById("center-play-overlay").classList.remove("hidden");
-                 resetDockTimer();
                  return;
              }
              const candidate = playbackCandidates[playbackCandidateIndex++];
-             // A limpeza deve ocorrer antes do início da nova tentativa, sem gerar fallback recursivo.
              stopPlayerEngines(false);
-             setPlaybackStatus("Carregando vídeo (" + playbackCandidateIndex + "/" + playbackCandidates.length + ")...");
+             playbackAttemptStarted = Date.now();
+             playbackSwitching = false;
+             setPlaybackStatus("Conectando... (" + playbackCandidateIndex + "/" + playbackCandidates.length + ")");
+             let failed = false;
              const fail = (reason) => {
-                 if (token !== playbackToken || playerTeardown) return;
-                 lastPlaybackFailure = String(reason || "");
-                 tryPlaybackCandidate();
+                 if (failed || token !== playbackToken || playbackSwitching) return;
+                 failed = true;
+                 playbackLastError = String(reason || "falha de mídia");
+                 // Avoid synchronous recursion while the browser is detaching media.
+                 setTimeout(() => { if (token === playbackToken && !playbackSwitching) tryPlaybackCandidate(); }, 100);
              };
-             const play = () => {
+             const attemptPlay = () => {
                  if (token !== playbackToken) return;
-                 const result = vEl.play();
-                 if (result && result.catch) result.catch(err => {
-                     if (token !== playbackToken) return;
-                     if (err && err.name === "NotAllowedError") {
-                         setPlaybackStatus("Toque no botão ▶ para iniciar o vídeo.");
+                 vEl.play().catch(() => {
+                     if (token === playbackToken) {
+                         clearPlaybackWatchdog();
+                         setPlaybackStatus("Toque em ▶ para iniciar a reprodução.");
                          document.getElementById("center-play-overlay").classList.remove("hidden");
-                         resetDockTimer();
-                     } else if (err && err.name !== "AbortError") fail(err.message);
+                     }
                  });
              };
              playbackWatchdog = setTimeout(() => {
-                 if (token === playbackToken && vEl.readyState < 2) fail("Tempo limite de carregamento");
-             }, 16000);
+                 if (token === playbackToken && vEl.readyState < 2) fail("tempo limite de carregamento");
+             }, 15000);
              try {
                  if (candidate.engine === "hls") {
                      if (typeof Hls !== "undefined" && Hls.isSupported()) {
-                         hlsInstance = new Hls({enableWorker:false, lowLatencyMode:false, maxBufferLength:20});
-                         hlsInstance.on(Hls.Events.MANIFEST_PARSED, play);
-                         hlsInstance.on(Hls.Events.ERROR, (_, err) => { if (err.fatal) fail(err.details || err.type); });
-                         hlsInstance.attachMedia(vEl);
+                         hlsInstance = new Hls({enableWorker:true, lowLatencyMode:currentPlayingItem.type === "tv", maxBufferLength:12, maxMaxBufferLength:30, backBufferLength:15});
+                         hlsInstance.on(Hls.Events.MANIFEST_PARSED, attemptPlay);
+                         hlsInstance.on(Hls.Events.ERROR, (_, err) => { if (err.fatal) fail(); });
                          hlsInstance.loadSource(candidate.url);
+                         hlsInstance.attachMedia(vEl);
                      } else if (vEl.canPlayType("application/vnd.apple.mpegurl")) {
-                         vEl.src = candidate.url; vEl.load(); play();
-                     } else fail("HLS indisponível neste navegador");
+                         vEl.src = candidate.url; attemptPlay();
+                     } else fail();
                  } else if (candidate.engine === "mpegts") {
-                     if (typeof mpegts === "undefined" || !mpegts.isSupported()) { fail("MPEG-TS indisponível"); return; }
-                     mpegtsInstance = mpegts.createPlayer({type:"mpegts", isLive:currentPlayingItem.type === "tv", url:candidate.url, cors:true}, {enableWorker:false, enableStashBuffer:false});
-                     mpegtsInstance.on(mpegts.Events.ERROR, (type, detail) => fail(type + ": " + detail));
+                     if (typeof mpegts === "undefined" || !mpegts.isSupported()) { fail(); return; }
+                     mpegtsInstance = mpegts.createPlayer({type:"mpegts", isLive:currentPlayingItem.type === "tv", url:candidate.url, cors:true}, {enableWorker:true, enableStashBuffer:true, stashInitialSize:384});
+                     mpegtsInstance.on(mpegts.Events.ERROR, fail);
                      mpegtsInstance.attachMediaElement(vEl);
-                     mpegtsInstance.load();
-                     play();
+                     mpegtsInstance.load(); attemptPlay();
                  } else {
-                     vEl.src = candidate.url; vEl.load(); play();
+                     vEl.src = candidate.url;
+                     vEl.load(); attemptPlay();
                  }
-             } catch(e) { fail(e.message); }
+             } catch(e) { console.error("Falha no mecanismo de vídeo", e); fail(); }
          }
 
          function openItemPlay(it, forceEngine = "auto") {
              if (!it || !it.url) { alert("Endereço de reprodução indisponível."); return; }
-             ++playbackToken;
+             // Invalidate callbacks from the previous channel before cleaning its media.
+             playbackToken++;
+             playbackSwitching = true;
              stopPlayerEngines();
              currentPlayingItem = it;
-             lastPlaybackFailure = "";
              playSecondsCounter = 0;
              currentActiveEngine = forceEngine;
              document.getElementById("player-modal").classList.add("active");
@@ -2265,7 +2278,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
              document.getElementById("player-title").textContent = it.name;
              document.getElementById("center-play-overlay").classList.add("hidden");
              vEl.className = "";
-             vEl.controls = true;
              closeAllBubbles();
              document.getElementById("dock-btn-tv-list").classList.toggle("hidden", it.type !== "tv");
              document.getElementById("btn-player-vod-list").classList.toggle("hidden", it.type === "tv");
@@ -2291,12 +2303,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
              if (it.type === "tv") fetchEpg(it);
              playbackCandidates = makePlaybackCandidates(it, forceEngine);
              playbackCandidateIndex = 0;
+             playbackLastError = "";
              tryPlaybackCandidate();
              if (it.type !== "tv") resetDockTimer();
          }
 
         document.getElementById("center-play-overlay").onclick = (e) => {
             e.stopPropagation();
+            if (document.getElementById("player-modal").classList.contains("tv-list-open")) expandTvPlayer();
             document.getElementById("center-play-overlay").classList.add("hidden");
             vEl.play().catch(()=>{});
             resetDockTimer();
@@ -2330,7 +2344,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         }
 
         function stopPlayerEngines(clearMonitoring = true) {
-             playerTeardown = true;
              clearPlaybackWatchdog();
             if (monitorInterval) {
                 clearInterval(monitorInterval);
@@ -2342,7 +2355,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             vEl.pause();
             vEl.removeAttribute("src");
             vEl.load();
-            queueMicrotask(() => { playerTeardown = false; });
         }
 
          vEl.addEventListener("playing", () => {
@@ -2357,14 +2369,20 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
              }
          });
          vEl.addEventListener("error", () => {
-             if (playerTeardown || !vEl.getAttribute("src") && !hlsInstance && !mpegtsInstance) return;
-             if (document.getElementById("player-modal").classList.contains("active") && playbackCandidateIndex < playbackCandidates.length) {
-                 lastPlaybackFailure = "Erro de mídia " + (vEl.error ? vEl.error.code : "");
-                 tryPlaybackCandidate();
-             }
+             if (!document.getElementById("player-modal").classList.contains("active") || playbackSwitching || !currentPlayingItem) return;
+             const error = vEl.error;
+             if (!error || !vEl.currentSrc) return;
+             // Avoid a second fail call from an engine's own error callback.
+             if (Date.now() - playbackAttemptStarted < 150) return;
+             if (playbackCandidateIndex < playbackCandidates.length) {
+                 playbackSwitching = true;
+                 setTimeout(() => { playbackSwitching = false; if (currentPlayingItem) tryPlaybackCandidate(); }, 150);
+             } else setPlaybackStatus("Falha de mídia (" + error.code + "). Verifique CORS, HTTPS e formato do stream.");
          });
          document.getElementById("btn-player-back").onclick = (e) => {
             e.stopPropagation();
+            playbackToken++;
+            playbackSwitching = true;
             stopPlayerEngines();
             document.getElementById("player-modal").classList.remove("active", "tv-list-open");
             document.body.classList.remove("player-open", "player-list-mode", "player-controls-visible");
@@ -2476,6 +2494,15 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     document.body.classList.remove("player-open", "player-list-mode", "player-controls-visible");
                     closeDrawer();
                 }
+                // Always reset overlays before switching tabs; prevents dead Home/TV/Films/Series buttons.
+                if (document.getElementById("player-modal").classList.contains("active")) {
+                    playbackToken++;
+                    playbackSwitching = true;
+                    stopPlayerEngines();
+                    document.getElementById("player-modal").classList.remove("active", "tv-list-open");
+                    document.body.classList.remove("player-open", "player-list-mode", "player-controls-visible");
+                }
+                closeDrawer();
                 activeTab = btn.dataset.tab;
                 adultUnlocked = false;
                 document.querySelectorAll(".bottom-nav .bnav-item").forEach(b => b.classList.remove("active"));
