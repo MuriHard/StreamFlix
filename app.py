@@ -45,7 +45,7 @@ def migrate_table_columns(conn, table_name, columns_dict):
             if col_name not in existing_cols:
                 cur.execute(f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_type}")
         conn.commit()
-    except Exception as e:
+    except Exception:
         pass
 
 def init_dbs():
@@ -76,7 +76,6 @@ def init_dbs():
         is_trial INTEGER DEFAULT 0
     )""")
 
-    # Garante que nenhuma coluna falte em bancos pré-existentes
     migrate_table_columns(conn1, "active_users", {
         "dns_used": "TEXT",
         "m3u_url": "TEXT",
@@ -108,11 +107,7 @@ def init_dbs():
         "trial_duration_hours": "6",
         "default_payment_link": "",
         "support_whatsapp": "https://wa.me/5500000000000?text=Preciso%20de%20suporte%20no%20StreamFlix",
-        "tmdb_api_key": "",
-        "adult_pin": "0000",
-        "apps_smart_tv": "",
-        "apps_android": "",
-        "custom_domain": ""
+        "adult_pin": "0000"
     }
     for k, v in defaults.items():
         cur1.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v))
@@ -223,31 +218,42 @@ def record_device_entry(mac, ip, ua_string, username="Desconhecido"):
     conn.close()
 
 # ==========================================================
-# 3. PARSER DINÂMICO DE TESTES (CAPTURA 100% DOS DADOS DO SERVIDOR)
+# 3. PARSER DINÂMICO DE TESTES (MODELO EXATO INFINITY / PANELBR)
 # ==========================================================
 def format_custom_trial_message(data):
     msg = "*SEGUE OS DADOS DE ACESSO*\n\n"
     msg += f"*Usuário:* {data.get('username','')}                      *Senha:* {data.get('password','')}\n"
-    msg += f"*Plano:* {data.get('plan_type','TESTE COMPLETO')}\n"
+    msg += f"*Plano:* {data.get('plan_type','TESTE COMPLETO (1 Tela)')}\n"
     msg += "—————————————————\n"
-    msg += f"🔗 Assinar/Renovar Plano: {data.get('payment_link','')}\n\n"
+    pay = data.get('payment_link', '')
+    msg += f"🔗 Assinar/Renovar Plano: {pay}\n\n"
     msg += f"🗓️ *Criado em:* {data.get('created_formatted', datetime.now().strftime('%d/%m/%Y %H:%M:%S'))}\n"
     msg += f"🗓️ *Vencimento:* {data.get('expires_formatted','')}\n"
     msg += f"📶 *Conexões:* {data.get('max_connections', '1')}\n\n"
     msg += "—————————————————\n"
-    
-    if data.get('apps_smart_tv'):
-        for p in data['apps_smart_tv'].split('\n\n'):
-            msg += f"📺 {p}\n—————————————————\n"
-            
+
+    tv = data.get('apps_smart_tv', '').strip()
+    if tv:
+        for p in tv.split('\n\n'):
+            msg += f"{p.strip()}\n—————————————————\n"
+    else:
+        msg += "🟣*Parceria LOTUS*🟣\n*COD:* infinity\n—————————————————\n"
+        msg += "🟢*parceria ZUXO*🟢\n*COD:* BLAZE\n—————————————————\n"
+        msg += "🟣  *pareceria RX PURPLE* 🟣\n*COD:* 80822887\n—————————————————\n"
+        msg += "🛑 PARCERIA BLESSED🛑\n*COD:* Infinity4097\n—————————————————\n"
+
     msg += "\n🔵 *LINK DIRETO PRA BAIXAR*\n\n"
-    if data.get('apps_android'):
-        for a in data['apps_android'].split('\n\n'):
-            msg += f"🔵 {a}\n—————————————————\n"
+    android = data.get('apps_android', '').strip()
+    if android:
+        for a in android.split('\n\n'):
+            msg += f"  🔵 *{a.strip()}*\n—————————————————\n"
+    else:
+        msg += "  🔵 *App: Infinity XC 2*\n    Link:  http://aftv.news/8203953\n    Cód Downloader: 6414370\n    Pin Ntdow: 59119\n—————————————————\n"
+        msg += "    🔵 *App: Infinity Vu*\n    Link:   bit.ly/InfinityVu\n    Cód Downloader: 319740\n     Pin Ntdow: 64566\n"
+
     return msg.strip()
 
 def parse_trial_api_response(raw_text, cfg):
-    """Extrai dinamicamente dados do servidor IPTV sem fixar valores modelo."""
     now_ts = int(time.time())
     hours = float(cfg.get("trial_duration_hours") or 6)
     fallback_exp_ts = now_ts + int(hours * 3600)
@@ -259,7 +265,7 @@ def parse_trial_api_response(raw_text, cfg):
         "password": "",
         "dns": fallback_dns,
         "m3u_url": "",
-        "plan_type": "TESTE COMPLETO",
+        "plan_type": "TESTE COMPLETO (1 Tela)",
         "max_connections": "1",
         "expires_at": fallback_exp_ts,
         "expires_formatted": fallback_exp_str,
@@ -275,42 +281,40 @@ def parse_trial_api_response(raw_text, cfg):
 
     cleaned = raw_text.strip()
 
-    # 1. Tenta decodificar como JSON estruturado
     try:
         data = json.loads(cleaned)
         if isinstance(data, dict):
-            sub = data.get("data") or data.get("result") or data.get("user_info") or data
-            u = sub.get("username") or sub.get("user") or sub.get("login") or data.get("username")
-            p = sub.get("password") or sub.get("pass") or sub.get("senha") or data.get("password")
-            dns = sub.get("dns") or sub.get("server") or data.get("dns")
-            plan = sub.get("plan") or sub.get("plan_type") or sub.get("package") or sub.get("pacote") or data.get("plan")
-            pay = sub.get("payUrl") or sub.get("payment_link") or sub.get("checkout_url") or sub.get("pix_url") or data.get("payUrl")
-            exp_formatted = data.get("expiresAtFormatted") or data.get("expiresAt") or data.get("expires_formatted")
-            created_formatted = data.get("createdAtFormatted") or data.get("createdAt") or data.get("created_formatted")
+            u = data.get("username")
+            p = data.get("password")
+            dns = data.get("dns")
+            plan = data.get("package")
+            pay = data.get("payUrl") or data.get("payment_link")
+            exp_formatted = data.get("expiresAtFormatted") or data.get("expiresAt")
+            created_formatted = data.get("createdAtFormatted") or data.get("createdAt")
             conns = data.get("connections") or data.get("max_connections")
             reply = data.get("reply") or ""
 
             if u: res["username"] = str(u).strip()
             if p: res["password"] = str(p).strip()
             if dns: res["dns"] = str(dns).strip().rstrip("/")
-            if plan: res["plan_type"] = str(plan).replace("🔹", "").replace("TESTE", "Teste").strip()
+            if plan: res["plan_type"] = str(plan).replace("🔹", "").strip()
             if conns: res["max_connections"] = str(conns).strip()
             if pay: res["payment_link"] = str(pay).strip()
             if exp_formatted: res["expires_formatted"] = str(exp_formatted).strip()
             if created_formatted: res["created_formatted"] = str(created_formatted).strip()
 
             if reply:
-                # Extrai parcerias de TV
+                # Extrai parcerias Smart TV
                 tv_matches = []
                 for p_match in re.findall(r'(\*?Parce?ria[^\n*]+\*?[\s\S]*?\*COD:\*?\s*[^\n]+)', reply, re.IGNORECASE):
-                    clean_p = p_match.replace("*", "").replace("—", "").replace("🟣", "").replace("🟢", "").replace("🛑", "").replace("🟡", "").strip()
+                    clean_p = p_match.replace("*", "").replace("—", "").strip()
                     if clean_p: tv_matches.append(clean_p)
                 if tv_matches: res["apps_smart_tv"] = "\n\n".join(tv_matches)
 
                 # Extrai apps Android
                 and_matches = []
                 for a_match in re.findall(r'(App:\s*[^\n*]+[\s\S]*?(?=——|—|\n\n\ud83d|\n\n\u26a0|$))', reply, re.IGNORECASE):
-                    clean_a = a_match.replace("*", "").replace("—", "").replace("⚠️", "").replace("▫️", "").replace("🔹", "").replace("⚫️", "").replace("🔵", "").strip()
+                    clean_a = a_match.replace("*", "").replace("—", "").replace("⚠️", "").replace("▫️", "").replace("🔹", "").replace("⚫️", "").strip()
                     if clean_a: and_matches.append(clean_a)
                 if and_matches: res["apps_android"] = "\n\n".join(and_matches)
 
@@ -319,57 +323,22 @@ def parse_trial_api_response(raw_text, cfg):
     except Exception:
         pass
 
-    # 2. Extrai de texto formatado / mensagem via Regex
     if not res["username"]:
         u_m = re.search(r"(?:usu[aá]rio|user|login)\s*[:=\-*]+\s*([A-Za-z0-9_.\-]+)", cleaned, re.I)
         if u_m: res["username"] = u_m.group(1).strip()
-
     if not res["password"]:
         p_m = re.search(r"(?:senha|password|pass)\s*[:=\-*]+\s*([A-Za-z0-9_.\-]+)", cleaned, re.I)
         if p_m: res["password"] = p_m.group(1).strip()
-
     if not res["payment_link"]:
         pay_m = re.search(r"(https?://[^\s\"'<>]+(?:checkout|fatura|pagamento|mercadopago|pix|assinar|pay)[^\s\"'<>]*)", cleaned, re.I)
         if pay_m: res["payment_link"] = pay_m.group(1).strip()
-
     if not res["m3u_url"] and res["username"] and res["password"] and res["dns"]:
         res["m3u_url"] = f"{res['dns']}/get.php?username={urllib.parse.quote(res['username'])}&password={urllib.parse.quote(res['password'])}&type=m3u_plus&output=ts"
 
-    if not res["payment_link"] and cfg.get("default_payment_link"):
-        res["payment_link"] = cfg.get("default_payment_link")
-
-    res["raw_message"] = format_custom_trial_message(res)
     return res
 
 # ==========================================================
-# 4. DOWNLOAD E PROXY DE PLAYLIST M3U
-# ==========================================================
-@app.route("/api/playlist/download")
-def api_playlist_download():
-    m3u_url = request.args.get("url", "").strip()
-    if not m3u_url:
-        dns = request.args.get("dns", "").strip().rstrip("/")
-        u = request.args.get("username", "").strip()
-        p = request.args.get("password", "").strip()
-        if dns and u and p:
-            if not dns.startswith("http://") and not dns.startswith("https://"): dns = "http://" + dns
-            m3u_url = f"{dns}/get.php?username={urllib.parse.quote(u)}&password={urllib.parse.quote(p)}&type=m3u_plus&output=ts"
-
-    if not m3u_url:
-        return jsonify({"ok": False, "error": "URL da playlist não informada"}), 400
-
-    try:
-        req = urllib.request.Request(m3u_url, headers={"User-Agent": "Mozilla/5.0", "Accept": "*/*"})
-        with urllib.request.urlopen(req, timeout=60, context=SSL_CTX) as resp:
-            content = resp.read()
-            try: text = content.decode("utf-8")
-            except: text = content.decode("latin-1", errors="ignore")
-            return Response(text, mimetype="text/plain; charset=utf-8")
-    except Exception as e:
-        return jsonify({"ok": False, "error": f"Falha ao conectar no servidor IPTV: {str(e)}"}), 502
-
-# ==========================================================
-# 5. MONITORAMENTO EM TEMPO REAL
+# 4. MONITORAMENTO EM TEMPO REAL
 # ==========================================================
 @app.route("/api/monitor/heartbeat", methods=["POST"])
 def api_monitor_heartbeat():
@@ -407,7 +376,7 @@ def api_monitor_heartbeat():
     return jsonify({"ok": True})
 
 # ==========================================================
-# 6. ROTAS DE LOGIN, TESTE GRÁTIS E ADMINISTRAÇÃO
+# 5. ROTAS DE LOGIN, TESTE GRÁTIS E ADMINISTRAÇÃO
 # ==========================================================
 @app.route("/api/config")
 def api_config():
@@ -443,12 +412,11 @@ def api_login():
     existing = conn.execute("SELECT * FROM active_users WHERE username = ?", (username,)).fetchone()
     now_ts = int(time.time())
 
-    # Na rota de login, pegamos os dados reais do servidor toda vez
     chosen_dns = primary_dns
     expires_at = now_ts + (30 * 86400)
     max_conns = "1"
     status_str = "Active"
-    plan_type = "Assinatura IPTV"
+    plan_type = "Assinante Oficial"
     created_at_str = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
     payment_link = cfg.get("default_payment_link", "")
 
@@ -456,7 +424,7 @@ def api_login():
         if not dns.startswith("http://") and not dns.startswith("https://"): dns = "http://" + dns
         try:
             api_url = f"{dns}/player_api.php?username={urllib.parse.quote(username)}&password={urllib.parse.quote(password)}"
-            req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0", "Accept": "*/*"})
+            req = urllib.request.Request(api_url, headers={"User-Agent": "IPTVSmartersPro/3.1.5 (Linux; Android 12)", "Accept": "*/*"})
             with urllib.request.urlopen(req, timeout=7, context=SSL_CTX) as resp:
                 info = json.loads(resp.read().decode("utf-8", errors="ignore"))
                 u_info = info.get("user_info", {})
@@ -508,7 +476,7 @@ def api_login():
         "status": status_str,
         "created_formatted": created_at_str,
         "expires_at": expires_at,
-        "expires_formatted": datetime.fromtimestamp(expires_at).strftime("%d/%m/%Y %H:%M:%S") if expires_at else "Sem Vencimento",
+        "expires_formatted": datetime.fromtimestamp(expires_at).strftime("%d/%m/%Y às %H:%M") if expires_at else "Sem Vencimento",
         "payment_link": payment_link,
         "support_whatsapp": cfg.get("support_whatsapp", "")
     })
@@ -544,7 +512,7 @@ def api_request_trial():
         try:
             req_post = urllib.request.Request(
                 trial_api_url, data=b"{}",
-                headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"},
+                headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"},
                 method="POST"
             )
             with urllib.request.urlopen(req_post, timeout=15, context=SSL_CTX) as resp:
@@ -563,6 +531,8 @@ def api_request_trial():
         parsed["username"] = f"teste_{rand_suffix}"
         parsed["password"] = f"{int(time.time()) % 900000 + 100000}"
         if parsed["dns"]: parsed["m3u_url"] = f"{parsed['dns']}/get.php?username={parsed['username']}&password={parsed['password']}&type=m3u_plus&output=ts"
+
+    parsed["raw_message"] = format_custom_trial_message(parsed)
 
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     conn1.execute("""INSERT INTO trial_records
@@ -690,7 +660,7 @@ def api_update_adult_pin():
     return jsonify({"ok": True, "pin": new_pin})
 
 # ==========================================================
-# 7. FRONTEND ESTILO NETFLIX (CONTROLES SLIM, VOD PROGRESS E DRAWER CANAIS)
+# 6. FRONTEND ESTILO NETFLIX (CONTROLES SLIM, VOD PROGRESS E LISTA TV)
 # ==========================================================
 HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="pt-BR">
@@ -730,7 +700,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .screen.active { display:block; }
         .hidden { display:none !important; }
 
-        /* BOTÕES REDONDOS MINIMALISTAS ELEGANTES */
         .btn-pill {
             display: inline-flex;
             align-items: center;
@@ -742,15 +711,15 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             font-weight: 700;
             cursor: pointer;
             border: 1px solid transparent;
-            transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+            transition: all 0.15s cubic-bezier(0.16, 1, 0.3, 1);
             text-decoration: none;
         }
+        .btn-pill:active { transform: scale(0.94); }
         .btn-pill-primary {
             background: var(--primary);
             color: #fff;
             box-shadow: 0 4px 16px var(--primary-glow);
         }
-        .btn-pill-primary:active { transform: scale(0.97); }
         .btn-pill-success {
             background: linear-gradient(135deg, #10b981, #059669);
             color: #fff;
@@ -766,7 +735,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             color: #fff;
         }
 
-        /* TELA DE LOGIN */
+        /* TELA DE LOGIN (SEM BOTÃO ADMIN EXPOSTO) */
         #screen-login { display:none; align-items:center; justify-content:center; padding:1.2rem; min-height:100vh; background:radial-gradient(circle at top, #240508 0%, #000 75%); }
         #screen-login.active { display:flex; }
         .login-box { background:var(--bg-surface); border:1px solid var(--border); border-radius:var(--radius-lg); padding:2rem 1.6rem; width:100%; max-width:390px; box-shadow:0 25px 60px rgba(0,0,0,0.95); text-align:center; }
@@ -796,14 +765,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             border: 1px solid var(--success);
             border-radius: var(--radius-lg);
             width: 100%;
-            max-width: 450px;
+            max-width: 460px;
             padding: 1.5rem;
             max-height: 92vh;
             overflow-y: auto;
             box-shadow: 0 20px 60px rgba(0,0,0,0.95), 0 0 35px rgba(16, 185, 129, 0.22);
             animation: cardPop 0.32s cubic-bezier(0.16, 1, 0.3, 1) forwards;
         }
-        .trial-app-box { background:rgba(255,255,255,0.03); border:1px solid var(--border); border-radius:12px; padding:0.85rem; font-size:0.78rem; color:#cbd5e1; white-space:pre-wrap; line-height:1.55; word-break:break-word; margin:1rem 0; text-align:left; }
+        .trial-app-box { background:rgba(255,255,255,0.03); border:1px solid var(--border); border-radius:12px; padding:0.85rem; font-size:0.76rem; color:#cbd5e1; white-space:pre-wrap; line-height:1.55; word-break:break-word; margin:1rem 0; text-align:left; font-family:monospace; }
         
         /* TOPBAR & NAVEGAÇÃO */
         .navbar { height:58px; background:var(--bg-glass); backdrop-filter:blur(12px); border-bottom:1px solid var(--border); display:flex; align-items:center; justify-content:space-between; padding:0 1rem; position:sticky; top:0; z-index:120; }
@@ -836,24 +805,25 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .poster-info h4 { font-size:0.76rem; font-weight:700; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
         .poster-info span { font-size:0.66rem; color:var(--text-muted); display:block; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 
-        /* LISTA VERTICAL DE CANAIS DE TV (SUBSTITUI CARDS PARA TV) */
-        .tv-channel-list { display:flex; flex-direction:column; gap:0.5rem; }
-        .tv-channel-item { display:flex; align-items:center; gap:0.75rem; padding:0.6rem 0.8rem; background:var(--bg-card); border:1px solid var(--border); border-radius:var(--radius-md); cursor:pointer; transition:border-color 0.15s; }
-        .tv-channel-item:active { border-color:var(--primary); }
-        .tv-channel-logo { width:45px; height:45px; border-radius:8px; object-fit:contain; background:#050509; padding:4px; flex-shrink:0; }
+        /* LISTA VERTICAL DE CANAIS DE TV */
+        .tv-channel-list { display:flex; flex-direction:column; gap:0.45rem; }
+        .tv-channel-item { display:flex; align-items:center; gap:0.75rem; padding:0.55rem 0.8rem; background:var(--bg-card); border:1px solid var(--border); border-radius:var(--radius-md); cursor:pointer; transition:border-color 0.15s; }
+        .tv-channel-item:active { border-color:var(--primary); transform:scale(0.98); }
+        .tv-channel-logo { width:42px; height:42px; border-radius:8px; object-fit:contain; background:#050509; padding:3px; flex-shrink:0; }
         .tv-channel-info { flex:1; overflow:hidden; }
-        .tv-channel-info h4 { font-size:0.85rem; font-weight:700; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; margin-bottom:0.15rem; color:#fff; }
+        .tv-channel-info h4 { font-size:0.84rem; font-weight:700; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; margin-bottom:0.15rem; color:#fff; }
         .tv-channel-info span { font-size:0.68rem; color:var(--text-muted); display:block; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 
-        /* DRAWER LATERAL OCULTO (CATEGORIAS E LISTA DE CANAIS NO PLAYER) */
+        /* DRAWER LATERAL OCULTO */
         .drawer-backdrop { position:fixed; inset:0; background:rgba(0,0,0,0.85); z-index:650; opacity:0; pointer-events:none; transition:opacity 0.25s; }
         .drawer-backdrop.active { opacity:1; pointer-events:auto; }
         .drawer-panel { position:fixed; top:0; left:0; bottom:0; width:290px; max-width:85vw; background:#07070c; border-right:1px solid var(--border); z-index:660; transform:translateX(-100%); transition:transform 0.28s ease; display:flex; flex-direction:column; }
         .drawer-panel.active { transform:translateX(0); }
         .drawer-header { height:58px; padding:0 1rem; border-bottom:1px solid var(--border); display:flex; align-items:center; justify-content:space-between; }
         .drawer-list { flex:1; overflow-y:auto; padding:0.6rem; display:flex; flex-direction:column; gap:0.35rem; }
-        .drawer-item { padding:0.7rem 0.9rem; border-radius:var(--radius-pill); color:var(--text-muted); background:transparent; border:none; text-align:left; font-size:0.84rem; font-weight:700; cursor:pointer; display:flex; justify-content:space-between; align-items:center; }
+        .drawer-item { padding:0.65rem 0.85rem; border-radius:var(--radius-pill); color:var(--text-muted); background:transparent; border:none; text-align:left; font-size:0.82rem; font-weight:700; cursor:pointer; display:flex; justify-content:space-between; align-items:center; }
         .drawer-item.active { background:var(--primary); color:#fff; }
+        .drawer-item:active { transform:scale(0.98); }
 
         .posters-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(122px, 1fr)); gap:0.75rem; padding-bottom:1.5rem; min-height:200px; }
         .posters-grid .poster-card { flex:unset; width:100%; }
@@ -879,7 +849,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .bnav-item { background:transparent; border:none; color:var(--text-muted); display:flex; flex-direction:column; align-items:center; justify-content:center; gap:0.2rem; font-size:0.68rem; font-weight:700; cursor:pointer; flex:1; height:100%; }
         .bnav-item.active { color:var(--primary); }
 
-        /* PLAYER DE VÍDEO COMPLETO E SLIM */
+        /* ==========================================================
+           PLAYER DE VÍDEO SLIM: CONTROLES OCULTOS DURANTE REPRODUÇÃO
+           ========================================================== */
         .player-modal { display:none; position:fixed; inset:0; background:#000; z-index:600; flex-direction:column; overflow:hidden; }
         .player-modal.active { display:flex; }
         .video-stage { position:relative; flex:1; width:100%; height:100%; overflow:hidden; background:#000; display:flex; align-items:center; justify-content:center; cursor:pointer; }
@@ -921,7 +893,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         }
         .center-play-circle:active { transform: scale(0.92); }
 
-        /* TOPO SLIM DO PLAYER - TOTALMENTE INVISÍVEL EM REPRODUÇÃO */
+        /* TOPO SLIM DO PLAYER */
         .player-top-slim {
             position: absolute;
             top: 14px;
@@ -948,13 +920,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             font-weight: 700;
             padding: 0.35rem 0.85rem;
             border-radius: var(--radius-pill);
-            max-width: 65vw;
+            max-width: 50vw;
             white-space: nowrap;
             overflow: hidden;
             text-overflow: ellipsis;
         }
 
-        /* DOCK SLIM FLUTUANTE - TOTALMENTE INVISÍVEL EM REPRODUÇÃO */
+        /* DOCK SLIM FLUTUANTE */
         .player-dock-wrap {
             position: absolute;
             bottom: 16px;
@@ -976,7 +948,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             pointer-events: auto;
         }
 
-        /* BARRA DE PROGRESSO (SEEK BAR) EXCLUSIVA PARA VOD (FILMES/SÉRIES) */
+        /* BARRA DE PROGRESSO (SEEK BAR) EXCLUSIVA PARA VOD */
         .vod-seek-bar-wrap {
             width: 100%;
             max-width: 440px;
@@ -1045,7 +1017,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             cursor: pointer;
             font-size: 0.76rem;
             font-weight: 800;
-            transition: all 0.18s ease;
+            transition: all 0.15s ease;
             position: relative;
         }
         .mini-btn:active, .mini-btn.active {
@@ -1053,9 +1025,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             color: #fff;
             border-color: var(--primary);
             box-shadow: 0 0 12px var(--primary-glow);
+            transform: scale(0.92);
         }
 
-        /* POPUP BUBBLE FLUTUANTE INVISÍVEL EM REPRODUÇÃO */
+        /* POPUP BUBBLE FLUTUANTE */
         .dock-bubble {
             position: absolute;
             bottom: 58px;
@@ -1066,13 +1039,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             border: 1px solid rgba(255, 255, 255, 0.14);
             border-radius: 16px;
             padding: 6px;
-            display: none; /* Só exibe ao clicar, com a classe open */
+            display: none;
             flex-direction: column;
             gap: 4px;
             box-shadow: 0 14px 35px rgba(0,0,0,0.9);
             min-width: 145px;
             z-index: 60;
-            pointer-events: none; /* Garante que não bloqueie cliques se invisível */
+            pointer-events: none;
             opacity: 0;
             transition: opacity 0.2s;
         }
@@ -1101,7 +1074,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             color: #fff;
         }
 
-        /* EPG BAR (SOMENTE PARA TV) */
         .epg-bar { background:rgba(20,20,30,0.85); border-radius:var(--radius-pill); padding:0.45rem 0.85rem; font-size:0.75rem; display:none; justify-content:space-between; margin-bottom:6px; max-width:85vw; }
         .epg-bar.active { display:flex; }
 
@@ -1151,7 +1123,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <div class="modal-box">
             <h3 style="color:var(--success); font-size:1.15rem; font-weight:900; margin-bottom:0.25rem;">✅ Teste Grátis Liberado!</h3>
             
-            <div class="trial-app-box" id="tr-raw" style="font-size:0.72rem; line-height:1.5;"></div>
+            <div class="trial-app-box" id="tr-raw"></div>
 
             <a href="#" target="_blank" class="btn-pill btn-pill-primary hidden" id="btn-pay-link" style="width:100%; margin-bottom:0.6rem; background:linear-gradient(135deg, #f59e0b, #d97706); color:#000; font-weight:900;">💳 Pagar / Assinar Plano Oficial</a>
 
@@ -1469,14 +1441,15 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         let activeCategory = "Todas";
         let currentAuth = JSON.parse(localStorage.getItem("sf_session") || "null");
         let serverConfig = {};
+        let xtreamCategories = { tv: [], movies: [], series: [] };
         let catalog = { tv: [], movies: [], series: [] };
-        let categoriesMap = { tv: {}, movies: {}, series: {} };
         let currentPlayingItem = null;
         let hlsInstance = null;
         let mpegtsInstance = null;
         let adultPin = "0000";
         let monitorInterval = null;
         let playSecondsCounter = 0;
+        let currentActiveEngine = "auto";
         let dockTimeout = null;
 
         const ADULT_REGEX = /\b(adult[os]?|\+18|xxx|porn[oa]?|erotic[oa]?|sexy|playboy|venus|for adults)\b/i;
@@ -1516,6 +1489,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             return h > 0 ? `${pad(h)}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`;
         }
 
+        // DECODIFICADOR ROBUSTO DE EPG
         function decodeEpgString(str) {
             if (!str) return "";
             try {
@@ -1542,6 +1516,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         }
         loadPublicConfig();
 
+        // HERO CAROUSEL 5s
         let heroItems = [];
         let heroIdx = 0;
         let heroMs = 0;
@@ -1570,134 +1545,80 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             };
         }
 
-        function openIndexedDB() {
-            return new Promise((resolve, reject) => {
-                const req = indexedDB.open("StreamFlix_V5_Store", 1);
-                req.onupgradeneeded = (e) => {
-                    const db = e.target.result;
-                    if (!db.objectStoreNames.contains("cache")) db.createObjectStore("cache");
-                };
-                req.onsuccess = () => resolve(req.result);
-                req.onerror = () => reject(req.error);
-            });
-        }
-
-        async function saveCatalogToDB(catData) {
-            try {
-                const db = await openIndexedDB();
-                const tx = db.transaction("cache", "readwrite");
-                tx.objectStore("cache").put(catData, "last_catalog");
-            } catch (e) {}
-        }
-
-        async function loadCatalogFromDB() {
-            try {
-                const db = await openIndexedDB();
-                return await new Promise((resolve) => {
-                    const tx = db.transaction("cache", "readonly");
-                    const req = tx.objectStore("cache").get("last_catalog");
-                    req.onsuccess = () => resolve(req.result || null);
-                    req.onerror = () => resolve(null);
-                });
-            } catch (e) { return null; }
-        }
-
-        function classifyItem(name, group, url) {
-            const u = url.toLowerCase();
-            const g = group.toLowerCase();
-            const n = name.toLowerCase();
-            if (u.includes('/series/')) return 'series';
-            if (u.includes('/movie/')) return 'movies';
-            if (u.includes('/live/') || u.endsWith('.ts')) return 'tv';
-            if (/s\d{1,2}\s*e\d{1,3}|\bep\.?\s*\d+/i.test(n) || g.includes('série') || g.includes('serie') || g.includes('novela') || g.includes('dorama') || g.includes('temporada')) return 'series';
-            if ((u.endsWith('.mp4') || u.endsWith('.mkv') || u.endsWith('.avi')) && !g.includes('24h') && !g.includes('canal')) return 'movies';
-            if (g.includes('filme') || g.includes('cinema') || g.includes('vod') || g.includes('lançamento') || g.includes('lancamento')) return 'movies';
-            return 'tv';
-        }
-
-        async function parseM3UContent(text) {
-            const lines = text.split(/\r?\n/);
-            const total = lines.length;
-            const fallbackLogo = 'https://images.unsplash.com/photo-1593784991095-a205069470b6?w=400&q=80';
-
-            catalog = { tv: [], movies: [], series: [] };
-            categoriesMap = { tv: {}, movies: {}, series: {} };
-
-            let name = "", group = "Geral", logo = fallbackLogo, hasInf = false, idSeq = 0;
-            const msgEl = document.getElementById("loading-msg");
-
-            for (let i = 0; i < total; i++) {
-                const l = lines[i].trim();
-                if (!l) continue;
-
-                if (l.startsWith("#EXTINF:")) {
-                    const cIdx = l.lastIndexOf(",");
-                    name = cIdx !== -1 ? l.slice(cIdx + 1).trim() : `Canal ${idSeq + 1}`;
-                    const gMatch = l.match(/group-title="([^"]*)"/i);
-                    group = gMatch && gMatch[1].trim() ? gMatch[1].trim() : "Geral";
-                    const lMatch = l.match(/tvg-logo="([^"]*)"/i);
-                    logo = lMatch && lMatch[1].trim() ? lMatch[1].trim() : fallbackLogo;
-                    hasInf = true;
-                } else if (!l.startsWith("#") && hasInf) {
-                    idSeq++;
-                    const type = classifyItem(name, group, l);
-                    const item = { id: idSeq, name, group, logo, url: l, type };
-
-                    catalog[type].push(item);
-                    categoriesMap[type][group] = (categoriesMap[type][group] || 0) + 1;
-                    hasInf = false;
-
-                    if (idSeq % 800 === 0) {
-                        msgEl.textContent = `Processando canais: ${idSeq} títulos organizados...`;
-                        await new Promise(r => setTimeout(r, 0));
-                    }
-                }
+        // CARREGA DADOS XTREAM CODES DIRETO DO SERVIDOR (BASE ORIGINAL COMPROVADA v5)
+        async function fetchXtreamData() {
+            let dns = (currentAuth && currentAuth.dns) || serverConfig.dns;
+            if (!currentAuth || !dns) {
+                alert("Servidor IPTV não configurado. Verifique o DNS na Área Admin.");
+                return;
             }
+            dns = dns.replace(/\/$/, "");
+            if (!dns.startsWith("http://") && !dns.startsWith("https://")) {
+                dns = "http://" + dns;
+            }
+            const u = encodeURIComponent(currentAuth.username);
+            const p = encodeURIComponent(currentAuth.password);
 
-            heroItems = [...catalog.movies, ...catalog.series].filter(it => !isAdultItem(it)).slice(0, 15);
-            if (heroItems.length > 0) renderHeroSlide(heroItems[0]);
-
-            renderHomeCarousels();
-            saveCatalogToDB({ catalog, categoriesMap });
-        }
-
-        async function loadPlaylistData() {
             const cover = document.getElementById("loading-cover");
             const msgEl = document.getElementById("loading-msg");
             cover.classList.add("active");
-            msgEl.textContent = "Carregando canais e categorias do servidor...";
-
-            const cached = await loadCatalogFromDB();
-            if (cached && cached.catalog && cached.catalog.tv.length > 0) {
-                catalog = cached.catalog;
-                categoriesMap = cached.categoriesMap;
-                heroItems = [...catalog.movies, ...catalog.series].filter(it => !isAdultItem(it)).slice(0, 15);
-                if (heroItems.length > 0) renderHeroSlide(heroItems[0]);
-                renderHomeCarousels();
-                cover.classList.remove("active");
-                return;
-            }
-
-            let m3uUrl = (currentAuth && currentAuth.m3u_url) || "";
-            if (!m3uUrl && currentAuth && currentAuth.username && currentAuth.password && currentAuth.dns) {
-                m3uUrl = `${currentAuth.dns}/get.php?username=${encodeURIComponent(currentAuth.username)}&password=${encodeURIComponent(currentAuth.password)}&type=m3u_plus&output=ts`;
-            }
-
-            if (!m3uUrl) {
-                cover.classList.remove("active");
-                alert("Nenhuma URL de playlist configurada. Configure o DNS na Área Admin.");
-                return;
-            }
 
             try {
-                const proxyUrl = `/api/playlist/download?url=${encodeURIComponent(m3uUrl)}`;
-                const r = await fetch(proxyUrl);
-                if (!r.ok) throw new Error("Servidor retornou erro ao baixar playlist");
-                const text = await r.text();
-                if (!text || !text.includes("#EXTINF")) throw new Error("Resposta da playlist vazia ou inválida");
-                await parseM3UContent(text);
-            } catch (err) {
-                alert("Não foi possível carregar a playlist automaticamente do servidor.");
+                msgEl.textContent = "Obtendo categorias do servidor...";
+                const [rTvCat, rVodCat, rSerCat] = await Promise.all([
+                    fetch(`${dns}/player_api.php?username=${u}&password=${p}&action=get_live_categories`).catch(()=>({json:()=>[]})),
+                    fetch(`${dns}/player_api.php?username=${u}&password=${p}&action=get_vod_categories`).catch(()=>({json:()=>[]})),
+                    fetch(`${dns}/player_api.php?username=${u}&password=${p}&action=get_series_categories`).catch(()=>({json:()=>[]}))
+                ]);
+                xtreamCategories.tv = await rTvCat.json().catch(()=>[]);
+                xtreamCategories.movies = await rVodCat.json().catch(()=>[]);
+                xtreamCategories.series = await rSerCat.json().catch(()=>[]);
+
+                const vodCatMap = {};
+                (Array.isArray(xtreamCategories.movies) ? xtreamCategories.movies : []).forEach(c => vodCatMap[c.category_id] = c.category_name);
+
+                const serCatMap = {};
+                (Array.isArray(xtreamCategories.series) ? xtreamCategories.series : []).forEach(c => serCatMap[c.category_id] = c.category_name);
+
+                const liveCatMap = {};
+                (Array.isArray(xtreamCategories.tv) ? xtreamCategories.tv : []).forEach(c => liveCatMap[c.category_id] = c.category_name);
+
+                msgEl.textContent = "Sincronizando conteúdos...";
+                const [rVod, rSer, rLive] = await Promise.all([
+                    fetch(`${dns}/player_api.php?username=${u}&password=${p}&action=get_vod_streams`).catch(()=>({json:()=>[]})),
+                    fetch(`${dns}/player_api.php?username=${u}&password=${p}&action=get_series`).catch(()=>({json:()=>[]})),
+                    fetch(`${dns}/player_api.php?username=${u}&password=${p}&action=get_live_streams`).catch(()=>({json:()=>[]}))
+                ]);
+                const vods = await rVod.json().catch(()=>[]);
+                const series = await rSer.json().catch(()=>[]);
+                const live = await rLive.json().catch(()=>[]);
+
+                catalog.movies = (Array.isArray(vods) ? vods : []).map(v => ({
+                    id: v.stream_id, name: v.name, group: v.category_name || vodCatMap[v.category_id] || "Filmes", category_id: v.category_id,
+                    type: "movies", logo: v.stream_icon, container_extension: v.container_extension || "mp4",
+                    rating: v.rating, tmdb_id: v.tmdb_id,
+                    url: `${dns}/movie/${currentAuth.username}/${currentAuth.password}/${v.stream_id}.${v.container_extension || 'mp4'}`
+                }));
+
+                catalog.series = (Array.isArray(series) ? series : []).map(s => ({
+                    id: s.series_id, name: s.name, group: s.category_name || serCatMap[s.category_id] || "Séries", category_id: s.category_id,
+                    type: "series", logo: s.cover, rating: s.rating, tmdb_id: s.tmdb_id,
+                    url: ""
+                }));
+
+                catalog.tv = (Array.isArray(live) ? live : []).map(l => ({
+                    id: l.stream_id, name: l.name, group: l.category_name || liveCatMap[l.category_id] || "Canais", category_id: l.category_id,
+                    type: "tv", logo: l.stream_icon, epg_id: l.epg_channel_id,
+                    url: `${dns}/live/${currentAuth.username}/${currentAuth.password}/${l.stream_id}.ts`
+                }));
+
+                heroItems = [...catalog.movies, ...catalog.series].filter(it => !isAdultItem(it)).slice(0, 15);
+                if (heroItems.length > 0) renderHeroSlide(heroItems[0]);
+
+                renderHomeCarousels();
+            } catch (e) {
+                console.error("Erro no carregamento Xtream:", e);
+                alert("Falha ao comunicar com o servidor IPTV. Verifique o DNS e credenciais.");
             } finally {
                 cover.classList.remove("active");
             }
@@ -1887,7 +1808,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
             const btnBack = document.createElement("button");
             btnBack.className = "drawer-item";
-            btnBack.innerHTML = `<span>‹ Voltar as Categorias</span>`;
+            btnBack.innerHTML = `<span>‹ Voltar a Todas as Categorias</span>`;
             btnBack.onclick = () => openCategoriesDrawer("tv");
             listEl.appendChild(btnBack);
 
@@ -1895,11 +1816,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             filtered.forEach(it => {
                 const b = document.createElement("button");
                 b.className = "drawer-item";
-                b.style.padding = "0.4rem 0.75rem";
+                b.style.padding = "0.45rem 0.75rem";
                 b.style.justifyContent = "flex-start";
                 b.style.gap = "0.75rem";
                 b.innerHTML = `
-                    <div style="width:40px; height:40px; background:#050509; border-radius:6px; flex-shrink:0; padding:3px; display:flex; align-items:center; justify-content:center;">
+                    <div style="width:38px; height:38px; background:#050509; border-radius:6px; flex-shrink:0; padding:2px; display:flex; align-items:center; justify-content:center;">
                         <img src="${it.logo}" onerror="this.style.display='none'" style="max-width:100%; max-height:100%;">
                     </div>
                     <div style="overflow:hidden; text-align:left;">
@@ -1918,15 +1839,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             if (forceTab) activeTab = forceTab;
             const list = document.getElementById("drawer-list");
             list.innerHTML = "";
-            const cats = categoriesMap[activeTab] || {};
-            const catNames = Object.keys(cats);
+            const cats = activeTab === "tv" ? xtreamCategories.tv : (activeTab === "movies" ? xtreamCategories.movies : xtreamCategories.series);
             
             let t = activeTab === "tv" ? "TV ao Vivo" : (activeTab === "movies" ? "Filmes" : "Séries");
             document.getElementById("drawer-title").textContent = `Categorias (${t})`;
 
             const bAll = document.createElement("button");
             bAll.className = `drawer-item ${activeCategory === "Todas" ? "active" : ""}`;
-            bAll.innerHTML = `<span>Todas as Categorias</span><span style="font-size:0.7rem; opacity:0.7;">${catalog[activeTab].length}</span>`;
+            bAll.innerHTML = `<span>Todas as Categorias</span>`;
             bAll.onclick = () => {
                 selectCategory("Todas");
                 if (activeTab === "tv") {
@@ -1939,20 +1859,20 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             };
             list.appendChild(bAll);
 
-            catNames.forEach(cName => {
+            (Array.isArray(cats) ? cats : []).forEach(c => {
                 const b = document.createElement("button");
-                b.className = `drawer-item ${activeCategory === cName ? "active" : ""}`;
-                b.innerHTML = `<span>${cName}</span><span style="font-size:0.7rem; opacity:0.7;">${cats[cName]}</span>`;
+                b.className = `drawer-item ${activeCategory === c.category_name ? "active" : ""}`;
+                b.innerHTML = `<span>${c.category_name}</span>`;
                 b.onclick = () => {
-                    if (ADULT_REGEX.test(cName)) {
+                    if (ADULT_REGEX.test(c.category_name)) {
                         const entered = prompt("🔒 Digite o PIN de 4 dígitos para conteúdo Adulto:");
                         if (entered !== adultPin) return alert("PIN incorreto!");
                     }
                     if (activeTab === "tv") {
                         if (document.getElementById("player-modal").classList.contains("active")) {
-                            openTvChannelList(cName);
+                            openTvChannelList(c.category_name);
                         } else {
-                            selectCategory(cName);
+                            selectCategory(c.category_name);
                             closeDrawer();
                             document.getElementById("view-home").classList.add("hidden");
                             document.getElementById("view-catalog").classList.add("hidden");
@@ -1960,7 +1880,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                             renderTvList();
                         }
                     } else {
-                        selectCategory(cName);
+                        selectCategory(c.category_name);
                         closeDrawer();
                     }
                 };
@@ -2048,7 +1968,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             });
         }
         document.getElementById("tv-search").oninput = renderTvList;
-
 
         // ==========================================================
         // PLAYER DE VÍDEO SLIM: CONTROLES OCULTOS DURANTE REPRODUÇÃO
@@ -2174,6 +2093,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 document.getElementById("seek-track-fill").style.width = "0%";
             }
 
+            document.getElementById("opt-vlc-ext").href = it.url;
+
             const epgBar = document.getElementById("epg-bar");
             if (it.type === "tv") {
                 epgBar.classList.add("active");
@@ -2191,17 +2112,17 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 else engine = "native";
             }
 
-            // OTIMIZAÇÃO DE BAIXA LATÊNCIA PARA BUFFER RÁPIDO NO HLS
+            // OTIMIZAÇÃO DE BUFFER E BAIXA LATÊNCIA PARA EVITAR TRAVAMENTOS NO SEEK
             if (engine === "ts_or_hls" || engine === "hls") {
                 const hlsUrl = url.endsWith('.ts') ? url.replace(/\.ts$/i, '.m3u8') : url;
 
                 if (typeof Hls !== "undefined" && Hls.isSupported()) {
                     hlsInstance = new Hls({
                         enableWorker: true,
-                        lowLatencyMode: true,
-                        maxBufferLength: 4,
-                        maxMaxBufferLength: 8,
-                        liveSyncDurationCount: 3,
+                        lowLatencyMode: it.type === "tv",
+                        maxBufferLength: it.type === "tv" ? 4 : 8,
+                        maxMaxBufferLength: it.type === "tv" ? 8 : 16,
+                        backBufferLength: 8,
                         startLevel: -1,
                         autoStartLoad: true
                     });
@@ -2466,10 +2387,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
         function fillConfigScreen() {
             if (!currentAuth) return;
-            document.getElementById("cfg-user").textContent = currentAuth.username;
-            document.getElementById("cfg-pass").textContent = currentAuth.password;
+            document.getElementById("cfg-user").textContent = currentAuth.username || "-";
+            document.getElementById("cfg-pass").textContent = currentAuth.password || "-";
             document.getElementById("cfg-exp").textContent = currentAuth.expires_formatted || "Ativo";
-            document.getElementById("cfg-created").textContent = currentAuth.created_formatted || "Hoje";
+            document.getElementById("cfg-created").textContent = currentAuth.created_formatted || "Servidor Oficial";
             document.getElementById("cfg-plan").textContent = currentAuth.plan_type || "Plano IPTV";
             document.getElementById("cfg-screens").textContent = `${currentAuth.max_connections || '1'} tela(s)`;
         }
@@ -2485,11 +2406,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         document.getElementById("btn-theme-oled").onclick = () => document.body.className = "";
         document.getElementById("btn-theme-midnight").onclick = () => document.body.className = "theme-midnight";
         document.getElementById("btn-clear-cache").onclick = async () => {
-            try {
-                const db = await openIndexedDB();
-                const tx = db.transaction("cache", "readwrite");
-                tx.objectStore("cache").clear();
-            } catch(e){}
+            localStorage.clear();
             location.reload();
         };
 
@@ -2507,7 +2424,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             enterApp();
         };
 
-        // GERAÇÃO DE TESTE GRÁTIS AUTOMÁTICO COM ANIMAÇÃO DE CARD E DADOS 100% FORMATADOS
+        // GERAÇÃO DE TESTE GRÁTIS AUTOMÁTICO COM ANIMAÇÃO DE CARD
         document.getElementById("btn-trial").onclick = async () => {
             const btn = document.getElementById("btn-trial");
             btn.textContent = "⏳ Conectando ao servidor e gerando seu teste...";
@@ -2527,6 +2444,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 currentAuth = tr;
                 localStorage.setItem("sf_session", JSON.stringify(tr));
 
+                // Popula o link real de pagamento da API
                 if (tr.payment_link) {
                     const payBtn = document.getElementById("btn-pay-link");
                     payBtn.classList.remove("hidden");
@@ -2535,13 +2453,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     document.getElementById("btn-pay-link").classList.add("hidden");
                 }
 
-                if (tr.raw_message) {
-                    document.getElementById("tr-raw").textContent = tr.raw_message;
-                } else {
-                    document.getElementById("tr-raw").textContent = "Teste criado com sucesso!\nUsuário: " + tr.username + "\nSenha: " + tr.password;
-                }
-
+                // Popula a mensagem formatada no bloco único
                 const shareText = tr.raw_message || ("Usuário: " + tr.username + "\nSenha: " + tr.password);
+                document.getElementById("tr-raw").textContent = shareText;
 
                 document.getElementById("btn-copy-tr").onclick = () => {
                     navigator.clipboard.writeText(shareText);
@@ -2550,7 +2464,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 document.getElementById("btn-wa-tr").href = `https://wa.me/?text=${encodeURIComponent(shareText)}`;
 
                 document.getElementById("trial-modal").classList.add("active");
-
             } catch (e) {
                 alert("Erro de conexão ao gerar o teste.");
             } finally {
@@ -2569,7 +2482,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             document.getElementById("main-navbar").classList.remove("hidden");
             document.getElementById("main-content").classList.remove("hidden");
             document.getElementById("bottom-nav").classList.add("active");
-            loadPlaylistData();
+            fetchXtreamData();
         }
 
         document.getElementById("btn-logout-cfg").onclick = () => {
@@ -2577,10 +2490,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             location.reload();
         };
 
-        // ROTA ADMINISTRATIVA (INVISÍVEL NA INTERFACE DO CLIENTE)
+        // ROTA ADMINISTRATIVA (INVISÍVEL NA TELA DE LOGIN DO CLIENTE)
         let adminPolling = null;
 
-        // Injeção direta pelo JS para ativar a rota Admin se o path for /admin
         if (window.location.pathname === "/admin") {
             document.getElementById("screen-login").classList.remove("active");
             document.getElementById("screen-admin").classList.add("active");
