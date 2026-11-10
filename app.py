@@ -767,12 +767,18 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             width: 100%;
             max-width: 460px;
             padding: 1.5rem;
-            max-height: 92vh;
+            max-height: min(92dvh, 760px);
             overflow-y: auto;
+            overscroll-behavior: contain;
             box-shadow: 0 20px 60px rgba(0,0,0,0.95), 0 0 35px rgba(16, 185, 129, 0.22);
             animation: cardPop 0.32s cubic-bezier(0.16, 1, 0.3, 1) forwards;
         }
-        .trial-app-box { background:rgba(255,255,255,0.03); border:1px solid var(--border); border-radius:12px; padding:0.85rem; font-size:0.76rem; color:#cbd5e1; white-space:pre-wrap; line-height:1.55; word-break:break-word; margin:1rem 0; text-align:left; font-family:monospace; }
+        .trial-app-box { background:rgba(255,255,255,0.03); border:1px solid var(--border); border-radius:12px; padding:0.85rem; font-size:0.76rem; color:#cbd5e1; white-space:pre-wrap; line-height:1.55; overflow-wrap:anywhere; word-break:normal; margin:1rem 0; text-align:left; font-family:monospace; }
+        .trial-app-box a { color:#7dd3fc; text-decoration:underline; text-underline-offset:2px; overflow-wrap:anywhere; }
+        @media (max-height:700px) {
+            .modal-box { padding:1rem; max-height:94dvh; }
+            .trial-app-box { margin:0.65rem 0; max-height:42dvh; overflow-y:auto; }
+        }
         
         /* TOPBAR & NAVEGAÇÃO */
         .navbar { height:58px; background:var(--bg-glass); backdrop-filter:blur(12px); border-bottom:1px solid var(--border); display:flex; align-items:center; justify-content:space-between; padding:0 1rem; position:sticky; top:0; z-index:120; }
@@ -781,14 +787,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .nav-brand span { color:var(--primary); }
 
         .content-wrap { max-width:1180px; margin:0 auto; padding:0.9rem; }
-        .hero-box { position:relative; border-radius:var(--radius-lg); overflow:hidden; height:280px; background:#07070c; border:1px solid var(--border); margin-bottom:1.4rem; }
+        .hero-box { position:relative; border-radius:var(--radius-lg); overflow:hidden; height:clamp(220px, 42vh, 340px); min-height:210px; background:#07070c; border:1px solid var(--border); margin-bottom:1.4rem; }
         .hero-bg { position:absolute; inset:0; background-size:cover; background-position:center; transition:background-image 0.4s ease; }
-        .hero-overlay { position:absolute; inset:0; background:linear-gradient(0deg, #000 14%, rgba(0,0,0,0.65) 60%, rgba(0,0,0,0.2) 100%); display:flex; flex-direction:column; justify-content:flex-end; padding:1.25rem; }
-        .hero-tag { align-self:flex-start; background:var(--primary); color:#fff; font-size:0.65rem; font-weight:800; text-transform:uppercase; padding:0.2rem 0.65rem; border-radius:var(--radius-pill); margin-bottom:0.4rem; }
-        .hero-title { font-size:1.35rem; font-weight:900; margin-bottom:0.2rem; }
-        .hero-meta { font-size:0.78rem; color:#cbd5e1; margin-bottom:0.85rem; }
-        .hero-timer { position:absolute; bottom:0; left:0; right:0; height:4px; background:rgba(255,255,255,0.15); }
-        .hero-timer-fill { height:100%; width:0%; background:var(--primary); transition:width 0.1s linear; }
+        .hero-overlay { position:absolute; inset:0; background:linear-gradient(0deg, #000 10%, rgba(0,0,0,0.48) 48%, rgba(0,0,0,0.08) 100%); display:flex; flex-direction:column; justify-content:flex-end; align-items:flex-start; padding:clamp(0.75rem, 3vw, 1.25rem); gap:0.45rem; }
+        .hero-title { font-size:clamp(1rem, 4vw, 1.35rem); line-height:1.15; font-weight:900; margin:0; max-width:100%; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
+        #btn-hero-play { width:50%; min-height:34px; padding:0.35rem 0.65rem; font-size:0.72rem; margin-top:0.2rem; }
 
         .home-row { margin-bottom:1.5rem; }
         .row-header { display:flex; align-items:center; justify-content:space-between; margin-bottom:0.65rem; }
@@ -815,9 +818,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .tv-channel-info span { font-size:0.68rem; color:var(--text-muted); display:block; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 
         /* DRAWER LATERAL OCULTO */
-        .drawer-backdrop { position:fixed; inset:0; background:rgba(0,0,0,0.85); z-index:650; opacity:0; pointer-events:none; transition:opacity 0.25s; }
+        .drawer-backdrop { position:fixed; inset:0; background:rgba(0,0,0,0.72); z-index:650; opacity:0; pointer-events:none; transition:opacity 0.25s; }
         .drawer-backdrop.active { opacity:1; pointer-events:auto; }
-        .drawer-panel { position:fixed; top:0; left:0; bottom:0; width:290px; max-width:85vw; background:#07070c; border-right:1px solid var(--border); z-index:660; transform:translateX(-100%); transition:transform 0.28s ease; display:flex; flex-direction:column; }
+        .drawer-panel { position:fixed; top:0; left:0; bottom:0; width:min(52vw, 270px); min-width:170px; max-width:52vw; background:#07070c; border-right:1px solid var(--border); z-index:660; transform:translateX(-100%); transition:transform 0.28s ease; display:flex; flex-direction:column; }
         .drawer-panel.active { transform:translateX(0); }
         .drawer-header { height:58px; padding:0 1rem; border-bottom:1px solid var(--border); display:flex; align-items:center; justify-content:space-between; }
         .drawer-list { flex:1; overflow-y:auto; padding:0.6rem; display:flex; flex-direction:column; gap:0.35rem; }
@@ -846,6 +849,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         /* BOTTOM NAVIGATION BAR */
         .bottom-nav { position:fixed; bottom:0; left:0; right:0; height:66px; background:rgba(8,8,12,0.96); backdrop-filter:blur(16px); border-top:1px solid var(--border); display:none; align-items:center; justify-content:space-around; z-index:200; }
         .bottom-nav.active { display:flex; }
+        body.player-open .bottom-nav.active { display:flex; }
         .bnav-item { background:transparent; border:none; color:var(--text-muted); display:flex; flex-direction:column; align-items:center; justify-content:center; gap:0.2rem; font-size:0.68rem; font-weight:700; cursor:pointer; flex:1; height:100%; }
         .bnav-item.active { color:var(--primary); }
 
@@ -862,10 +866,38 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             object-fit: contain;
             background: #000;
         }
-        #video-player.mode-fill-horizontal {
-            width: 100vw;
-            height: 100%;
-            object-fit: cover;
+        #video-player.mode-fill-horizontal,
+        #video-player.mode-vertical-extend {
+            width: 100%;
+            height: 140%;
+            max-height: none;
+            object-fit: fill;
+            object-position: center;
+        }
+        .player-modal.tv-list-open .video-stage {
+            position:absolute;
+            right:0;
+            top:50%;
+            transform:translateY(-50%);
+            width:calc(100% - min(52vw, 270px));
+            height:34vh;
+            min-height:150px;
+            flex:none;
+            z-index:5;
+            border:1px solid rgba(255,255,255,0.16);
+            border-radius:10px 0 0 10px;
+        }
+        .player-modal.tv-list-open #video-player { width:100%; height:100%; object-fit:contain; }
+        .player-modal.tv-list-open .player-top-slim,
+        .player-modal.tv-list-open .player-dock-wrap { display:none !important; }
+        .player-modal.tv-list-open .epg-bar { display:none !important; }
+        body.player-open .drawer-backdrop.active { background:transparent; pointer-events:none; }
+        body.player-open .drawer-panel { width:min(52vw, 270px); max-width:52vw; }
+        body.player-open .bottom-nav { z-index:710; }
+        body.player-open .bottom-nav .bnav-item[data-tab="config"] { display:none; }
+        @media (max-width:380px) {
+            .player-modal.tv-list-open .video-stage { height:28vh; min-height:125px; }
+            .drawer-panel { min-width:150px; }
         }
 
         .center-play-overlay {
@@ -1074,7 +1106,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             color: #fff;
         }
 
-        .epg-bar { background:rgba(20,20,30,0.85); border-radius:var(--radius-pill); padding:0.45rem 0.85rem; font-size:0.75rem; display:none; justify-content:space-between; margin-bottom:6px; max-width:85vw; }
+        .epg-bar { background:rgba(20,20,30,0.85); border-radius:var(--radius-pill); padding:0.4rem 0.7rem; font-size:0.68rem; display:none; justify-content:space-between; gap:0.5rem; margin-bottom:6px; max-width:92vw; }
         .epg-bar.active { display:flex; }
 
         .config-card { background:var(--bg-surface); border:1px solid var(--border); border-radius:var(--radius-lg); padding:1.2rem; margin-bottom:1rem; }
@@ -1163,12 +1195,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             <div class="hero-box">
                 <div class="hero-bg" id="hero-bg"></div>
                 <div class="hero-overlay">
-                    <span class="hero-tag">DESTAQUE RECÉM ADICIONADO (5s)</span>
                     <h2 class="hero-title" id="hero-title">Carregando Destaques...</h2>
-                    <p class="hero-meta" id="hero-meta">Prévia automática exclusiva de Filmes e Séries</p>
-                    <button class="btn-pill btn-pill-primary" id="btn-hero-play" style="align-self:flex-start;">▶ Assistir Agora</button>
+                    <button class="btn-pill btn-pill-primary" id="btn-hero-play">▶ Assistir Agora</button>
                 </div>
-                <div class="hero-timer"><div class="hero-timer-fill" id="hero-timer-fill"></div></div>
             </div>
 
             <section class="home-row">
@@ -1216,6 +1245,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 <div class="trial-row" style="border-bottom:1px dashed #202434; padding-bottom:0.4rem; margin-bottom:0.4rem; display:flex; justify-content:space-between;"><strong>Data do Servidor (Login):</strong><span id="cfg-created">-</span></div>
                 <div class="trial-row" style="border-bottom:1px dashed #202434; padding-bottom:0.4rem; margin-bottom:0.4rem; display:flex; justify-content:space-between;"><strong>Tipo de Plano:</strong><span id="cfg-plan">-</span></div>
                 <div class="trial-row" style="display:flex; justify-content:space-between;"><strong>Telas Simultâneas:</strong><span id="cfg-screens">1 tela</span></div>
+            </div>
+
+            <div class="config-card" id="cfg-payment-card">
+                <div class="config-title">💳 Pagamento e Renovação</div>
+                <p style="font-size:0.75rem; color:var(--text-muted); margin-bottom:0.65rem;">Acesse o link de pagamento associado ao seu acesso para renovar ou contratar um plano.</p>
+                <a href="#" target="_blank" rel="noopener noreferrer" class="btn-pill btn-pill-primary hidden" id="btn-config-pay" style="width:100%; background:linear-gradient(135deg, #f59e0b, #d97706); color:#000;">💳 Fazer Pagamento</a>
+                <span id="cfg-payment-unavailable" style="font-size:0.75rem; color:var(--text-muted);">Link de pagamento não disponível para este acesso.</span>
             </div>
 
             <div class="config-card">
@@ -1294,10 +1330,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div id="player-modal" class="player-modal">
         <!-- Topo Slim do Player: Oculto durante reprodução, aparece ao tocar -->
         <div class="player-top-slim" id="player-top-slim">
-            <button class="btn-pill btn-pill-outline" id="btn-player-back" style="padding:0.35rem 0.75rem; font-size:0.72rem;">‹ Sair</button>
+            <button class="btn-pill btn-pill-outline" id="btn-player-back" aria-label="Voltar" title="Voltar" style="width:34px;height:34px;padding:0;font-size:1.25rem;border-radius:50%;">‹</button>
             <div class="player-title-badge" id="player-title">Reproduzindo...</div>
             <div style="display:flex; gap:0.4rem;">
-                <button class="btn-pill btn-pill-outline hidden" id="btn-player-tv-list" style="padding:0.35rem 0.75rem; font-size:0.72rem;">📺 Lista</button>
                 <button class="btn-pill btn-pill-outline hidden" id="btn-player-vod-list" style="padding:0.35rem 0.75rem; font-size:0.72rem;">🎬 Voltar a Categoria</button>
             </div>
         </div>
@@ -1335,7 +1370,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             </div>
 
             <div class="dock-bubble" id="bubble-aspect">
-                <button class="bubble-item active" id="opt-aspect-fill">Preencher Horizontal</button>
+                <button class="bubble-item" id="opt-aspect-fill">Preencher Horizontal</button>
                 <button class="bubble-item" id="opt-aspect-fit">Original (16:9)</button>
             </div>
 
@@ -1354,6 +1389,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 <button class="mini-btn" id="dock-btn-ff" title="Avançar 10s">⏩</button>
                 <button class="mini-btn" id="dock-btn-speed" title="Velocidade">1.0x</button>
                 <button class="mini-btn" id="dock-btn-aspect" title="Ajuste de Tela">📐</button>
+                <button class="mini-btn hidden" id="dock-btn-tv-list" title="Lista de canais">☷</button>
                 <button class="mini-btn" id="dock-btn-engine" title="Decodificador">⚙️</button>
             </div>
         </div>
@@ -1523,7 +1559,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         setInterval(() => {
             if (activeTab !== "home" || document.getElementById("player-modal").classList.contains("active")) return;
             heroMs += 100;
-            document.getElementById("hero-timer-fill").style.width = `${Math.min(100, (heroMs / 5000) * 100)}%`;
             if (heroMs >= 5000) {
                 heroMs = 0;
                 if (heroItems.length > 0) {
@@ -1537,7 +1572,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             if (!it) return;
             document.getElementById("hero-bg").style.backgroundImage = `url('${it.logo}')`;
             document.getElementById("hero-title").textContent = it.name;
-            document.getElementById("hero-meta").textContent = `${it.group} • Destaque 5s`;
             document.getElementById("btn-hero-play").onclick = () => {
                 if (it.type === 'movies') openTmdbDetails(it);
                 else if (it.type === 'series') openSeriesDetails(it);
@@ -1802,6 +1836,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
         // LISTA LATERAL DE TV E DRAWER DE CATEGORIAS
         function openTvChannelList(catName) {
+            if (document.getElementById("player-modal").classList.contains("active")) {
+                document.getElementById("player-modal").classList.add("tv-list-open");
+            }
             const listEl = document.getElementById("drawer-list");
             listEl.innerHTML = "";
             document.getElementById("drawer-title").textContent = catName;
@@ -1812,7 +1849,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             btnBack.onclick = () => openCategoriesDrawer("tv");
             listEl.appendChild(btnBack);
 
-            const filtered = catalog.tv.filter(it => it.group === catName);
+            const filtered = catalog.tv.filter(it => catName === "Todas" || it.group === catName);
             filtered.forEach(it => {
                 const b = document.createElement("button");
                 b.className = "drawer-item";
@@ -1849,6 +1886,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             bAll.innerHTML = `<span>Todas as Categorias</span>`;
             bAll.onclick = () => {
                 selectCategory("Todas");
+                if (activeTab === "tv" && document.getElementById("player-modal").classList.contains("active")) {
+                    openTvChannelList("Todas");
+                    return;
+                }
                 if (activeTab === "tv") {
                     document.getElementById("view-home").classList.add("hidden");
                     document.getElementById("view-catalog").classList.add("hidden");
@@ -1894,6 +1935,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         function closeDrawer() {
             document.getElementById("drawer-backdrop").classList.remove("active");
             document.getElementById("drawer-panel").classList.remove("active");
+            document.getElementById("player-modal").classList.remove("tv-list-open");
         }
         document.getElementById("btn-open-drawer").onclick = () => openCategoriesDrawer();
         document.getElementById("btn-close-drawer").onclick = closeDrawer;
@@ -2052,6 +2094,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             currentActiveEngine = forceEngine;
 
             document.getElementById("player-modal").classList.add("active");
+            document.getElementById("player-modal").classList.remove("tv-list-open");
+            document.body.classList.add("player-open");
             document.getElementById("player-title").textContent = it.name;
             document.getElementById("center-play-overlay").classList.add("hidden");
 
@@ -2061,21 +2105,24 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
             // Botões de Retorno ao Catálogo/Lista no Topo do Player
             if (it.type === "tv") {
-                document.getElementById("btn-player-tv-list").classList.remove("hidden");
+                document.getElementById("dock-btn-tv-list").classList.remove("hidden");
                 document.getElementById("btn-player-vod-list").classList.add("hidden");
-                document.getElementById("btn-player-tv-list").onclick = (e) => {
+                document.getElementById("dock-btn-tv-list").onclick = (e) => {
                     e.stopPropagation();
-                    openTvChannelList(it.group);
+                    openTvChannelList(currentPlayingItem ? currentPlayingItem.group : it.group);
+                    document.getElementById("player-modal").classList.add("tv-list-open");
                     document.getElementById("drawer-backdrop").classList.add("active");
                     document.getElementById("drawer-panel").classList.add("active");
+                    resetDockTimer();
                 };
             } else {
-                document.getElementById("btn-player-tv-list").classList.add("hidden");
+                document.getElementById("dock-btn-tv-list").classList.add("hidden");
                 document.getElementById("btn-player-vod-list").classList.remove("hidden");
                 document.getElementById("btn-player-vod-list").onclick = (e) => {
                     e.stopPropagation();
                     stopPlayerEngines();
-                    document.getElementById("player-modal").classList.remove("active");
+                    document.getElementById("player-modal").classList.remove("active", "tv-list-open");
+                    document.body.classList.remove("player-open");
                     document.querySelector(`.bottom-nav .bnav-item[data-tab="${it.type}"]`).click();
                     selectCategory(it.group);
                 };
@@ -2216,7 +2263,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 const decodedTitle = decodeEpgString(rawTitle);
                 
                 document.getElementById("epg-now").textContent = `Agora: ${decodedTitle}`;
-                document.getElementById("epg-time").textContent = prog.start ? `${prog.start} - ${prog.end}` : "Ao Vivo";
+                const onlyClock = (value) => {
+                    if (!value) return "";
+                    const match = String(value).match(/(?:T|\s)(\d{2}:\d{2})(?::\d{2})?/);
+                    return match ? match[1] : (String(value).match(/\b\d{2}:\d{2}\b/) || [""])[0];
+                };
+                const startClock = onlyClock(prog.start);
+                const endClock = onlyClock(prog.end);
+                document.getElementById("epg-time").textContent = startClock && endClock ? `${startClock} - ${endClock}` : "Ao Vivo";
             } catch (e) {
                 document.getElementById("epg-now").textContent = `Agora: ${it.name}`;
             }
@@ -2238,7 +2292,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         document.getElementById("btn-player-back").onclick = (e) => {
             e.stopPropagation();
             stopPlayerEngines();
-            document.getElementById("player-modal").classList.remove("active");
+            document.getElementById("player-modal").classList.remove("active", "tv-list-open");
+            document.body.classList.remove("player-open");
         };
 
         // CONTROLES SLIM DO DOCK COM BOLHAS INVISÍVEIS DURANTE REPRODUÇÃO
@@ -2299,7 +2354,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
         document.getElementById("opt-aspect-fill").onclick = (e) => {
             e.stopPropagation();
-            vEl.className = "mode-fill-horizontal";
+            vEl.className = "mode-vertical-extend";
+            document.getElementById("opt-aspect-fill").classList.add("active");
+            document.getElementById("opt-aspect-fit").classList.remove("active");
             btnAspect.classList.add("active");
             closeAllBubbles();
             resetDockTimer();
@@ -2308,6 +2365,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         document.getElementById("opt-aspect-fit").onclick = (e) => {
             e.stopPropagation();
             vEl.className = "";
+            document.getElementById("opt-aspect-fit").classList.add("active");
+            document.getElementById("opt-aspect-fill").classList.remove("active");
             btnAspect.classList.remove("active");
             closeAllBubbles();
             resetDockTimer();
@@ -2393,6 +2452,18 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             document.getElementById("cfg-created").textContent = currentAuth.created_formatted || "Servidor Oficial";
             document.getElementById("cfg-plan").textContent = currentAuth.plan_type || "Plano IPTV";
             document.getElementById("cfg-screens").textContent = `${currentAuth.max_connections || '1'} tela(s)`;
+            const paymentLink = String(currentAuth.payment_link || "").trim();
+            const paymentButton = document.getElementById("btn-config-pay");
+            const paymentUnavailable = document.getElementById("cfg-payment-unavailable");
+            if (paymentLink && /^https?:\/\//i.test(paymentLink)) {
+                paymentButton.href = paymentLink;
+                paymentButton.classList.remove("hidden");
+                paymentUnavailable.classList.add("hidden");
+            } else {
+                paymentButton.removeAttribute("href");
+                paymentButton.classList.add("hidden");
+                paymentUnavailable.classList.remove("hidden");
+            }
         }
 
         document.getElementById("btn-save-pin").onclick = async () => {
@@ -2455,7 +2526,26 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
                 // Popula a mensagem formatada no bloco único
                 const shareText = tr.raw_message || ("Usuário: " + tr.username + "\nSenha: " + tr.password);
-                document.getElementById("tr-raw").textContent = shareText;
+                const trialBox = document.getElementById("tr-raw");
+                trialBox.replaceChildren();
+                const urlPattern = /(https?:\/\/[^\s<>"']+)/gi;
+                let cursor = 0;
+                let match;
+                while ((match = urlPattern.exec(shareText)) !== null) {
+                    trialBox.appendChild(document.createTextNode(shareText.slice(cursor, match.index)));
+                    const cleanUrl = match[0].replace(/[),.;!?]+$/, "");
+                    const link = document.createElement("a");
+                    link.href = cleanUrl;
+                    link.target = "_blank";
+                    link.rel = "noopener noreferrer";
+                    link.textContent = cleanUrl;
+                    trialBox.appendChild(link);
+                    if (cleanUrl.length < match[0].length) {
+                        trialBox.appendChild(document.createTextNode(match[0].slice(cleanUrl.length)));
+                    }
+                    cursor = match.index + match[0].length;
+                }
+                trialBox.appendChild(document.createTextNode(shareText.slice(cursor)));
 
                 document.getElementById("btn-copy-tr").onclick = () => {
                     navigator.clipboard.writeText(shareText);
