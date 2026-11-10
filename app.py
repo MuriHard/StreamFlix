@@ -4,6 +4,7 @@ import json
 import time
 import sqlite3
 import hashlib
+import secrets
 import ssl
 import urllib.request
 import urllib.parse
@@ -139,6 +140,7 @@ def init_dbs():
         last_heartbeat INTEGER,
         started_at TEXT
     )""")
+    migrate_table_columns(conn2, "active_monitoring", {"playback_state": "TEXT DEFAULT 'playing'", "playback_session": "TEXT"})
     conn2.commit()
     conn2.close()
 
@@ -343,36 +345,43 @@ def parse_trial_api_response(raw_text, cfg):
 @app.route("/api/monitor/heartbeat", methods=["POST"])
 def api_monitor_heartbeat():
     data = request.get_json(silent=True) or {}
-    mac = (data.get("mac") or "").strip().upper()
-    username = (data.get("username") or "Anônimo").strip()
-    title = (data.get("title") or "Nenhum").strip()
-    ctype = (data.get("type") or "tv").strip()
-    elapsed = int(data.get("elapsed") or 0)
-    is_playing = bool(data.get("playing", True))
-
-    forwarded = request.headers.get("X-Forwarded-For", "")
-    ip = (forwarded.split(",")[0].strip() if forwarded else request.remote_addr) or "0.0.0.0"
+    username = str(data.get("username") or "").strip()
+    token = str(data.get("token") or "")
+    if not username or not token or session.get("playback_token") != token or session.get("playback_user") != username:
+        return jsonify({"ok": False, "error": "Sessão inválida"}), 401
+    conn_user = get_main_db()
+    user = conn_user.execute("SELECT expires_at FROM active_users WHERE username = ?", (username,)).fetchone()
+    conn_user.close()
+    if not user or (user["expires_at"] and int(user["expires_at"]) <= int(time.time())):
+        return jsonify({"ok": False, "expired": True}), 403
+    mac = str(data.get("mac") or "").strip().upper()[:80]
+    title = str(data.get("title") or "").strip()[:250]
+    ctype = str(data.get("type") or "tv").strip()[:30]
+    playback_session = str(data.get("playback_session") or "")[:100]
+    if not playback_session or not re.fullmatch(r"[A-Za-z0-9_-]{8,100}", playback_session):
+        return jsonify({"ok": False}), 400
+    try:
+        elapsed = max(0, min(int(float(data.get("elapsed") or 0)), 8640000))
+    except (TypeError, ValueError, OverflowError):
+        elapsed = 0
+    state = str(data.get("state") or "playing")
+    playing = bool(data.get("playing", True))
+    session_id = hashlib.sha256(f"{username}|{token}|{playback_session}".encode()).hexdigest()
+    ip = request.remote_addr or "0.0.0.0"
     ua = request.headers.get("User-Agent", "")
-
-    record_device_entry(mac, ip, ua, username)
-
-    session_id = f"{mac}_{username}"
     now_ts = int(time.time())
-    now_str = datetime.now().strftime("%H:%M:%S")
-
     conn = get_devices_db()
-    if not is_playing:
+    if not playing or state in ("stopped", "ended"):
         conn.execute("DELETE FROM active_monitoring WHERE session_id = ?", (session_id,))
-    else:
-        location = resolve_ip_location(ip)
-        device_name = parse_user_agent(ua)
+    elif title:
+        old = conn.execute("SELECT started_at FROM active_monitoring WHERE session_id = ?", (session_id,)).fetchone()
         conn.execute("""INSERT OR REPLACE INTO active_monitoring
-            (session_id, username, mac, ip, location, device, content_title, content_type, elapsed_seconds, last_heartbeat, started_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT started_at FROM active_monitoring WHERE session_id = ?), ?))
-        """, (session_id, username, mac, ip, location, device_name, title, ctype, elapsed, now_ts, session_id, now_str))
+            (session_id, username, mac, ip, location, device, content_title, content_type, elapsed_seconds, last_heartbeat, started_at, playback_state, playback_session)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (session_id, username, mac, ip, resolve_ip_location(ip), parse_user_agent(ua), title, ctype,
+             elapsed, now_ts, old["started_at"] if old else datetime.now().strftime("%Y-%m-%d %H:%M:%S"), state, playback_session))
     conn.commit()
     conn.close()
-
     return jsonify({"ok": True})
 
 # ==========================================================
@@ -412,6 +421,11 @@ def api_login():
     existing = conn.execute("SELECT * FROM active_users WHERE username = ?", (username,)).fetchone()
     now_ts = int(time.time())
 
+    if existing and existing["password"] == password and existing["expires_at"] and int(existing["expires_at"]) <= now_ts:
+        link = existing["payment_link"] or cfg.get("default_payment_link", "")
+        conn.close()
+        return jsonify({"ok": False, "expired": True, "payment_link": link, "error": "Seu acesso venceu."}), 403
+
     chosen_dns = primary_dns
     expires_at = now_ts + (30 * 86400)
     max_conns = "1"
@@ -443,7 +457,7 @@ def api_login():
                             conn.close()
                             return jsonify({
                                 "ok": False, "expired": True,
-                                "payment_link": existing["payment_link"] if existing else payment_link,
+                                "payment_link": (existing["payment_link"] if existing and existing["payment_link"] else payment_link),
                                 "error": "Assinatura vencida! Redirecionando..."
                             }), 403
                     break
@@ -464,9 +478,12 @@ def api_login():
         plan_type = existing["plan_type"] or plan_type
         payment_link = existing["payment_link"] or payment_link
     conn.close()
+    session["playback_user"] = username
+    session["playback_token"] = secrets.token_urlsafe(32)
 
     return jsonify({
         "ok": True,
+        "monitor_token": session["playback_token"],
         "username": username,
         "password": password,
         "dns": chosen_dns,
@@ -548,13 +565,17 @@ def api_request_trial():
     conn1.commit()
     conn1.close()
 
+    session["playback_user"] = parsed["username"]
+    session["playback_token"] = secrets.token_urlsafe(32)
+    parsed["monitor_token"] = session["playback_token"]
     return jsonify({"ok": True, "trial": parsed})
 
 @app.route("/api/check-session", methods=["POST"])
 def api_check_session():
     data = request.get_json(silent=True) or {}
     username = (data.get("username") or "").strip()
-    if not username: return jsonify({"valid": False})
+    if not username or session.get("playback_user") != username or data.get("token") != session.get("playback_token"):
+        return jsonify({"valid": False, "reauth": True})
     conn = get_main_db()
     row = conn.execute("SELECT * FROM active_users WHERE username = ?", (username,)).fetchone()
     conn.close()
@@ -562,14 +583,14 @@ def api_check_session():
         exp_ts = int(row["expires_at"] or 0)
         now_ts = int(time.time())
         if exp_ts > 0 and now_ts >= exp_ts:
-            return jsonify({"valid": False, "expired": True, "payment_link": row["payment_link"]})
+            return jsonify({"valid": False, "expired": True, "payment_link": row["payment_link"] or get_settings().get("default_payment_link", "")})
         return jsonify({
             "valid": True, "expired": False, "expires_at": exp_ts,
             "remaining_seconds": max(0, exp_ts - now_ts) if exp_ts > 0 else 999999,
             "plan_type": row["plan_type"],
             "payment_link": row["payment_link"]
         })
-    return jsonify({"valid": True, "expired": False, "remaining_seconds": 86400})
+    return jsonify({"valid": False, "reauth": True})
 
 # --- GESTÃO ADMIN COM PURGE TOTAL DE REGISTROS ---
 @app.route("/api/admin/login", methods=["POST"])
@@ -588,7 +609,7 @@ def api_admin_data():
     conn2 = get_devices_db()
     devices = [dict(r) for r in conn2.execute("SELECT * FROM devices ORDER BY id DESC LIMIT 200").fetchall()]
     now_ts = int(time.time())
-    active_rows = conn2.execute("SELECT * FROM active_monitoring WHERE last_heartbeat >= ? ORDER BY last_heartbeat DESC", (now_ts - 25,)).fetchall()
+    active_rows = conn2.execute("SELECT * FROM active_monitoring WHERE last_heartbeat >= ? ORDER BY last_heartbeat DESC", (now_ts - 45,)).fetchall()
     active_monitoring = []
     for r in active_rows:
         d = dict(r)
@@ -597,6 +618,8 @@ def api_admin_data():
         h, m = divmod(m, 60)
         d["elapsed_formatted"] = f"{h:02d}:{m:02d}:{s:02d}"
         active_monitoring.append(d)
+    conn2.execute("DELETE FROM active_monitoring WHERE last_heartbeat < ?", (now_ts - 3600,))
+    conn2.commit()
     conn2.close()
     return jsonify({"ok": True, "settings": cfg, "devices": devices, "monitoring": active_monitoring})
 
@@ -788,7 +811,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
         .content-wrap { max-width:1180px; margin:0 auto; padding:0.9rem; }
         .hero-box { position:relative; border-radius:var(--radius-lg); overflow:hidden; height:clamp(220px, 42vh, 340px); min-height:210px; background:#07070c; border:1px solid var(--border); margin-bottom:1.4rem; }
-        .hero-bg { position:absolute; inset:0; background-size:cover; background-position:center; transition:background-image 0.4s ease; }
+        .hero-bg { position:absolute; inset:0; background-size:contain; background-repeat:no-repeat; background-position:center; transition:background-image 0.4s ease; }
         .hero-overlay { position:absolute; inset:0; background:linear-gradient(0deg, #000 10%, rgba(0,0,0,0.48) 48%, rgba(0,0,0,0.08) 100%); display:flex; flex-direction:column; justify-content:flex-end; align-items:flex-start; padding:clamp(0.75rem, 3vw, 1.25rem); gap:0.45rem; }
         .hero-title { font-size:clamp(1rem, 4vw, 1.35rem); line-height:1.15; font-weight:900; margin:0; max-width:100%; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
         #btn-hero-play { width:50%; min-height:34px; padding:0.35rem 0.65rem; font-size:0.72rem; margin-top:0.2rem; }
@@ -802,7 +825,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .poster-card { position:relative; flex:0 0 134px; background:var(--bg-surface); border:1px solid var(--border); border-radius:14px; overflow:hidden; cursor:pointer; transition:transform 0.15s, border-color 0.15s; }
         .poster-card:active { transform:scale(0.96); border-color:var(--primary); }
         .poster-aspect { position:relative; width:100%; aspect-ratio:2 / 3; background:#050509; overflow:hidden; }
-        .poster-aspect img { width:100%; height:100%; object-fit:cover; display:block; }
+        .poster-aspect img { width:100%; height:100%; object-fit:contain; display:block; }
         .poster-badge { position:absolute; top:6px; left:6px; background:rgba(229,9,20,0.92); color:#fff; font-size:0.56rem; font-weight:800; padding:2px 6px; border-radius:var(--radius-pill); text-transform:uppercase; }
         .poster-info { padding:0.5rem; }
         .poster-info h4 { font-size:0.76rem; font-weight:700; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
@@ -835,7 +858,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .series-modal { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.92); backdrop-filter:blur(10px); z-index:450; align-items:center; justify-content:center; padding:1rem; }
         .series-modal.active { display:flex; animation:fadeIn 0.2s ease forwards; }
         .series-box { background:var(--bg-surface); border:1px solid var(--border); border-radius:var(--radius-lg); width:100%; max-width:540px; max-height:92vh; overflow-y:auto; position:relative; }
-        .series-hero { height:180px; background-size:cover; background-position:center; position:relative; }
+        .series-hero { height:clamp(180px, 42vh, 340px); background-size:contain; background-repeat:no-repeat; background-position:center; background-color:#050509; position:relative; }
         .series-hero-overlay { position:absolute; inset:0; background:linear-gradient(0deg, var(--bg-surface) 10%, transparent 100%); }
         .series-content { padding:1.2rem; }
         .seasons-bar { display:flex; gap:0.4rem; overflow-x:auto; padding-bottom:0.5rem; margin:0.8rem 0; scrollbar-width:none; }
@@ -890,6 +913,19 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .player-modal.tv-list-open #video-player { width:100%; height:100%; object-fit:contain; }
         .player-modal.tv-list-open .player-top-slim,
         .player-modal.tv-list-open .player-dock-wrap { display:none !important; }
+        .player-modal.tv-list-open .video-stage { cursor:pointer; }
+        .player-modal.tv-list-open .video-stage::after { content:"Toque para expandir"; position:absolute; bottom:6px; right:8px; background:#0009; padding:3px 7px; border-radius:6px; font-size:11px; pointer-events:none; }
+        .tv-split-layout { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:10px; align-items:start; }
+        .tv-split-layout .tv-channel-item { padding:6px; gap:5px; }
+        .tv-split-layout .tv-channel-logo { width:28px; height:28px; }
+        .tv-split-layout .tv-channel-info h4 { font-size:0.7rem; }
+        .tv-preview { position:sticky; top:68px; aspect-ratio:16/9; background:#08080e; border:1px solid var(--border); border-radius:10px; overflow:hidden; display:flex; align-items:center; justify-content:center; }
+        .tv-preview video { width:100%; height:100%; object-fit:contain; }
+        .tv-preview-placeholder { position:absolute; color:#94a3b8; font-size:0.7rem; text-align:center; pointer-events:none; padding:8px; }
+        .player-modal.tv-list-open .video-stage { width:48%; height:auto; aspect-ratio:16/9; min-height:0; top:50%; }
+        body.player-open .drawer-panel { width:50vw; max-width:50vw; }
+        .drawer-panel { z-index:680; }
+        .player-modal.tv-list-open .video-stage { z-index:670; }
         .player-modal.tv-list-open .epg-bar { display:none !important; }
         body.player-open .drawer-backdrop.active { background:transparent; pointer-events:none; }
         body.player-open .drawer-panel { width:min(52vw, 270px); max-width:52vw; }
@@ -1167,6 +1203,16 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         </div>
     </div>
 
+    <div id="expired-modal" class="modal-sheet" style="z-index:1000;">
+      <div class="modal-box" style="border-color:var(--gold); text-align:center;">
+        <h2 style="font-size:1.4rem; margin-bottom:0.7rem;">Seu acesso venceu.</h2>
+        <p style="color:var(--text-muted); margin-bottom:1.2rem;">Renove seu acesso para continuar assistindo.</p>
+        <a id="btn-renew-access" class="btn-pill btn-pill-primary" target="_blank" rel="noopener noreferrer" style="width:100%;">Liberar acesso</a>
+        <p id="renew-unavailable" class="hidden" style="margin-top:0.7rem;color:var(--gold);font-size:0.8rem;">Link de pagamento indisponível. Entre em contato com o suporte.</p>
+        <button id="btn-expired-logout" class="btn-pill btn-pill-outline" style="width:100%;margin-top:0.8rem;">Voltar ao login</button>
+      </div>
+    </div>
+
     <!-- 3. TOPBAR GERAL -->
     <header class="navbar hidden" id="main-navbar">
         <div class="nav-left">
@@ -1232,7 +1278,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 <span id="tv-selected-label">Categoria: Todas</span>
                 <span id="tv-total-label">0 canais</span>
             </div>
-            <div class="tv-channel-list" id="tv-list"></div>
+            <div class="tv-split-layout"><div class="tv-channel-list" id="tv-list"></div><div class="tv-preview" id="tv-preview"><video id="tv-preview-video" playsinline muted autoplay></video><span class="tv-preview-placeholder" id="tv-preview-placeholder">Selecione um canal para visualizar</span></div></div>
         </div>
 
         <!-- TELA CONFIGURAÇÕES -->
@@ -1389,7 +1435,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 <button class="mini-btn" id="dock-btn-ff" title="Avançar 10s">⏩</button>
                 <button class="mini-btn" id="dock-btn-speed" title="Velocidade">1.0x</button>
                 <button class="mini-btn" id="dock-btn-aspect" title="Ajuste de Tela">📐</button>
-                <button class="mini-btn hidden" id="dock-btn-tv-list" title="Lista de canais">☷</button>
+                <button class="mini-btn" id="dock-btn-tv-list" title="Abrir categorias">☷</button>
                 <button class="mini-btn" id="dock-btn-engine" title="Decodificador">⚙️</button>
             </div>
         </div>
@@ -1487,6 +1533,38 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         let playSecondsCounter = 0;
         let currentActiveEngine = "auto";
         let dockTimeout = null;
+        let playbackSessionId = null;
+        let playbackStartedAt = 0;
+        let previewHls = null;
+        let sessionCheckInterval = null;
+        const makePlaybackId = () => (crypto.randomUUID ? crypto.randomUUID().replace(/-/g, "") : Math.random().toString(36).slice(2) + Date.now().toString(36));
+        function showExpired(link) {
+            if (currentPlayingItem) stopPlayerEngines();
+            document.getElementById("player-modal").classList.remove("active", "tv-list-open");
+            closeDrawer();
+            const url = String(link || currentAuth?.payment_link || serverConfig.default_payment_link || "").trim();
+            const valid = /^https?:\/\/[^\s]+$/i.test(url);
+            const btn = document.getElementById("btn-renew-access");
+            if (valid) { btn.href = url; btn.classList.remove("hidden"); }
+            else { btn.removeAttribute("href"); btn.classList.add("hidden"); }
+            document.getElementById("renew-unavailable").classList.toggle("hidden", valid);
+            document.getElementById("expired-modal").classList.add("active");
+        }
+        document.getElementById("btn-expired-logout").onclick = () => { localStorage.removeItem("sf_session"); location.reload(); };
+        async function checkActiveSession() {
+            if (!currentAuth?.username || !currentAuth?.monitor_token) return;
+            try {
+                const r = await fetch("/api/check-session", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({username:currentAuth.username, token:currentAuth.monitor_token})});
+                const d = await r.json();
+                if (d.expired) showExpired(d.payment_link);
+                else if (!d.valid && d.reauth) { localStorage.removeItem("sf_session"); location.reload(); }
+            } catch(e) {}
+        }
+        function startSessionChecks() {
+            if (sessionCheckInterval) clearInterval(sessionCheckInterval);
+            checkActiveSession();
+            sessionCheckInterval = setInterval(checkActiveSession, 15000);
+        }
 
         const ADULT_REGEX = /\b(adult[os]?|\+18|xxx|porn[oa]?|erotic[oa]?|sexy|playboy|venus|for adults)\b/i;
 
@@ -1842,6 +1920,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             const listEl = document.getElementById("drawer-list");
             listEl.innerHTML = "";
             document.getElementById("drawer-title").textContent = catName;
+            document.getElementById("drawer-backdrop").classList.add("active");
+            document.getElementById("drawer-panel").classList.add("active");
 
             const btnBack = document.createElement("button");
             btnBack.className = "drawer-item";
@@ -1850,7 +1930,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             listEl.appendChild(btnBack);
 
             const filtered = catalog.tv.filter(it => catName === "Todas" || it.group === catName);
-            filtered.forEach(it => {
+            filtered.filter(it => catName !== "Todas" || !isAdultItem(it)).forEach(it => {
                 const b = document.createElement("button");
                 b.className = "drawer-item";
                 b.style.padding = "0.45rem 0.75rem";
@@ -1865,14 +1945,22 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     </div>
                 `;
                 b.onclick = () => {
-                    closeDrawer();
-                    openItemPlay(it);
+                    if (currentPlayingItem && currentPlayingItem.id === it.id && currentPlayingItem.type === it.type) {
+                        closeDrawer();
+                    } else {
+                        openItemPlay(it, "auto", true);
+                    }
                 };
                 listEl.appendChild(b);
             });
         }
 
         function openCategoriesDrawer(forceTab = null) {
+            if (document.getElementById("player-modal").classList.contains("active")) {
+                document.getElementById("player-modal").classList.add("tv-list-open");
+                document.getElementById("drawer-backdrop").classList.add("active");
+                document.getElementById("drawer-panel").classList.add("active");
+            }
             if (forceTab) activeTab = forceTab;
             const list = document.getElementById("drawer-list");
             list.innerHTML = "";
@@ -1935,11 +2023,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         function closeDrawer() {
             document.getElementById("drawer-backdrop").classList.remove("active");
             document.getElementById("drawer-panel").classList.remove("active");
-            document.getElementById("player-modal").classList.remove("tv-list-open");
+            document.getElementById("player-modal").classList.toggle("tv-list-open", keepDrawer);
         }
         document.getElementById("btn-open-drawer").onclick = () => openCategoriesDrawer();
         document.getElementById("btn-close-drawer").onclick = closeDrawer;
         document.getElementById("drawer-backdrop").onclick = closeDrawer;
+        document.getElementById("video-stage").addEventListener("click", () => {
+            if (document.getElementById("player-modal").classList.contains("tv-list-open")) closeDrawer();
+        }, true);
 
         function selectCategory(catName) {
             activeCategory = catName;
@@ -2005,7 +2096,18 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                         <span>${it.group}</span>
                     </div>
                 `;
-                div.onclick = () => openItemPlay(it);
+                div.onclick = () => {
+                    document.getElementById("tv-preview-placeholder").textContent = it.name;
+                    openItemPlay(it);
+                };
+                div.addEventListener("mouseenter", () => {
+                    const prev = document.getElementById("tv-preview");
+                    prev.style.backgroundImage = it.logo ? `url("${encodeURI(it.logo).replace(/"/g, '%22')}")` : "none";
+                    prev.style.backgroundSize = "contain";
+                    prev.style.backgroundPosition = "center";
+                    prev.style.backgroundRepeat = "no-repeat";
+                    document.getElementById("tv-preview-placeholder").textContent = it.name;
+                });
                 listEl.appendChild(div);
             });
         }
@@ -2071,25 +2173,39 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             resetDockTimer();
         });
 
-        function sendMonitorHeartbeat(isPlaying) {
-            if (!currentPlayingItem) return;
-            const mac = getOrCreateMac();
+        function sendMonitorHeartbeat(isPlaying, item = currentPlayingItem, sid = playbackSessionId) {
+            if (!item || !currentAuth?.monitor_token || !sid) return;
+            const state = !isPlaying ? "stopped" : (vEl.paused ? "paused" : (vEl.readyState < 2 ? "buffering" : "playing"));
+            const elapsed = item.type === "tv" ? Math.floor((Date.now() - playbackStartedAt)/1000) : Math.floor(vEl.currentTime || 0);
             fetch("/api/monitor/heartbeat", {
-                method: "POST",
-                headers: {"Content-Type": "application/json"},
-                body: JSON.stringify({
-                    mac: mac,
-                    username: currentAuth ? currentAuth.username : "Anônimo",
-                    title: currentPlayingItem.name,
-                    type: currentPlayingItem.type,
-                    elapsed: playSecondsCounter,
-                    playing: isPlaying
-                })
-            }).catch(()=>{});
+                method:"POST", credentials:"same-origin", headers:{"Content-Type":"application/json"},
+                body:JSON.stringify({token:currentAuth.monitor_token, playback_session:sid, mac:getOrCreateMac(), username:currentAuth.username,
+                    title:item.name, type:item.type, elapsed, state, playing:isPlaying})
+            }).then(async r => { if (r.status === 403) { const d = await r.json(); if (d.expired) showExpired(currentAuth.payment_link); } }).catch(()=>{});
         }
+        function startMonitorLoop() {
+            if (monitorInterval) clearInterval(monitorInterval);
+            sendMonitorHeartbeat(true);
+            monitorInterval = setInterval(() => {
+                if (currentPlayingItem && document.getElementById("player-modal").classList.contains("active")) sendMonitorHeartbeat(true);
+            }, 10000);
+        }
+        ["playing", "pause", "waiting", "stalled", "seeking", "seeked", "ended"].forEach(ev => vEl.addEventListener(ev, () => {
+            if (ev === "ended") sendMonitorHeartbeat(false);
+            else if (currentPlayingItem) sendMonitorHeartbeat(true);
+        }));
+        document.addEventListener("visibilitychange", () => { if (currentPlayingItem) sendMonitorHeartbeat(true); });
+        window.addEventListener("pagehide", () => {
+            if (currentPlayingItem && currentAuth?.monitor_token && playbackSessionId) {
+                navigator.sendBeacon?.("/api/monitor/heartbeat", new Blob([JSON.stringify({token:currentAuth.monitor_token, playback_session:playbackSessionId, username:currentAuth.username, playing:false})], {type:"application/json"}));
+            }
+        });
 
-        function openItemPlay(it, forceEngine = "auto") {
+        function openItemPlay(it, forceEngine = "auto", keepDrawer = false) {
+            if (currentPlayingItem) stopPlayerEngines();
             currentPlayingItem = it;
+            playbackSessionId = makePlaybackId();
+            playbackStartedAt = Date.now();
             playSecondsCounter = 0;
             currentActiveEngine = forceEngine;
 
@@ -2099,7 +2215,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             document.getElementById("player-title").textContent = it.name;
             document.getElementById("center-play-overlay").classList.add("hidden");
 
-            stopPlayerEngines();
             vEl.className = "";
             closeAllBubbles();
 
@@ -2116,7 +2231,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     resetDockTimer();
                 };
             } else {
-                document.getElementById("dock-btn-tv-list").classList.add("hidden");
+                document.getElementById("dock-btn-tv-list").classList.remove("hidden");
                 document.getElementById("btn-player-vod-list").classList.remove("hidden");
                 document.getElementById("btn-player-vod-list").onclick = (e) => {
                     e.stopPropagation();
@@ -2128,7 +2243,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 };
             }
 
-            resetDockTimer();
+            if (keepDrawer) {
+                document.getElementById("drawer-panel").classList.add("active");
+                document.getElementById("drawer-backdrop").classList.add("active");
+                document.getElementById("player-dock-wrap").classList.remove("visible");
+                document.getElementById("player-top-slim").classList.remove("visible");
+            } else { closeDrawer(); resetDockTimer(); }
+            startMonitorLoop();
 
             const seekWrap = document.getElementById("vod-seek-wrap");
             if (it.type === "tv") {
@@ -2205,8 +2326,15 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             startNativePlay(url);
         }
 
+        function cleanupVideoEngine() {
+            if (hlsInstance) { try { hlsInstance.destroy(); } catch(e) {} hlsInstance = null; }
+            if (mpegtsInstance) { try { mpegtsInstance.destroy(); } catch(e) {} mpegtsInstance = null; }
+            vEl.pause();
+            vEl.removeAttribute("src");
+            vEl.load();
+        }
         function startMpegTsOrNative(url) {
-            stopPlayerEngines();
+            cleanupVideoEngine();
             if (typeof mpegts !== "undefined" && mpegts.isSupported()) {
                 try {
                     mpegtsInstance = mpegts.createPlayer({
@@ -2234,7 +2362,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         }
 
         function startNativePlay(url) {
-            stopPlayerEngines();
+            cleanupVideoEngine();
             vEl.src = url;
             vEl.load();
             vEl.play().catch(() => {
@@ -2282,6 +2410,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 monitorInterval = null;
             }
             sendMonitorHeartbeat(false);
+            playbackSessionId = null;
             if (hlsInstance) { try { hlsInstance.destroy(); } catch (e) {} hlsInstance = null; }
             if (mpegtsInstance) { try { mpegtsInstance.destroy(); } catch (e) {} mpegtsInstance = null; }
             vEl.pause();
@@ -2392,6 +2521,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             };
         });
 
+        document.getElementById("dock-btn-tv-list").addEventListener("click", (e) => {
+            if (currentPlayingItem?.type !== "tv") {
+                e.stopPropagation();
+                openCategoriesDrawer(currentPlayingItem?.type === "series" ? "series" : "movies");
+            }
+        });
+
         // NAVEGAÇÃO BOTTOM BAR E CATEGORIAS GERAIS
         document.querySelectorAll(".bottom-nav .bnav-item").forEach(btn => {
             btn.onclick = () => {
@@ -2489,7 +2625,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             const mac = getOrCreateMac();
             const r = await fetch("/api/login", { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({ username: u, password: p, mac: mac }) });
             const d = await r.json();
-            if (!d.ok) return alert(d.error || "Erro ao entrar.");
+            if (!d.ok) {
+                if (d.expired) { currentAuth = {username:u, payment_link:d.payment_link}; showExpired(d.payment_link); return; }
+                return alert(d.error || "Erro ao entrar.");
+            }
             currentAuth = d;
             localStorage.setItem("sf_session", JSON.stringify(d));
             enterApp();
@@ -2572,6 +2711,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             document.getElementById("main-navbar").classList.remove("hidden");
             document.getElementById("main-content").classList.remove("hidden");
             document.getElementById("bottom-nav").classList.add("active");
+            startSessionChecks();
             fetchXtreamData();
         }
 
@@ -2612,7 +2752,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 const d = await res.json();
                 if (!d.ok) return;
 
-                document.getElementById("adm-dns").value = d.settings.dns_list || "";
+                if (!document.getElementById("adm-dns").matches(":focus")) document.getElementById("adm-dns").value = d.settings.dns_list || "";
                 document.getElementById("adm-trial-api").value = d.settings.trial_api_url || "";
                 document.getElementById("adm-pay-link").value = d.settings.default_payment_link || "";
                 document.getElementById("adm-wa-link").value = d.settings.support_whatsapp || "";
@@ -2674,7 +2814,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         };
 
         if (currentAuth && currentAuth.username && window.location.pathname !== "/admin") {
-            enterApp();
+            if (currentAuth.expires_at && Date.now() >= Number(currentAuth.expires_at)*1000) showExpired(currentAuth.payment_link);
+            else if (currentAuth.monitor_token) enterApp();
+            else { localStorage.removeItem("sf_session"); currentAuth = null; }
         }
     </script>
 </body>
