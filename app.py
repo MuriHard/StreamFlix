@@ -4,7 +4,6 @@ import json
 import time
 import sqlite3
 import hashlib
-import secrets
 import ssl
 import urllib.request
 import urllib.parse
@@ -140,7 +139,6 @@ def init_dbs():
         last_heartbeat INTEGER,
         started_at TEXT
     )""")
-    migrate_table_columns(conn2, "active_monitoring", {"playback_state": "TEXT DEFAULT 'playing'", "playback_session": "TEXT"})
     conn2.commit()
     conn2.close()
 
@@ -345,43 +343,36 @@ def parse_trial_api_response(raw_text, cfg):
 @app.route("/api/monitor/heartbeat", methods=["POST"])
 def api_monitor_heartbeat():
     data = request.get_json(silent=True) or {}
-    username = str(data.get("username") or "").strip()
-    token = str(data.get("token") or "")
-    if not username or not token or session.get("playback_token") != token or session.get("playback_user") != username:
-        return jsonify({"ok": False, "error": "Sessão inválida"}), 401
-    conn_user = get_main_db()
-    user = conn_user.execute("SELECT expires_at FROM active_users WHERE username = ?", (username,)).fetchone()
-    conn_user.close()
-    if not user or (user["expires_at"] and int(user["expires_at"]) <= int(time.time())):
-        return jsonify({"ok": False, "expired": True}), 403
-    mac = str(data.get("mac") or "").strip().upper()[:80]
-    title = str(data.get("title") or "").strip()[:250]
-    ctype = str(data.get("type") or "tv").strip()[:30]
-    playback_session = str(data.get("playback_session") or "")[:100]
-    if not playback_session or not re.fullmatch(r"[A-Za-z0-9_-]{8,100}", playback_session):
-        return jsonify({"ok": False}), 400
-    try:
-        elapsed = max(0, min(int(float(data.get("elapsed") or 0)), 8640000))
-    except (TypeError, ValueError, OverflowError):
-        elapsed = 0
-    state = str(data.get("state") or "playing")
-    playing = bool(data.get("playing", True))
-    session_id = hashlib.sha256(f"{username}|{token}|{playback_session}".encode()).hexdigest()
-    ip = request.remote_addr or "0.0.0.0"
+    mac = (data.get("mac") or "").strip().upper()
+    username = (data.get("username") or "Anônimo").strip()
+    title = (data.get("title") or "Nenhum").strip()
+    ctype = (data.get("type") or "tv").strip()
+    elapsed = int(data.get("elapsed") or 0)
+    is_playing = bool(data.get("playing", True))
+
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    ip = (forwarded.split(",")[0].strip() if forwarded else request.remote_addr) or "0.0.0.0"
     ua = request.headers.get("User-Agent", "")
+
+    record_device_entry(mac, ip, ua, username)
+
+    session_id = f"{mac}_{username}"
     now_ts = int(time.time())
+    now_str = datetime.now().strftime("%H:%M:%S")
+
     conn = get_devices_db()
-    if not playing or state in ("stopped", "ended"):
+    if not is_playing:
         conn.execute("DELETE FROM active_monitoring WHERE session_id = ?", (session_id,))
-    elif title:
-        old = conn.execute("SELECT started_at FROM active_monitoring WHERE session_id = ?", (session_id,)).fetchone()
+    else:
+        location = resolve_ip_location(ip)
+        device_name = parse_user_agent(ua)
         conn.execute("""INSERT OR REPLACE INTO active_monitoring
-            (session_id, username, mac, ip, location, device, content_title, content_type, elapsed_seconds, last_heartbeat, started_at, playback_state, playback_session)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (session_id, username, mac, ip, resolve_ip_location(ip), parse_user_agent(ua), title, ctype,
-             elapsed, now_ts, old["started_at"] if old else datetime.now().strftime("%Y-%m-%d %H:%M:%S"), state, playback_session))
+            (session_id, username, mac, ip, location, device, content_title, content_type, elapsed_seconds, last_heartbeat, started_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT started_at FROM active_monitoring WHERE session_id = ?), ?))
+        """, (session_id, username, mac, ip, location, device_name, title, ctype, elapsed, now_ts, session_id, now_str))
     conn.commit()
     conn.close()
+
     return jsonify({"ok": True})
 
 # ==========================================================
@@ -421,11 +412,6 @@ def api_login():
     existing = conn.execute("SELECT * FROM active_users WHERE username = ?", (username,)).fetchone()
     now_ts = int(time.time())
 
-    if existing and existing["password"] == password and existing["expires_at"] and int(existing["expires_at"]) <= now_ts:
-        link = existing["payment_link"] or cfg.get("default_payment_link", "")
-        conn.close()
-        return jsonify({"ok": False, "expired": True, "payment_link": link, "error": "Seu acesso venceu."}), 403
-
     chosen_dns = primary_dns
     expires_at = now_ts + (30 * 86400)
     max_conns = "1"
@@ -457,7 +443,7 @@ def api_login():
                             conn.close()
                             return jsonify({
                                 "ok": False, "expired": True,
-                                "payment_link": (existing["payment_link"] if existing and existing["payment_link"] else payment_link),
+                                "payment_link": existing["payment_link"] if existing else payment_link,
                                 "error": "Assinatura vencida! Redirecionando..."
                             }), 403
                     break
@@ -478,12 +464,9 @@ def api_login():
         plan_type = existing["plan_type"] or plan_type
         payment_link = existing["payment_link"] or payment_link
     conn.close()
-    session["playback_user"] = username
-    session["playback_token"] = secrets.token_urlsafe(32)
 
     return jsonify({
         "ok": True,
-        "monitor_token": session["playback_token"],
         "username": username,
         "password": password,
         "dns": chosen_dns,
@@ -565,17 +548,13 @@ def api_request_trial():
     conn1.commit()
     conn1.close()
 
-    session["playback_user"] = parsed["username"]
-    session["playback_token"] = secrets.token_urlsafe(32)
-    parsed["monitor_token"] = session["playback_token"]
     return jsonify({"ok": True, "trial": parsed})
 
 @app.route("/api/check-session", methods=["POST"])
 def api_check_session():
     data = request.get_json(silent=True) or {}
     username = (data.get("username") or "").strip()
-    if not username or session.get("playback_user") != username or data.get("token") != session.get("playback_token"):
-        return jsonify({"valid": False, "reauth": True})
+    if not username: return jsonify({"valid": False})
     conn = get_main_db()
     row = conn.execute("SELECT * FROM active_users WHERE username = ?", (username,)).fetchone()
     conn.close()
@@ -583,14 +562,14 @@ def api_check_session():
         exp_ts = int(row["expires_at"] or 0)
         now_ts = int(time.time())
         if exp_ts > 0 and now_ts >= exp_ts:
-            return jsonify({"valid": False, "expired": True, "payment_link": row["payment_link"] or get_settings().get("default_payment_link", "")})
+            return jsonify({"valid": False, "expired": True, "payment_link": row["payment_link"]})
         return jsonify({
             "valid": True, "expired": False, "expires_at": exp_ts,
             "remaining_seconds": max(0, exp_ts - now_ts) if exp_ts > 0 else 999999,
             "plan_type": row["plan_type"],
             "payment_link": row["payment_link"]
         })
-    return jsonify({"valid": False, "reauth": True})
+    return jsonify({"valid": True, "expired": False, "remaining_seconds": 86400})
 
 # --- GESTÃO ADMIN COM PURGE TOTAL DE REGISTROS ---
 @app.route("/api/admin/login", methods=["POST"])
@@ -609,7 +588,7 @@ def api_admin_data():
     conn2 = get_devices_db()
     devices = [dict(r) for r in conn2.execute("SELECT * FROM devices ORDER BY id DESC LIMIT 200").fetchall()]
     now_ts = int(time.time())
-    active_rows = conn2.execute("SELECT * FROM active_monitoring WHERE last_heartbeat >= ? ORDER BY last_heartbeat DESC", (now_ts - 45,)).fetchall()
+    active_rows = conn2.execute("SELECT * FROM active_monitoring WHERE last_heartbeat >= ? ORDER BY last_heartbeat DESC", (now_ts - 25,)).fetchall()
     active_monitoring = []
     for r in active_rows:
         d = dict(r)
@@ -618,8 +597,6 @@ def api_admin_data():
         h, m = divmod(m, 60)
         d["elapsed_formatted"] = f"{h:02d}:{m:02d}:{s:02d}"
         active_monitoring.append(d)
-    conn2.execute("DELETE FROM active_monitoring WHERE last_heartbeat < ?", (now_ts - 3600,))
-    conn2.commit()
     conn2.close()
     return jsonify({"ok": True, "settings": cfg, "devices": devices, "monitoring": active_monitoring})
 
@@ -690,10 +667,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-    <title>StreamFlix Pro</title>
+    <title>StreamFlix Pro · Player Fix 2026-11-10</title>
     <script src="https://unpkg.com/lucide@latest"></script>
-    <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
-    <script src="https://cdn.jsdelivr.net/npm/mpegts.js@latest/dist/mpegts.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.20"></script>
+    <script src="https://cdn.jsdelivr.net/npm/mpegts.js@1.7.3/dist/mpegts.js"></script>
     <style>
         :root {
             --bg-base: #000000;
@@ -811,7 +788,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
         .content-wrap { max-width:1180px; margin:0 auto; padding:0.9rem; }
         .hero-box { position:relative; border-radius:var(--radius-lg); overflow:hidden; height:clamp(220px, 42vh, 340px); min-height:210px; background:#07070c; border:1px solid var(--border); margin-bottom:1.4rem; }
-        .hero-bg { position:absolute; inset:0; background-size:contain; background-repeat:no-repeat; background-position:center; transition:background-image 0.4s ease; }
+        .hero-bg { position:absolute; inset:0; background-size:cover; background-position:center; transition:background-image 0.4s ease; }
         .hero-overlay { position:absolute; inset:0; background:linear-gradient(0deg, #000 10%, rgba(0,0,0,0.48) 48%, rgba(0,0,0,0.08) 100%); display:flex; flex-direction:column; justify-content:flex-end; align-items:flex-start; padding:clamp(0.75rem, 3vw, 1.25rem); gap:0.45rem; }
         .hero-title { font-size:clamp(1rem, 4vw, 1.35rem); line-height:1.15; font-weight:900; margin:0; max-width:100%; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
         #btn-hero-play { width:50%; min-height:34px; padding:0.35rem 0.65rem; font-size:0.72rem; margin-top:0.2rem; }
@@ -825,7 +802,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .poster-card { position:relative; flex:0 0 134px; background:var(--bg-surface); border:1px solid var(--border); border-radius:14px; overflow:hidden; cursor:pointer; transition:transform 0.15s, border-color 0.15s; }
         .poster-card:active { transform:scale(0.96); border-color:var(--primary); }
         .poster-aspect { position:relative; width:100%; aspect-ratio:2 / 3; background:#050509; overflow:hidden; }
-        .poster-aspect img { width:100%; height:100%; object-fit:contain; display:block; }
+        .poster-aspect img { width:100%; height:100%; object-fit:cover; display:block; }
         .poster-badge { position:absolute; top:6px; left:6px; background:rgba(229,9,20,0.92); color:#fff; font-size:0.56rem; font-weight:800; padding:2px 6px; border-radius:var(--radius-pill); text-transform:uppercase; }
         .poster-info { padding:0.5rem; }
         .poster-info h4 { font-size:0.76rem; font-weight:700; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
@@ -858,7 +835,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .series-modal { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.92); backdrop-filter:blur(10px); z-index:450; align-items:center; justify-content:center; padding:1rem; }
         .series-modal.active { display:flex; animation:fadeIn 0.2s ease forwards; }
         .series-box { background:var(--bg-surface); border:1px solid var(--border); border-radius:var(--radius-lg); width:100%; max-width:540px; max-height:92vh; overflow-y:auto; position:relative; }
-        .series-hero { height:clamp(180px, 42vh, 340px); background-size:contain; background-repeat:no-repeat; background-position:center; background-color:#050509; position:relative; }
+        .series-hero { height:180px; background-size:cover; background-position:center; position:relative; }
         .series-hero-overlay { position:absolute; inset:0; background:linear-gradient(0deg, var(--bg-surface) 10%, transparent 100%); }
         .series-content { padding:1.2rem; }
         .seasons-bar { display:flex; gap:0.4rem; overflow-x:auto; padding-bottom:0.5rem; margin:0.8rem 0; scrollbar-width:none; }
@@ -872,7 +849,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         /* BOTTOM NAVIGATION BAR */
         .bottom-nav { position:fixed; bottom:0; left:0; right:0; height:66px; background:rgba(8,8,12,0.96); backdrop-filter:blur(16px); border-top:1px solid var(--border); display:none; align-items:center; justify-content:space-around; z-index:200; }
         .bottom-nav.active { display:flex; }
-        body.player-open .bottom-nav.active { display:flex; }
+        body.player-open .bottom-nav.active { display:none; }
+        body.player-open.player-list-mode .bottom-nav.active { display:flex; }
+        body.player-open.player-controls-visible:not(.player-list-mode) .bottom-nav.active { display:none; }
         .bnav-item { background:transparent; border:none; color:var(--text-muted); display:flex; flex-direction:column; align-items:center; justify-content:center; gap:0.2rem; font-size:0.68rem; font-weight:700; cursor:pointer; flex:1; height:100%; }
         .bnav-item.active { color:var(--primary); }
 
@@ -913,20 +892,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .player-modal.tv-list-open #video-player { width:100%; height:100%; object-fit:contain; }
         .player-modal.tv-list-open .player-top-slim,
         .player-modal.tv-list-open .player-dock-wrap { display:none !important; }
-        .player-modal.tv-list-open .video-stage { cursor:pointer; }
-        .player-modal.tv-list-open .video-stage::after { content:"Toque para expandir"; position:absolute; bottom:6px; right:8px; background:#0009; padding:3px 7px; border-radius:6px; font-size:11px; pointer-events:none; }
-        .tv-split-layout { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:10px; align-items:start; }
-        .tv-split-layout .tv-channel-item { padding:6px; gap:5px; }
-        .tv-split-layout .tv-channel-logo { width:28px; height:28px; }
-        .tv-split-layout .tv-channel-info h4 { font-size:0.7rem; }
-        .tv-preview { position:sticky; top:68px; aspect-ratio:16/9; background:#08080e; border:1px solid var(--border); border-radius:10px; overflow:hidden; display:flex; align-items:center; justify-content:center; }
-        .tv-preview video { width:100%; height:100%; object-fit:contain; }
-        .tv-preview-placeholder { position:absolute; color:#94a3b8; font-size:0.7rem; text-align:center; pointer-events:none; padding:8px; }
-        .player-modal.tv-list-open .video-stage { width:48%; height:auto; aspect-ratio:16/9; min-height:0; top:50%; }
-        body.player-open .drawer-panel { width:50vw; max-width:50vw; }
-        .drawer-panel { z-index:680; }
-        .player-modal.tv-list-open .video-stage { z-index:670; }
         .player-modal.tv-list-open .epg-bar { display:none !important; }
+        .player-modal.tv-list-open #playback-status { font-size:.65rem; padding:5px; }
+        .player-modal.tv-list-open #video-player { pointer-events:auto; }
+        .player-modal.tv-list-open .center-play-overlay { z-index:42; }
+        .player-modal.tv-list-open #playback-status { max-width:95%; }
+        body.player-open:not(.player-list-mode) .drawer-panel, body.player-open:not(.player-list-mode) .drawer-backdrop { display:none !important; }
         body.player-open .drawer-backdrop.active { background:transparent; pointer-events:none; }
         body.player-open .drawer-panel { width:min(52vw, 270px); max-width:52vw; }
         body.player-open .bottom-nav { z-index:710; }
@@ -936,6 +907,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             .drawer-panel { min-width:150px; }
         }
 
+        .playback-status { position:absolute; left:50%; top:50%; transform:translate(-50%,-50%); z-index:35; background:rgba(10,10,15,.88); border:1px solid rgba(255,255,255,.16); border-radius:14px; padding:12px 18px; color:#fff; font-size:.78rem; text-align:center; max-width:85%; pointer-events:none; }
         .center-play-overlay {
             position: absolute;
             inset: 0;
@@ -1203,16 +1175,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         </div>
     </div>
 
-    <div id="expired-modal" class="modal-sheet" style="z-index:1000;">
-      <div class="modal-box" style="border-color:var(--gold); text-align:center;">
-        <h2 style="font-size:1.4rem; margin-bottom:0.7rem;">Seu acesso venceu.</h2>
-        <p style="color:var(--text-muted); margin-bottom:1.2rem;">Renove seu acesso para continuar assistindo.</p>
-        <a id="btn-renew-access" class="btn-pill btn-pill-primary" target="_blank" rel="noopener noreferrer" style="width:100%;">Liberar acesso</a>
-        <p id="renew-unavailable" class="hidden" style="margin-top:0.7rem;color:var(--gold);font-size:0.8rem;">Link de pagamento indisponível. Entre em contato com o suporte.</p>
-        <button id="btn-expired-logout" class="btn-pill btn-pill-outline" style="width:100%;margin-top:0.8rem;">Voltar ao login</button>
-      </div>
-    </div>
-
     <!-- 3. TOPBAR GERAL -->
     <header class="navbar hidden" id="main-navbar">
         <div class="nav-left">
@@ -1278,7 +1240,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 <span id="tv-selected-label">Categoria: Todas</span>
                 <span id="tv-total-label">0 canais</span>
             </div>
-            <div class="tv-split-layout"><div class="tv-channel-list" id="tv-list"></div><div class="tv-preview" id="tv-preview"><video id="tv-preview-video" playsinline muted autoplay></video><span class="tv-preview-placeholder" id="tv-preview-placeholder">Selecione um canal para visualizar</span></div></div>
+            <div class="tv-channel-list" id="tv-list"></div>
         </div>
 
         <!-- TELA CONFIGURAÇÕES -->
@@ -1384,7 +1346,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         </div>
 
         <div class="video-stage" id="video-stage">
-            <video id="video-player" playsinline preload="auto"></video>
+            <video id="video-player" playsinline webkit-playsinline preload="metadata" controls></video>
+            <div id="playback-status" class="playback-status hidden" role="status" aria-live="polite"></div>
             <div class="center-play-overlay hidden" id="center-play-overlay">
                 <div class="center-play-circle">▶</div>
             </div>
@@ -1435,7 +1398,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 <button class="mini-btn" id="dock-btn-ff" title="Avançar 10s">⏩</button>
                 <button class="mini-btn" id="dock-btn-speed" title="Velocidade">1.0x</button>
                 <button class="mini-btn" id="dock-btn-aspect" title="Ajuste de Tela">📐</button>
-                <button class="mini-btn" id="dock-btn-tv-list" title="Abrir categorias">☷</button>
+                <button class="mini-btn hidden" id="dock-btn-tv-list" title="Lista de canais">☷</button>
                 <button class="mini-btn" id="dock-btn-engine" title="Decodificador">⚙️</button>
             </div>
         </div>
@@ -1533,40 +1496,24 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         let playSecondsCounter = 0;
         let currentActiveEngine = "auto";
         let dockTimeout = null;
-        let playbackSessionId = null;
-        let playbackStartedAt = 0;
-        let previewHls = null;
-        let sessionCheckInterval = null;
-        const makePlaybackId = () => (crypto.randomUUID ? crypto.randomUUID().replace(/-/g, "") : Math.random().toString(36).slice(2) + Date.now().toString(36));
-        function showExpired(link) {
-            if (currentPlayingItem) stopPlayerEngines();
-            document.getElementById("player-modal").classList.remove("active", "tv-list-open");
-            closeDrawer();
-            const url = String(link || currentAuth?.payment_link || serverConfig.default_payment_link || "").trim();
-            const valid = /^https?:\/\/[^\s]+$/i.test(url);
-            const btn = document.getElementById("btn-renew-access");
-            if (valid) { btn.href = url; btn.classList.remove("hidden"); }
-            else { btn.removeAttribute("href"); btn.classList.add("hidden"); }
-            document.getElementById("renew-unavailable").classList.toggle("hidden", valid);
-            document.getElementById("expired-modal").classList.add("active");
-        }
-        document.getElementById("btn-expired-logout").onclick = () => { localStorage.removeItem("sf_session"); location.reload(); };
-        async function checkActiveSession() {
-            if (!currentAuth?.username || !currentAuth?.monitor_token) return;
-            try {
-                const r = await fetch("/api/check-session", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({username:currentAuth.username, token:currentAuth.monitor_token})});
-                const d = await r.json();
-                if (d.expired) showExpired(d.payment_link);
-                else if (!d.valid && d.reauth) { localStorage.removeItem("sf_session"); location.reload(); }
-            } catch(e) {}
-        }
-        function startSessionChecks() {
-            if (sessionCheckInterval) clearInterval(sessionCheckInterval);
-            checkActiveSession();
-            sessionCheckInterval = setInterval(checkActiveSession, 15000);
-        }
+        let playbackWatchdog = null;
+        let playbackAttempt = 0;
+        let playbackCandidates = [];
+        let playbackCandidateIndex = 0;
+        let playbackToken = 0;
+        let playerTeardown = false;
+        let lastPlaybackFailure = "";
 
-        const ADULT_REGEX = /\b(adult[os]?|\+18|xxx|porn[oa]?|erotic[oa]?|sexy|playboy|venus|for adults)\b/i;
+        const ADULT_REGEX = /(?:18\s*\+|\+\s*18|\b18\s*anos\b|\badult[oa]s?\b|\bxxx\b|\bporn\w*\b|\berotic\w*\b|\bsexy\b|\bplayboy\b|\bvenus\b|\bfor adults\b)/i;
+        let adultUnlocked = false;
+        function isAdultCategory(name) { return ADULT_REGEX.test(String(name || "")); }
+        function requestAdultAccess() {
+            const pin = prompt("🔒 Pasta protegida: digite o PIN de 4 dígitos:");
+            if (pin === null) return false;
+            if (pin !== adultPin) { alert("PIN incorreto!"); return false; }
+            adultUnlocked = true;
+            return true;
+        }
 
         function isAdultItem(item) {
             const txt = ((item.name || "") + " " + (item.group || ""));
@@ -1913,15 +1860,28 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         document.getElementById("btn-tmdb-close").onclick = () => document.getElementById("tmdb-modal").classList.remove("active");
 
         // LISTA LATERAL DE TV E DRAWER DE CATEGORIAS
+        function setTvMiniMode(enabled) {
+            const modal = document.getElementById("player-modal");
+            modal.classList.toggle("tv-list-open", enabled);
+            document.body.classList.toggle("player-list-mode", enabled);
+            document.body.classList.remove("player-controls-visible");
+            if (enabled) {
+                document.getElementById("player-dock-wrap").classList.remove("visible");
+                document.getElementById("player-top-slim").classList.remove("visible");
+            }
+        }
+        function expandTvPlayer() {
+            closeDrawer();
+            setTvMiniMode(false);
+            resetDockTimer();
+        }
         function openTvChannelList(catName) {
             if (document.getElementById("player-modal").classList.contains("active")) {
-                document.getElementById("player-modal").classList.add("tv-list-open");
+                setTvMiniMode(true);
             }
             const listEl = document.getElementById("drawer-list");
             listEl.innerHTML = "";
             document.getElementById("drawer-title").textContent = catName;
-            document.getElementById("drawer-backdrop").classList.add("active");
-            document.getElementById("drawer-panel").classList.add("active");
 
             const btnBack = document.createElement("button");
             btnBack.className = "drawer-item";
@@ -1929,8 +1889,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             btnBack.onclick = () => openCategoriesDrawer("tv");
             listEl.appendChild(btnBack);
 
-            const filtered = catalog.tv.filter(it => catName === "Todas" || it.group === catName);
-            filtered.filter(it => catName !== "Todas" || !isAdultItem(it)).forEach(it => {
+            const filtered = catalog.tv.filter(it => (catName === "Todas" || it.group === catName) && (!isAdultItem(it) || adultUnlocked));
+            filtered.forEach(it => {
                 const b = document.createElement("button");
                 b.className = "drawer-item";
                 b.style.padding = "0.45rem 0.75rem";
@@ -1945,22 +1905,21 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     </div>
                 `;
                 b.onclick = () => {
-                    if (currentPlayingItem && currentPlayingItem.id === it.id && currentPlayingItem.type === it.type) {
-                        closeDrawer();
-                    } else {
-                        openItemPlay(it, "auto", true);
+                    if (currentPlayingItem && currentPlayingItem.id === it.id && currentPlayingItem.type === "tv") {
+                        expandTvPlayer();
+                        return;
                     }
+                    openItemPlay(it);
+                    openTvChannelList(catName);
+                    document.getElementById("drawer-backdrop").classList.add("active");
+                    document.getElementById("drawer-panel").classList.add("active");
+                    setTvMiniMode(true);
                 };
                 listEl.appendChild(b);
             });
         }
 
         function openCategoriesDrawer(forceTab = null) {
-            if (document.getElementById("player-modal").classList.contains("active")) {
-                document.getElementById("player-modal").classList.add("tv-list-open");
-                document.getElementById("drawer-backdrop").classList.add("active");
-                document.getElementById("drawer-panel").classList.add("active");
-            }
             if (forceTab) activeTab = forceTab;
             const list = document.getElementById("drawer-list");
             list.innerHTML = "";
@@ -1988,15 +1947,30 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             };
             list.appendChild(bAll);
 
-            (Array.isArray(cats) ? cats : []).forEach(c => {
+            const allCats = Array.isArray(cats) ? cats : [];
+            const protectedCats = allCats.filter(c => isAdultCategory(c.category_name));
+            if (protectedCats.length) {
+                const folder = document.createElement("button");
+                folder.className = "drawer-item";
+                folder.textContent = "🔒 Pasta protegida (18+)";
+                folder.onclick = () => {
+                    if (!adultUnlocked && !requestAdultAccess()) return;
+                    list.innerHTML = "";
+                    const back = document.createElement("button");
+                    back.className = "drawer-item";
+                    back.textContent = "‹ Voltar às categorias";
+                    back.onclick = () => openCategoriesDrawer(activeTab);
+                    list.appendChild(back);
+                    protectedCats.forEach(c => addCategoryButton(c));
+                };
+                list.appendChild(folder);
+            }
+            function addCategoryButton(c) {
                 const b = document.createElement("button");
                 b.className = `drawer-item ${activeCategory === c.category_name ? "active" : ""}`;
                 b.innerHTML = `<span>${c.category_name}</span>`;
                 b.onclick = () => {
-                    if (ADULT_REGEX.test(c.category_name)) {
-                        const entered = prompt("🔒 Digite o PIN de 4 dígitos para conteúdo Adulto:");
-                        if (entered !== adultPin) return alert("PIN incorreto!");
-                    }
+                    if (isAdultCategory(c.category_name) && !adultUnlocked && !requestAdultAccess()) return;
                     if (activeTab === "tv") {
                         if (document.getElementById("player-modal").classList.contains("active")) {
                             openTvChannelList(c.category_name);
@@ -2014,7 +1988,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     }
                 };
                 list.appendChild(b);
-            });
+            }
+            allCats.filter(c => !isAdultCategory(c.category_name)).forEach(addCategoryButton);
 
             document.getElementById("drawer-backdrop").classList.add("active");
             document.getElementById("drawer-panel").classList.add("active");
@@ -2023,14 +1998,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         function closeDrawer() {
             document.getElementById("drawer-backdrop").classList.remove("active");
             document.getElementById("drawer-panel").classList.remove("active");
-            document.getElementById("player-modal").classList.toggle("tv-list-open", keepDrawer);
         }
         document.getElementById("btn-open-drawer").onclick = () => openCategoriesDrawer();
         document.getElementById("btn-close-drawer").onclick = closeDrawer;
         document.getElementById("drawer-backdrop").onclick = closeDrawer;
-        document.getElementById("video-stage").addEventListener("click", () => {
-            if (document.getElementById("player-modal").classList.contains("tv-list-open")) closeDrawer();
-        }, true);
 
         function selectCategory(catName) {
             activeCategory = catName;
@@ -2050,7 +2021,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             const filtered = rawList.filter(it => {
                 const adult = isAdultItem(it);
                 if (activeCategory === "Todas") {
-                    if (adult) return false;
+                    if (adult && !adultUnlocked) return false;
                 } else if (it.group !== activeCategory) {
                     return false;
                 }
@@ -2072,7 +2043,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             const filtered = rawList.filter(it => {
                 const adult = isAdultItem(it);
                 if (activeCategory === "Todas") {
-                    if (adult) return false;
+                    if (adult && !adultUnlocked) return false;
                 } else if (it.group !== activeCategory) {
                     return false;
                 }
@@ -2096,18 +2067,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                         <span>${it.group}</span>
                     </div>
                 `;
-                div.onclick = () => {
-                    document.getElementById("tv-preview-placeholder").textContent = it.name;
-                    openItemPlay(it);
-                };
-                div.addEventListener("mouseenter", () => {
-                    const prev = document.getElementById("tv-preview");
-                    prev.style.backgroundImage = it.logo ? `url("${encodeURI(it.logo).replace(/"/g, '%22')}")` : "none";
-                    prev.style.backgroundSize = "contain";
-                    prev.style.backgroundPosition = "center";
-                    prev.style.backgroundRepeat = "no-repeat";
-                    document.getElementById("tv-preview-placeholder").textContent = it.name;
-                });
+                div.onclick = () => openItemPlay(it);
                 listEl.appendChild(div);
             });
         }
@@ -2127,6 +2087,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             const topSlim = document.getElementById("player-top-slim");
             dockWrap.classList.add("visible");
             topSlim.classList.add("visible");
+            document.body.classList.add("player-controls-visible");
 
             if (dockTimeout) clearTimeout(dockTimeout);
             dockTimeout = setTimeout(() => {
@@ -2134,17 +2095,23 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     closeAllBubbles();
                     dockWrap.classList.remove("visible");
                     topSlim.classList.remove("visible");
+                    document.body.classList.remove("player-controls-visible");
                 }
             }, 3000);
         }
 
         document.getElementById("video-stage").addEventListener("click", (e) => {
             if (e.target.closest("#center-play-overlay")) return;
+            if (document.getElementById("player-modal").classList.contains("tv-list-open")) {
+                expandTvPlayer();
+                return;
+            }
             const dockWrap = document.getElementById("player-dock-wrap");
             if (dockWrap.classList.contains("visible")) {
                 closeAllBubbles();
                 dockWrap.classList.remove("visible");
                 document.getElementById("player-top-slim").classList.remove("visible");
+                document.body.classList.remove("player-controls-visible");
                 if (dockTimeout) clearTimeout(dockTimeout);
             } else {
                 resetDockTimer();
@@ -2173,202 +2140,160 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             resetDockTimer();
         });
 
-        function sendMonitorHeartbeat(isPlaying, item = currentPlayingItem, sid = playbackSessionId) {
-            if (!item || !currentAuth?.monitor_token || !sid) return;
-            const state = !isPlaying ? "stopped" : (vEl.paused ? "paused" : (vEl.readyState < 2 ? "buffering" : "playing"));
-            const elapsed = item.type === "tv" ? Math.floor((Date.now() - playbackStartedAt)/1000) : Math.floor(vEl.currentTime || 0);
+        function sendMonitorHeartbeat(isPlaying) {
+            if (!currentPlayingItem) return;
+            const mac = getOrCreateMac();
             fetch("/api/monitor/heartbeat", {
-                method:"POST", credentials:"same-origin", headers:{"Content-Type":"application/json"},
-                body:JSON.stringify({token:currentAuth.monitor_token, playback_session:sid, mac:getOrCreateMac(), username:currentAuth.username,
-                    title:item.name, type:item.type, elapsed, state, playing:isPlaying})
-            }).then(async r => { if (r.status === 403) { const d = await r.json(); if (d.expired) showExpired(currentAuth.payment_link); } }).catch(()=>{});
-        }
-        function startMonitorLoop() {
-            if (monitorInterval) clearInterval(monitorInterval);
-            sendMonitorHeartbeat(true);
-            monitorInterval = setInterval(() => {
-                if (currentPlayingItem && document.getElementById("player-modal").classList.contains("active")) sendMonitorHeartbeat(true);
-            }, 10000);
-        }
-        ["playing", "pause", "waiting", "stalled", "seeking", "seeked", "ended"].forEach(ev => vEl.addEventListener(ev, () => {
-            if (ev === "ended") sendMonitorHeartbeat(false);
-            else if (currentPlayingItem) sendMonitorHeartbeat(true);
-        }));
-        document.addEventListener("visibilitychange", () => { if (currentPlayingItem) sendMonitorHeartbeat(true); });
-        window.addEventListener("pagehide", () => {
-            if (currentPlayingItem && currentAuth?.monitor_token && playbackSessionId) {
-                navigator.sendBeacon?.("/api/monitor/heartbeat", new Blob([JSON.stringify({token:currentAuth.monitor_token, playback_session:playbackSessionId, username:currentAuth.username, playing:false})], {type:"application/json"}));
-            }
-        });
-
-        function openItemPlay(it, forceEngine = "auto", keepDrawer = false) {
-            if (currentPlayingItem) stopPlayerEngines();
-            currentPlayingItem = it;
-            playbackSessionId = makePlaybackId();
-            playbackStartedAt = Date.now();
-            playSecondsCounter = 0;
-            currentActiveEngine = forceEngine;
-
-            document.getElementById("player-modal").classList.add("active");
-            document.getElementById("player-modal").classList.remove("tv-list-open");
-            document.body.classList.add("player-open");
-            document.getElementById("player-title").textContent = it.name;
-            document.getElementById("center-play-overlay").classList.add("hidden");
-
-            vEl.className = "";
-            closeAllBubbles();
-
-            // Botões de Retorno ao Catálogo/Lista no Topo do Player
-            if (it.type === "tv") {
-                document.getElementById("dock-btn-tv-list").classList.remove("hidden");
-                document.getElementById("btn-player-vod-list").classList.add("hidden");
-                document.getElementById("dock-btn-tv-list").onclick = (e) => {
-                    e.stopPropagation();
-                    openTvChannelList(currentPlayingItem ? currentPlayingItem.group : it.group);
-                    document.getElementById("player-modal").classList.add("tv-list-open");
-                    document.getElementById("drawer-backdrop").classList.add("active");
-                    document.getElementById("drawer-panel").classList.add("active");
-                    resetDockTimer();
-                };
-            } else {
-                document.getElementById("dock-btn-tv-list").classList.remove("hidden");
-                document.getElementById("btn-player-vod-list").classList.remove("hidden");
-                document.getElementById("btn-player-vod-list").onclick = (e) => {
-                    e.stopPropagation();
-                    stopPlayerEngines();
-                    document.getElementById("player-modal").classList.remove("active", "tv-list-open");
-                    document.body.classList.remove("player-open");
-                    document.querySelector(`.bottom-nav .bnav-item[data-tab="${it.type}"]`).click();
-                    selectCategory(it.group);
-                };
-            }
-
-            if (keepDrawer) {
-                document.getElementById("drawer-panel").classList.add("active");
-                document.getElementById("drawer-backdrop").classList.add("active");
-                document.getElementById("player-dock-wrap").classList.remove("visible");
-                document.getElementById("player-top-slim").classList.remove("visible");
-            } else { closeDrawer(); resetDockTimer(); }
-            startMonitorLoop();
-
-            const seekWrap = document.getElementById("vod-seek-wrap");
-            if (it.type === "tv") {
-                seekWrap.classList.remove("active");
-            } else {
-                seekWrap.classList.add("active");
-                document.getElementById("seek-cur-time").textContent = "00:00";
-                document.getElementById("seek-total-time").textContent = "00:00";
-                document.getElementById("seek-track-fill").style.width = "0%";
-            }
-
-            document.getElementById("opt-vlc-ext").href = it.url;
-
-            const epgBar = document.getElementById("epg-bar");
-            if (it.type === "tv") {
-                epgBar.classList.add("active");
-                fetchEpg(it);
-            } else {
-                epgBar.classList.remove("active");
-            }
-
-            const url = it.url;
-            let engine = forceEngine;
-
-            if (engine === "auto") {
-                if (url.includes(".m3u8")) engine = "hls";
-                else if (it.type === "tv" || url.endsWith(".ts")) engine = "ts_or_hls";
-                else engine = "native";
-            }
-
-            // OTIMIZAÇÃO DE BUFFER E BAIXA LATÊNCIA PARA EVITAR TRAVAMENTOS NO SEEK
-            if (engine === "ts_or_hls" || engine === "hls") {
-                const hlsUrl = url.endsWith('.ts') ? url.replace(/\.ts$/i, '.m3u8') : url;
-
-                if (typeof Hls !== "undefined" && Hls.isSupported()) {
-                    hlsInstance = new Hls({
-                        enableWorker: true,
-                        lowLatencyMode: it.type === "tv",
-                        maxBufferLength: it.type === "tv" ? 4 : 8,
-                        maxMaxBufferLength: it.type === "tv" ? 8 : 16,
-                        backBufferLength: 8,
-                        startLevel: -1,
-                        autoStartLoad: true
-                    });
-                    hlsInstance.loadSource(hlsUrl);
-                    hlsInstance.attachMedia(vEl);
-
-                    hlsInstance.on(Hls.Events.MANIFEST_PARSED, () => {
-                        vEl.play().catch(() => {
-                            document.getElementById("center-play-overlay").classList.remove("hidden");
-                        });
-                    });
-
-                    hlsInstance.on(Hls.Events.ERROR, (event, data) => {
-                        if (data.fatal) {
-                            startMpegTsOrNative(url);
-                        }
-                    });
-                    return;
-                } else if (vEl.canPlayType('application/vnd.apple.mpegurl')) {
-                    vEl.src = hlsUrl;
-                    vEl.play().catch(() => {
-                        document.getElementById("center-play-overlay").classList.remove("hidden");
-                    });
-                    return;
-                }
-            }
-
-            if (engine === "mpegts") {
-                startMpegTsOrNative(url);
-                return;
-            }
-
-            startNativePlay(url);
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({
+                    mac: mac,
+                    username: currentAuth ? currentAuth.username : "Anônimo",
+                    title: currentPlayingItem.name,
+                    type: currentPlayingItem.type,
+                    elapsed: playSecondsCounter,
+                    playing: isPlaying
+                })
+            }).catch(()=>{});
         }
 
-        function cleanupVideoEngine() {
-            if (hlsInstance) { try { hlsInstance.destroy(); } catch(e) {} hlsInstance = null; }
-            if (mpegtsInstance) { try { mpegtsInstance.destroy(); } catch(e) {} mpegtsInstance = null; }
-            vEl.pause();
-            vEl.removeAttribute("src");
-            vEl.load();
-        }
-        function startMpegTsOrNative(url) {
-            cleanupVideoEngine();
-            if (typeof mpegts !== "undefined" && mpegts.isSupported()) {
-                try {
-                    mpegtsInstance = mpegts.createPlayer({
-                        type: 'mpegts',
-                        isLive: true,
-                        url: url,
-                        cors: true
-                    }, {
-                        enableWorker: true,
-                        enableStashBuffer: false,
-                        stashInitialSize: 128
-                    });
-                    mpegtsInstance.attachMediaElement(vEl);
-                    mpegtsInstance.load();
-                    vEl.play().catch(() => {
-                        document.getElementById("center-play-overlay").classList.remove("hidden");
-                    });
-                    return;
-                } catch(e) {
-                    startNativePlay(url);
-                    return;
-                }
-            }
-            startNativePlay(url);
-        }
+        function setPlaybackStatus(message) {
+             const el = document.getElementById("playback-status");
+             el.textContent = message || "";
+             el.classList.toggle("hidden", !message);
+         }
 
-        function startNativePlay(url) {
-            cleanupVideoEngine();
-            vEl.src = url;
-            vEl.load();
-            vEl.play().catch(() => {
-                document.getElementById("center-play-overlay").classList.remove("hidden");
-            });
-        }
+         function clearPlaybackWatchdog() {
+             if (playbackWatchdog) clearTimeout(playbackWatchdog);
+             playbackWatchdog = null;
+         }
+
+         // Reprodutor: URLs originais preservadas; não se presume que .ts tenha um .m3u8 equivalente.
+         function makePlaybackCandidates(item, requestedEngine) {
+             const url = String(item.url || "").trim();
+             const isHls = /\.m3u8(?:[?#]|$)/i.test(url);
+             const isTs = /\.ts(?:[?#]|$)/i.test(url);
+             const list = [];
+             const add = (engine) => { if (!list.some(c => c.engine === engine)) list.push({engine, url}); };
+             if (requestedEngine === "native") add("native");
+             else if (requestedEngine === "hls") { add("hls"); add("native"); }
+             else if (requestedEngine === "mpegts") { add("mpegts"); add("native"); }
+             else if (isHls) { add("hls"); add("native"); }
+             else if (isTs || item.type === "tv") { add("mpegts"); add("native"); }
+             else { add("native"); }
+             return list;
+         }
+
+         function playbackFailureText() {
+             const source = currentPlayingItem && currentPlayingItem.url || "";
+             if (location.protocol === "https:" && /^http:\/\//i.test(source)) {
+                 return "O site usa HTTPS, mas o streaming usa HTTP. O navegador pode bloquear conteúdo misto. Use uma origem HTTPS compatível.";
+             }
+             return "Falha ao reproduzir. Verifique acesso ao servidor, CORS, formato e codecs. " + lastPlaybackFailure;
+         }
+
+         function tryPlaybackCandidate() {
+             clearPlaybackWatchdog();
+             const token = ++playbackToken;
+             if (playbackCandidateIndex >= playbackCandidates.length) {
+                 stopPlayerEngines(false);
+                 setPlaybackStatus(playbackFailureText());
+                 document.getElementById("center-play-overlay").classList.remove("hidden");
+                 resetDockTimer();
+                 return;
+             }
+             const candidate = playbackCandidates[playbackCandidateIndex++];
+             // A limpeza deve ocorrer antes do início da nova tentativa, sem gerar fallback recursivo.
+             stopPlayerEngines(false);
+             setPlaybackStatus("Carregando vídeo (" + playbackCandidateIndex + "/" + playbackCandidates.length + ")...");
+             const fail = (reason) => {
+                 if (token !== playbackToken || playerTeardown) return;
+                 lastPlaybackFailure = String(reason || "");
+                 tryPlaybackCandidate();
+             };
+             const play = () => {
+                 if (token !== playbackToken) return;
+                 const result = vEl.play();
+                 if (result && result.catch) result.catch(err => {
+                     if (token !== playbackToken) return;
+                     if (err && err.name === "NotAllowedError") {
+                         setPlaybackStatus("Toque no botão ▶ para iniciar o vídeo.");
+                         document.getElementById("center-play-overlay").classList.remove("hidden");
+                         resetDockTimer();
+                     } else if (err && err.name !== "AbortError") fail(err.message);
+                 });
+             };
+             playbackWatchdog = setTimeout(() => {
+                 if (token === playbackToken && vEl.readyState < 2) fail("Tempo limite de carregamento");
+             }, 16000);
+             try {
+                 if (candidate.engine === "hls") {
+                     if (typeof Hls !== "undefined" && Hls.isSupported()) {
+                         hlsInstance = new Hls({enableWorker:false, lowLatencyMode:false, maxBufferLength:20});
+                         hlsInstance.on(Hls.Events.MANIFEST_PARSED, play);
+                         hlsInstance.on(Hls.Events.ERROR, (_, err) => { if (err.fatal) fail(err.details || err.type); });
+                         hlsInstance.attachMedia(vEl);
+                         hlsInstance.loadSource(candidate.url);
+                     } else if (vEl.canPlayType("application/vnd.apple.mpegurl")) {
+                         vEl.src = candidate.url; vEl.load(); play();
+                     } else fail("HLS indisponível neste navegador");
+                 } else if (candidate.engine === "mpegts") {
+                     if (typeof mpegts === "undefined" || !mpegts.isSupported()) { fail("MPEG-TS indisponível"); return; }
+                     mpegtsInstance = mpegts.createPlayer({type:"mpegts", isLive:currentPlayingItem.type === "tv", url:candidate.url, cors:true}, {enableWorker:false, enableStashBuffer:false});
+                     mpegtsInstance.on(mpegts.Events.ERROR, (type, detail) => fail(type + ": " + detail));
+                     mpegtsInstance.attachMediaElement(vEl);
+                     mpegtsInstance.load();
+                     play();
+                 } else {
+                     vEl.src = candidate.url; vEl.load(); play();
+                 }
+             } catch(e) { fail(e.message); }
+         }
+
+         function openItemPlay(it, forceEngine = "auto") {
+             if (!it || !it.url) { alert("Endereço de reprodução indisponível."); return; }
+             ++playbackToken;
+             stopPlayerEngines();
+             currentPlayingItem = it;
+             lastPlaybackFailure = "";
+             playSecondsCounter = 0;
+             currentActiveEngine = forceEngine;
+             document.getElementById("player-modal").classList.add("active");
+             document.body.classList.add("player-open");
+             if (it.type === "tv") setTvMiniMode(true);
+             else setTvMiniMode(false);
+             document.getElementById("player-title").textContent = it.name;
+             document.getElementById("center-play-overlay").classList.add("hidden");
+             vEl.className = "";
+             vEl.controls = true;
+             closeAllBubbles();
+             document.getElementById("dock-btn-tv-list").classList.toggle("hidden", it.type !== "tv");
+             document.getElementById("btn-player-vod-list").classList.toggle("hidden", it.type === "tv");
+             document.getElementById("dock-btn-tv-list").onclick = (e) => {
+                 e.stopPropagation();
+                 openTvChannelList(currentPlayingItem.group);
+                 document.getElementById("drawer-backdrop").classList.add("active");
+                 document.getElementById("drawer-panel").classList.add("active");
+             };
+             document.getElementById("btn-player-vod-list").onclick = (e) => {
+                 e.stopPropagation();
+                 document.getElementById("btn-player-back").click();
+                 const tab = document.querySelector(`.bottom-nav .bnav-item[data-tab="${it.type}"]`);
+                 if (tab) { tab.click(); selectCategory(it.group); }
+             };
+             const seek = document.getElementById("vod-seek-wrap");
+             seek.classList.toggle("active", it.type !== "tv");
+             document.getElementById("seek-cur-time").textContent = "00:00";
+             document.getElementById("seek-total-time").textContent = "00:00";
+             document.getElementById("seek-track-fill").style.width = "0%";
+             document.getElementById("opt-vlc-ext").href = it.url;
+             document.getElementById("epg-bar").classList.toggle("active", it.type === "tv");
+             if (it.type === "tv") fetchEpg(it);
+             playbackCandidates = makePlaybackCandidates(it, forceEngine);
+             playbackCandidateIndex = 0;
+             tryPlaybackCandidate();
+             if (it.type !== "tv") resetDockTimer();
+         }
 
         document.getElementById("center-play-overlay").onclick = (e) => {
             e.stopPropagation();
@@ -2404,25 +2329,46 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             }
         }
 
-        function stopPlayerEngines() {
+        function stopPlayerEngines(clearMonitoring = true) {
+             playerTeardown = true;
+             clearPlaybackWatchdog();
             if (monitorInterval) {
                 clearInterval(monitorInterval);
                 monitorInterval = null;
             }
-            sendMonitorHeartbeat(false);
-            playbackSessionId = null;
+             if (clearMonitoring) sendMonitorHeartbeat(false);
             if (hlsInstance) { try { hlsInstance.destroy(); } catch (e) {} hlsInstance = null; }
             if (mpegtsInstance) { try { mpegtsInstance.destroy(); } catch (e) {} mpegtsInstance = null; }
             vEl.pause();
             vEl.removeAttribute("src");
             vEl.load();
+            queueMicrotask(() => { playerTeardown = false; });
         }
 
-        document.getElementById("btn-player-back").onclick = (e) => {
+         vEl.addEventListener("playing", () => {
+             clearPlaybackWatchdog();
+             setPlaybackStatus("");
+             document.getElementById("center-play-overlay").classList.add("hidden");
+             if (!monitorInterval) {
+                 sendMonitorHeartbeat(true);
+                 monitorInterval = setInterval(() => {
+                     if (!vEl.paused && currentPlayingItem) { playSecondsCounter += 10; sendMonitorHeartbeat(true); }
+                 }, 10000);
+             }
+         });
+         vEl.addEventListener("error", () => {
+             if (playerTeardown || !vEl.getAttribute("src") && !hlsInstance && !mpegtsInstance) return;
+             if (document.getElementById("player-modal").classList.contains("active") && playbackCandidateIndex < playbackCandidates.length) {
+                 lastPlaybackFailure = "Erro de mídia " + (vEl.error ? vEl.error.code : "");
+                 tryPlaybackCandidate();
+             }
+         });
+         document.getElementById("btn-player-back").onclick = (e) => {
             e.stopPropagation();
             stopPlayerEngines();
             document.getElementById("player-modal").classList.remove("active", "tv-list-open");
-            document.body.classList.remove("player-open");
+            document.body.classList.remove("player-open", "player-list-mode", "player-controls-visible");
+            closeDrawer();
         };
 
         // CONTROLES SLIM DO DOCK COM BOLHAS INVISÍVEIS DURANTE REPRODUÇÃO
@@ -2521,17 +2467,17 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             };
         });
 
-        document.getElementById("dock-btn-tv-list").addEventListener("click", (e) => {
-            if (currentPlayingItem?.type !== "tv") {
-                e.stopPropagation();
-                openCategoriesDrawer(currentPlayingItem?.type === "series" ? "series" : "movies");
-            }
-        });
-
         // NAVEGAÇÃO BOTTOM BAR E CATEGORIAS GERAIS
         document.querySelectorAll(".bottom-nav .bnav-item").forEach(btn => {
             btn.onclick = () => {
+                if (document.getElementById("player-modal").classList.contains("active")) {
+                    stopPlayerEngines();
+                    document.getElementById("player-modal").classList.remove("active", "tv-list-open");
+                    document.body.classList.remove("player-open", "player-list-mode", "player-controls-visible");
+                    closeDrawer();
+                }
                 activeTab = btn.dataset.tab;
+                adultUnlocked = false;
                 document.querySelectorAll(".bottom-nav .bnav-item").forEach(b => b.classList.remove("active"));
                 btn.classList.add("active");
 
@@ -2570,7 +2516,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     document.getElementById("view-config").classList.add("hidden");
                     activeCategory = "Todas";
                     renderCatalogGrid();
-                    openCategoriesDrawer(activeTab);
                 }
                 window.scrollTo({ top: 0, behavior: "smooth" });
             };
@@ -2625,10 +2570,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             const mac = getOrCreateMac();
             const r = await fetch("/api/login", { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({ username: u, password: p, mac: mac }) });
             const d = await r.json();
-            if (!d.ok) {
-                if (d.expired) { currentAuth = {username:u, payment_link:d.payment_link}; showExpired(d.payment_link); return; }
-                return alert(d.error || "Erro ao entrar.");
-            }
+            if (!d.ok) return alert(d.error || "Erro ao entrar.");
             currentAuth = d;
             localStorage.setItem("sf_session", JSON.stringify(d));
             enterApp();
@@ -2711,7 +2653,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             document.getElementById("main-navbar").classList.remove("hidden");
             document.getElementById("main-content").classList.remove("hidden");
             document.getElementById("bottom-nav").classList.add("active");
-            startSessionChecks();
             fetchXtreamData();
         }
 
@@ -2752,7 +2693,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 const d = await res.json();
                 if (!d.ok) return;
 
-                if (!document.getElementById("adm-dns").matches(":focus")) document.getElementById("adm-dns").value = d.settings.dns_list || "";
+                document.getElementById("adm-dns").value = d.settings.dns_list || "";
                 document.getElementById("adm-trial-api").value = d.settings.trial_api_url || "";
                 document.getElementById("adm-pay-link").value = d.settings.default_payment_link || "";
                 document.getElementById("adm-wa-link").value = d.settings.support_whatsapp || "";
@@ -2814,9 +2755,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         };
 
         if (currentAuth && currentAuth.username && window.location.pathname !== "/admin") {
-            if (currentAuth.expires_at && Date.now() >= Number(currentAuth.expires_at)*1000) showExpired(currentAuth.payment_link);
-            else if (currentAuth.monitor_token) enterApp();
-            else { localStorage.removeItem("sf_session"); currentAuth = null; }
+            enterApp();
         }
     </script>
 </body>
