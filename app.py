@@ -181,7 +181,12 @@ def get_settings():
     conn = get_main_db()
     rows = conn.execute("SELECT key, value FROM settings").fetchall()
     conn.close()
-    return {r["key"]: r["value"] for r in rows}
+    cfg = {r["key"]: r["value"] for r in rows}
+    # Configurações do banco têm precedência. Em uma instalação nova, permitir
+    # configurar a API de testes por variável de ambiente, sem publicar seu token.
+    if not (cfg.get("trial_api_url") or "").strip():
+        cfg["trial_api_url"] = os.environ.get("STREAMFLIX_TRIAL_API_URL", "").strip()
+    return cfg
 
 def save_settings(new_data):
     conn = get_main_db()
@@ -314,18 +319,29 @@ def parse_trial_api_response(raw_text, cfg):
 
     cleaned = raw_text.strip()
 
+    details_text = ""
     try:
         data = json.loads(cleaned)
         if isinstance(data, dict):
-            u = data.get("username")
-            p = data.get("password")
-            dns = data.get("dns")
+            # Alguns gateways entregam a conta sob data/result/account.
+            # Mesclar apenas campos ausentes, preservando a mensagem original.
+            outer = data
+            for wrapper in ("data", "result", "account", "user", "credentials"):
+                nested = data.get(wrapper)
+                if isinstance(nested, dict):
+                    data = {**outer, **nested}
+                    break
+            u = data.get("username") or data.get("usuario") or data.get("login") or (data.get("user") if isinstance(data.get("user"), str) else None)
+            p = data.get("password") or data.get("senha") or data.get("pass")
+            dns = data.get("dns") or data.get("server") or data.get("server_url") or data.get("host")
             plan = data.get("package")
-            pay = data.get("payUrl") or data.get("payment_link")
+            pay = data.get("payUrl") or data.get("payment_link") or data.get("paymentUrl")
             exp_formatted = data.get("expiresAtFormatted") or data.get("expiresAt")
             created_formatted = data.get("createdAtFormatted") or data.get("createdAt")
             conns = data.get("connections") or data.get("max_connections")
-            reply = data.get("reply") or ""
+            reply = data.get("reply") or data.get("message") or outer.get("reply") or ""
+            if not isinstance(reply, str): reply = json.dumps(reply, ensure_ascii=False)
+            details_text = reply
 
             if u: res["username"] = str(u).strip()
             if p: res["password"] = str(p).strip()
@@ -333,9 +349,16 @@ def parse_trial_api_response(raw_text, cfg):
             if plan: res["plan_type"] = str(plan).replace("🔹", "").strip()
             if conns: res["max_connections"] = str(conns).strip()
             if pay: res["payment_link"] = str(pay).strip()
-            if exp_formatted: res["expires_formatted"] = str(exp_formatted).strip()
+            if exp_formatted:
+                if str(exp_formatted).isdigit() and int(exp_formatted) > 1000000000:
+                    res["expires_at"] = int(exp_formatted)
+                    res["expires_formatted"] = datetime.fromtimestamp(int(exp_formatted)).strftime("%d/%m/%Y %H:%M:%S")
+                else:
+                    res["expires_formatted"] = str(exp_formatted).strip()
             if created_formatted: res["created_formatted"] = str(created_formatted).strip()
 
+            if data.get("m3u_url") or data.get("m3u"):
+                res["m3u_url"] = str(data.get("m3u_url") or data.get("m3u")).strip()
             if reply:
                 # Extrai parcerias Smart TV
                 tv_matches = []
@@ -356,6 +379,8 @@ def parse_trial_api_response(raw_text, cfg):
     except Exception:
         pass
 
+    # A resposta de vários fornecedores possui credenciais apenas em `reply`.
+    cleaned = cleaned + "\n" + details_text
     if not res["username"]:
         u_m = re.search(r"(?:usu[aá]rio|user|login)\s*[:=\-*]+\s*([A-Za-z0-9_.\-]+)", cleaned, re.I)
         if u_m: res["username"] = u_m.group(1).strip()
@@ -365,6 +390,17 @@ def parse_trial_api_response(raw_text, cfg):
     if not res["payment_link"]:
         pay_m = re.search(r"(https?://[^\s\"'<>]+(?:checkout|fatura|pagamento|mercadopago|pix|assinar|pay)[^\s\"'<>]*)", cleaned, re.I)
         if pay_m: res["payment_link"] = pay_m.group(1).strip()
+    # Não inventar uma expiração local quando o provedor informou a real.
+    exp_text = str(res["expires_formatted"] or "").strip().replace(" às ", " ")
+    parsed_exp = None
+    for fmt in ("%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            parsed_exp = int(datetime.strptime(exp_text, fmt).timestamp())
+            break
+        except (TypeError, ValueError):
+            pass
+    if parsed_exp:
+        res["expires_at"] = parsed_exp
     if not res["m3u_url"] and res["username"] and res["password"] and res["dns"]:
         res["m3u_url"] = f"{res['dns']}/get.php?username={urllib.parse.quote(res['username'])}&password={urllib.parse.quote(res['password'])}&type=m3u_plus&output=ts"
 
@@ -446,62 +482,139 @@ def api_login():
     username = str(data.get("username") or "").strip()
     password = str(data.get("password") or "").strip()
     mac = str(data.get("mac") or "").strip().upper()[:64]
+    # Um login novo deve substituir a sessão anterior somente após autenticação válida.
+    # Não permitir que uma tentativa com senha incorreta herde a sessão antiga.
+    session.pop("streamflix_user", None)
+    session.pop("adult_unlocked", None)
+
+    # Também aceita uma URL M3U completa no campo de usuário (senha pode ficar vazia).
+    m3u_supplied = str(data.get("m3u_url") or "").strip()
+    if username.startswith(("http://", "https://")) and "/get.php" in username:
+        m3u_supplied, username = username, ""
+    parsed_dns = ""
+    if m3u_supplied:
+        try:
+            p = urlsplit(m3u_supplied)
+            args = urllib.parse.parse_qs(p.query)
+            if p.scheme not in ("http", "https") or not p.hostname or not p.path.endswith("/get.php"):
+                raise ValueError()
+            parsed_dns = f"{p.scheme}://{p.netloc}"
+            username = str((args.get("username") or [username])[0]).strip()
+            password = str((args.get("password") or [password])[0]).strip()
+        except (ValueError, IndexError):
+            return jsonify({"ok": False, "error": "Link M3U inválido."}), 400
     if not username or not password:
-        return jsonify({"ok": False, "error": "Informe usuário e senha."}), 400
+        return jsonify({"ok": False, "error": "Informe usuário e senha, ou cole uma URL M3U válida."}), 400
+
     cfg = get_settings()
     dns_list = [d.strip().rstrip("/") for d in cfg.get("dns_list", "").splitlines() if d.strip()]
     conn = get_main_db()
     existing = conn.execute("SELECT * FROM active_users WHERE username=?", (username,)).fetchone()
     now = int(time.time())
     pay = (existing["payment_link"] if existing else "") or cfg.get("default_payment_link", "")
-    # Não criar acesso fictício de 30 dias quando os servidores não respondem.
+    if parsed_dns:
+        dns_list.insert(0, parsed_dns)
     if existing and existing["dns_used"] and existing["dns_used"] not in dns_list:
         dns_list.insert(0, existing["dns_used"])
+    dns_list = list(dict.fromkeys((d if d.startswith(("http://","https://")) else "http://" + d).rstrip("/") for d in dns_list))
+    if not dns_list:
+        conn.close()
+        return jsonify({"ok": False, "error": "DNS IPTV não configurado no painel Admin."}), 503
+
     info = None
     chosen_dns = None
-    upstream_reached = False
+    verified_m3u = False
+    explicitly_denied = False
+    server_reachable = False
     for dns in dns_list:
-        if not dns.startswith(("http://", "https://")):
-            dns = "http://" + dns
         try:
-            api_url = f"{dns}/player_api.php?username={urllib.parse.quote(username)}&password={urllib.parse.quote(password)}"
-            req = urllib.request.Request(api_url, headers={"User-Agent": "IPTVSmartersPro/3.1.5", "Accept": "application/json"})
-            with urllib.request.urlopen(req, timeout=7, context=SSL_CTX) as resp:
-                result = json.loads(resp.read(1024 * 1024).decode("utf-8", errors="replace"))
-            if not isinstance(result, dict) or not isinstance(result.get("user_info"), dict):
+            url = dns + "/player_api.php?" + urllib.parse.urlencode({"username": username, "password": password})
+            req = urllib.request.Request(url, headers={"User-Agent": "IPTVSmartersPro/3.1.5 (Linux; Android 12)", "Accept": "application/json,*/*"})
+            with urllib.request.urlopen(req, timeout=8, context=SSL_CTX) as resp:
+                obj = json.loads(resp.read(1024 * 1024).decode("utf-8", "replace"))
+            if not isinstance(obj, dict) or not isinstance(obj.get("user_info"), dict):
                 continue
-            upstream_reached = True
-            uinfo = result["user_info"]
-            exp = int(uinfo.get("exp_date") or 0) if str(uinfo.get("exp_date") or "0").isdigit() else 0
-            state = str(uinfo.get("status") or "").lower()
-            if (exp and exp <= now) or state in ("expired", "disabled", "banned"):
+            server_reachable = True
+            uinfo = obj["user_info"]
+            exp_value = str(uinfo.get("exp_date") or "0")
+            exp = int(exp_value) if exp_value.isdigit() else 0
+            state = str(uinfo.get("status") or "").strip().lower()
+            auth_flag = str(uinfo.get("auth") if uinfo.get("auth") is not None else "")
+            authenticated = auth_flag == "1" or (auth_flag == "" and state in ("active", "trial"))
+            # auth=0 significa credenciais rejeitadas, não necessariamente vencimento.
+            # Um usuário inexistente jamais deve receber um card de renovação.
+            if authenticated and ((exp and exp <= now) or state == "expired"):
                 conn.close()
                 return jsonify({"ok": False, "expired": True, "payment_link": pay, "error": "Seu acesso venceu."}), 403
-            if str(uinfo.get("auth")) == "1" and (state in ("active", "trial", "") or not state):
-                info = uinfo
-                chosen_dns = dns
+            if authenticated and state in ("active", "trial", "enabled", ""):
+                chosen_dns, info = dns, uinfo
                 break
-        except Exception:
-            continue
-    if not info:
+            # Uma API que responde auth=0 é uma rejeição real, não uma falha de rede.
+            if not authenticated:
+                explicitly_denied = True
+        except Exception as exc:
+            app.logger.info("Xtream indisponível em %s: %s", urlsplit(dns).hostname, type(exc).__name__)
+
+    # Servidores Xtream podem disponibilizar M3U, mas não responder player_api.php.
+    # Confirmar a existência REAL de EXTINF antes de aceitar a conta.
+    if not info and not explicitly_denied:
+        for dns in dns_list:
+            try:
+                m3u = dns + "/get.php?" + urllib.parse.urlencode({"username": username, "password": password, "type": "m3u_plus", "output": "mpegts"})
+                req = urllib.request.Request(m3u, headers={"User-Agent": "IPTVSmartersPro/3.1.5", "Accept": "*/*"})
+                with urllib.request.urlopen(req, timeout=11, context=SSL_CTX) as resp:
+                    prefix = resp.read(32768).decode("utf-8-sig", "replace")
+                if prefix.lstrip().startswith("#EXTM3U") and "#EXTINF" in prefix:
+                    chosen_dns, verified_m3u = dns, True
+                    break
+            except Exception as exc:
+                app.logger.info("M3U indisponível em %s: %s", urlsplit(dns).hostname, type(exc).__name__)
+
+    if not info and not verified_m3u:
         cached_exp = int(existing["expires_at"] or 0) if existing else 0
-        conn.close()
-        if existing and cached_exp and cached_exp <= now:
+        matches_cache = bool(existing and hmac.compare_digest(str(existing["password"] or ""), password))
+        if matches_cache and cached_exp and cached_exp <= now:
+            conn.close()
             return jsonify({"ok": False, "expired": True, "payment_link": pay, "error": "Seu acesso venceu."}), 403
-        return jsonify({"ok": False, "error": "Credenciais inválidas ou servidor IPTV indisponível." if upstream_reached else "Não foi possível validar o acesso no servidor IPTV."}), 401
-    expires = int(info.get("exp_date") or 0) if str(info.get("exp_date") or "0").isdigit() else 0
-    created = existing["created_at_str"] if existing else datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-    if str(info.get("created_at") or "").isdigit():
+        # Restabelece contas JÁ CADASTRADAS enquanto o upstream estiver fora.
+        # Nunca cria usuários novos fictícios nem ignora rejeição explícita da API.
+        if matches_cache and not explicitly_denied and cached_exp > now:
+            chosen_dns = str(existing["dns_used"] or dns_list[0]).rstrip("/")
+            info = {"status": "Active", "exp_date": cached_exp,
+                    "max_connections": existing["max_connections"] or "1"}
+            app.logger.warning("Login de conta cadastrada via cache local (IPTV sem resposta): %s", username)
+        else:
+            conn.close()
+            error = "Usuário ou senha rejeitados pelo servidor IPTV." if explicitly_denied else "Não foi possível validar o acesso no servidor IPTV. Confirme o DNS ou a playlist M3U."
+            return jsonify({"ok": False, "error": error}), 401 if explicitly_denied else 503
+
+    upstream_exp = str((info or {}).get("exp_date") or "0")
+    expires = int(upstream_exp) if upstream_exp.isdigit() else 0
+    # Se o fornecedor omitir exp_date, não apagar a validade anteriormente
+    # informada pela API de testes ou por uma autenticação Xtream anterior.
+    if not expires and existing:
+        expires = int(existing["expires_at"] or 0)
+    if expires and expires <= now:
+        conn.close()
+        return jsonify({"ok": False, "expired": True, "payment_link": pay, "error": "Seu acesso venceu."}), 403
+    created = (existing["created_at_str"] if existing else "") or datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    if info and str(info.get("created_at") or "").isdigit():
         try: created = datetime.fromtimestamp(int(info["created_at"])).strftime("%d/%m/%Y %H:%M:%S")
         except (ValueError, OverflowError): pass
-    m3u = f"{chosen_dns}/get.php?username={urllib.parse.quote(username)}&password={urllib.parse.quote(password)}&type=m3u_plus&output=mpegts"
+    m3u_url = chosen_dns + "/get.php?" + urllib.parse.urlencode({"username": username, "password": password, "type": "m3u_plus", "output": "mpegts"})
     plan = (existing["plan_type"] if existing else "") or "Assinante Oficial"
-    max_conns = str(info.get("max_connections") or "1")
+    max_conns = str((info or {}).get("max_connections") or (existing["max_connections"] if existing else "") or "1")
     is_trial = int(existing["is_trial"] or 0) if existing else 0
-    conn.execute("""INSERT OR REPLACE INTO active_users
-      (username,password,dns_used,m3u_url,plan_type,max_connections,expires_at,payment_link,is_trial,created_at_str)
-      VALUES (?,?,?,?,?,?,?,?,?,?)""",
-      (username,password,chosen_dns,m3u,plan,max_conns,expires,pay,is_trial,created))
+    # UPDATE preserva o PIN adulto e outros metadados adicionados ao usuário.
+    conn.execute("""INSERT INTO active_users
+       (username,password,dns_used,m3u_url,plan_type,max_connections,expires_at,payment_link,is_trial,created_at_str)
+       VALUES (?,?,?,?,?,?,?,?,?,?)
+       ON CONFLICT(username) DO UPDATE SET
+       password=excluded.password,dns_used=excluded.dns_used,m3u_url=excluded.m3u_url,
+       plan_type=excluded.plan_type,max_connections=excluded.max_connections,
+       expires_at=excluded.expires_at,payment_link=excluded.payment_link,
+       is_trial=excluded.is_trial,created_at_str=excluded.created_at_str""",
+       (username,password,chosen_dns,m3u_url,plan,max_conns,expires,pay,is_trial,created))
     conn.commit()
     conn.close()
     session["streamflix_user"] = username
@@ -509,10 +622,12 @@ def api_login():
     forwarded = request.headers.get("X-Forwarded-For", "")
     record_device_entry(mac, forwarded.split(",")[0].strip() if forwarded else request.remote_addr, request.headers.get("User-Agent", ""), username)
     return jsonify({"ok": True, "username": username, "password": password, "dns": chosen_dns,
-      "m3u_url": m3u, "plan_type": plan, "max_connections": max_conns,
-      "status": info.get("status") or "Active", "created_formatted": created,
-      "expires_at": expires, "expires_formatted": datetime.fromtimestamp(expires).strftime("%d/%m/%Y às %H:%M") if expires else "Sem vencimento",
-      "payment_link": pay, "support_whatsapp": cfg.get("support_whatsapp", "")})
+        "m3u_url": m3u_url, "plan_type": plan, "max_connections": max_conns,
+        "status": (info or {}).get("status", "Active"), "created_formatted": created,
+        "expires_at": expires,
+        "expires_formatted": datetime.fromtimestamp(expires).strftime("%d/%m/%Y às %H:%M") if expires else "Sem vencimento",
+        "payment_link": pay, "support_whatsapp": cfg.get("support_whatsapp", ""),
+        "session_mode": "m3u" if verified_m3u else ("xtream" if str((info or {}).get("auth")) == "1" else "restored")})
 
 @app.route("/api/request-trial", methods=["POST"])
 def api_request_trial():
@@ -561,7 +676,11 @@ def api_request_trial():
 
     if not parsed["username"] or not parsed["password"]:
         conn1.close()
-        return jsonify({"ok": False, "error": "A API de testes não forneceu uma conta IPTV válida. Nenhum teste fictício foi registrado."}), 502
+        if not trial_api_url:
+            return jsonify({"ok": False, "error": "API de testes não configurada. Informe a URL no painel Admin ou em STREAMFLIX_TRIAL_API_URL."}), 503
+        if not raw_api_resp:
+            return jsonify({"ok": False, "error": "Não foi possível conectar à API de testes. Verifique a URL no painel Admin e os registros do servidor."}), 502
+        return jsonify({"ok": False, "error": "A API de testes respondeu, mas não forneceu usuário e senha válidos."}), 502
 
     parsed["raw_message"] = format_custom_trial_message(parsed)
 
@@ -690,7 +809,13 @@ def api_admin_delete_all_trials():
 @app.route("/api/admin/save", methods=["POST"])
 def api_admin_save():
     if not session.get("is_admin"): return jsonify({"ok": False}), 401
-    save_settings(request.get_json(silent=True) or {})
+    incoming = request.get_json(silent=True) or {}
+    current = get_settings()
+    # Um formulário administrativo ainda não carregado não pode apagar a API
+    # de testes já configurada com uma string vazia sem confirmação explícita.
+    if not str(incoming.get("trial_api_url") or "").strip() and current.get("trial_api_url"):
+        incoming.pop("trial_api_url", None)
+    save_settings(incoming)
     return jsonify({"ok": True})
 
 @app.route("/api/adult/unlock", methods=["POST"])
@@ -760,9 +885,9 @@ def _check_public_media_url(url):
         _public_dns_cache.clear()
     _public_dns_cache[key] = time.time() + 60
 
-def _remote_open(url, range_header=None):
+def _remote_open(url, range_header=None, user_agent=None):
     _check_public_media_url(url)
-    headers = {"User-Agent": "VLC/3.0 StreamFlix", "Accept": "*/*", "Accept-Encoding": "identity"}
+    headers = {"User-Agent": user_agent or "VLC/3.0 StreamFlix", "Accept": "*/*", "Accept-Encoding": "identity"}
     if range_header and re.fullmatch(r"bytes=\d*-\d*", range_header):
         headers["Range"] = range_header
     opener = urllib.request.build_opener(_SafeRedirect(), urllib.request.HTTPSHandler(context=SSL_CTX))
@@ -843,7 +968,7 @@ def api_xtream_proxy():
             args[key] = request.args[key]
     url = row["dns_used"].rstrip("/") + "/player_api.php?" + urllib.parse.urlencode(args)
     try:
-        with _remote_open(url) as r:
+        with _remote_open(url, user_agent="IPTVSmartersPro/3.1.5 (Linux; Android 12)") as r:
             data = r.read(15 * 1024 * 1024 + 1)
             if len(data) > 15 * 1024 * 1024:
                 return jsonify({"error": "Resposta excedeu o limite"}), 502
@@ -851,6 +976,76 @@ def api_xtream_proxy():
     except Exception as exc:
         app.logger.warning("Falha na API Xtream: %s", type(exc).__name__)
         return jsonify({"error": "Falha na API do servidor IPTV"}), 502
+
+def _parse_m3u_playlist(body, username):
+    """Parse an authorized M3U without exposing upstream passwords in the browser."""
+    items = []
+    pending = None
+    ext_pattern = re.compile(r'([\w-]+)\s*=\s*(?:"([^"]*)"|([^\s,]+))')
+    for raw in body.splitlines():
+        line = raw.strip()
+        if line.startswith("#EXTINF:"):
+            head, _, title = line.partition(",")
+            attrs = {m.group(1).lower(): (m.group(2) if m.group(2) is not None else m.group(3)) for m in ext_pattern.finditer(head)}
+            pending = {"name": title.strip() or attrs.get("tvg-name") or "Sem título",
+                       "logo": attrs.get("tvg-logo", ""), "group": attrs.get("group-title", "") or "Outros"}
+        elif line.startswith("#EXTGRP:") and pending:
+            pending["group"] = line[8:].strip() or "Outros"
+        elif line.startswith(("http://", "https://")) and pending:
+            try:
+                target = urlsplit(line)
+                if target.scheme not in ("http", "https") or not target.hostname:
+                    raise ValueError("URL inválida")
+                try:
+                    address_ip = ipaddress.ip_address(target.hostname)
+                except ValueError:
+                    address_ip = None  # Nome DNS; checado quando solicitar mídia.
+                if address_ip and not address_ip.is_global:
+                    raise ValueError("Host privado")
+            except (ValueError, OSError):
+                pending = None
+                continue
+            path = urlsplit(line).path.lower()
+            group_lower = pending["group"].lower()
+            if "/series/" in path or any(x in group_lower for x in ("séries", "series", "temporada")):
+                kind = "series"
+            elif "/movie/" in path or any(x in group_lower for x in ("filmes", "movies", "vod", "cinema")) or path.endswith((".mp4", ".mkv", ".avi", ".mov", ".m4v")):
+                kind = "movies"
+            else:
+                kind = "tv"
+            ext = (path.rsplit(".", 1)[-1] if "." in path.rsplit("/",1)[-1] else ("ts" if kind == "tv" else "mp4"))
+            item = {**pending, "id": str(len(items)+1), "type": kind,
+                    "url": _sign_hls_url(line, username), "container_extension": ext, "source_m3u": True}
+            items.append(item)
+            pending = None
+            if len(items) >= 25000:
+                break
+    return items
+
+@app.route("/api/playlist")
+def api_playlist_fallback():
+    user = _media_user()
+    if not user:
+        return jsonify({"error": "Sessão não autenticada ou vencida"}), 401
+    m3u_url = (user["m3u_url"] or "").strip()
+    if not m3u_url:
+        m3u_url = user["dns_used"].rstrip("/") + "/get.php?" + urllib.parse.urlencode({
+            "username": user["username"], "password": user["password"], "type": "m3u_plus", "output": "mpegts"})
+    try:
+        with _remote_open(m3u_url, user_agent="IPTVSmartersPro/3.1.5 (Linux; Android 12)") as upstream:
+            content = upstream.read(32 * 1024 * 1024 + 1)
+        if len(content) > 32 * 1024 * 1024:
+            return jsonify({"error": "Playlist M3U excede 32 MB; ajuste o limite no servidor"}), 413
+        decoded = content.decode("utf-8-sig", "replace")
+        if not decoded.lstrip().startswith("#EXTM3U"):
+            return jsonify({"error": "O servidor retornou uma playlist inválida"}), 502
+        entries = _parse_m3u_playlist(decoded, user["username"])
+        if not entries:
+            return jsonify({"error": "Playlist M3U sem canais válidos"}), 502
+        return jsonify({"ok": True, "items": entries, "source": "m3u"})
+    except Exception as exc:
+        app.logger.warning("Falha ao carregar M3U: %s", type(exc).__name__)
+        return jsonify({"error": "Falha ao carregar M3U do servidor IPTV"}), 502
 
 @app.route("/api/media/<kind>/<stream_id>.<ext>")
 def api_media_stream(kind, stream_id, ext):
@@ -890,7 +1085,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
     <meta http-equiv="Cache-Control" content="no-store, max-age=0">
     <title>StreamFlix Pro</title>
-    <meta name="streamflix-version" content="2026-11-10-integrado-monitoramento-v2">
+    <meta name="streamflix-version" content="2026-11-11-restauracao-regressoes-v3.2">
     <script src="https://unpkg.com/lucide@latest"></script>
     <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
     <script src="https://cdn.jsdelivr.net/npm/mpegts.js@latest/dist/mpegts.js"></script>
@@ -1412,8 +1607,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             <h1 class="brand-title">STREAM<span>FLIX</span></h1>
             <p class="brand-sub">Cinema, Séries & TV ao Vivo</p>
             <form id="form-login">
-                <div class="form-group"><label>Usuário</label><div class="input-wrap"><input type="text" id="l-user" required></div></div>
-                <div class="form-group"><label>Senha</label><div class="input-wrap"><input type="password" id="l-pass" required></div></div>
+                <div class="form-group"><label>Usuário ou link M3U</label><div class="input-wrap"><input type="text" id="l-user" required></div></div>
+                <div class="form-group"><label>Senha</label><div class="input-wrap"><input type="password" id="l-pass" placeholder="Senha (dispensável para link M3U)"></div></div>
                 <button type="submit" class="btn-pill btn-pill-primary" style="width:100%; margin-top:0.4rem;">Entrar e Assistir</button>
             </form>
             <button type="button" class="btn-pill btn-pill-success" id="btn-trial" style="width:100%; margin-top:0.75rem;">⚡ Gerar Teste Grátis Automático</button>
@@ -1928,8 +2123,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             if (!dns.startsWith("http://") && !dns.startsWith("https://")) {
                 dns = "http://" + dns;
             }
-            const u = encodeURIComponent(currentAuth.username);
-            const p = encodeURIComponent(currentAuth.password);
 
             const cover = document.getElementById("loading-cover");
             const msgEl = document.getElementById("loading-msg");
@@ -1937,14 +2130,21 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
             try {
                 msgEl.textContent = "Obtendo categorias do servidor...";
-                const [rTvCat, rVodCat, rSerCat] = await Promise.all([
-                    fetch(xtreamUrl("get_live_categories")).catch(()=>({json:()=>[]})),
-                    fetch(xtreamUrl("get_vod_categories")).catch(()=>({json:()=>[]})),
-                    fetch(xtreamUrl("get_series_categories")).catch(()=>({json:()=>[]}))
+                const safeXtream = async action => {
+                    const response = await fetch(xtreamUrl(action), {credentials: "same-origin", cache: "no-store"});
+                    if (!response.ok) throw new Error(`Xtream ${action}: HTTP ${response.status}`);
+                    const data = await response.json();
+                    if (!Array.isArray(data)) throw new Error(`Resposta inválida de ${action}`);
+                    return data;
+                };
+                const [tvCat, vodCat, serCat] = await Promise.allSettled([
+                    safeXtream("get_live_categories"),
+                    safeXtream("get_vod_categories"),
+                    safeXtream("get_series_categories")
                 ]);
-                xtreamCategories.tv = await rTvCat.json().catch(()=>[]);
-                xtreamCategories.movies = await rVodCat.json().catch(()=>[]);
-                xtreamCategories.series = await rSerCat.json().catch(()=>[]);
+                xtreamCategories.tv = tvCat.status === "fulfilled" ? tvCat.value : [];
+                xtreamCategories.movies = vodCat.status === "fulfilled" ? vodCat.value : [];
+                xtreamCategories.series = serCat.status === "fulfilled" ? serCat.value : [];
 
                 const vodCatMap = {};
                 (Array.isArray(xtreamCategories.movies) ? xtreamCategories.movies : []).forEach(c => vodCatMap[c.category_id] = c.category_name);
@@ -1956,14 +2156,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 (Array.isArray(xtreamCategories.tv) ? xtreamCategories.tv : []).forEach(c => liveCatMap[c.category_id] = c.category_name);
 
                 msgEl.textContent = "Sincronizando conteúdos...";
-                const [rVod, rSer, rLive] = await Promise.all([
-                    fetch(xtreamUrl("get_vod_streams")).catch(()=>({json:()=>[]})),
-                    fetch(xtreamUrl("get_series")).catch(()=>({json:()=>[]})),
-                    fetch(xtreamUrl("get_live_streams")).catch(()=>({json:()=>[]}))
+                const [vodResult, seriesResult, liveResult] = await Promise.allSettled([
+                    safeXtream("get_vod_streams"),
+                    safeXtream("get_series"),
+                    safeXtream("get_live_streams")
                 ]);
-                const vods = await rVod.json().catch(()=>[]);
-                const series = await rSer.json().catch(()=>[]);
-                const live = await rLive.json().catch(()=>[]);
+                const vods = vodResult.status === "fulfilled" ? vodResult.value : [];
+                const series = seriesResult.status === "fulfilled" ? seriesResult.value : [];
+                const live = liveResult.status === "fulfilled" ? liveResult.value : [];
 
                 catalog.movies = (Array.isArray(vods) ? vods : []).map(v => ({
                     id: v.stream_id, name: v.name, group: v.category_name || vodCatMap[v.category_id] || "Filmes", category_id: v.category_id,
@@ -1984,6 +2184,22 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     url: mediaUrl("live", l.stream_id, "ts")
                 }));
 
+                // A API Xtream nem sempre está disponível mesmo quando a M3U funciona.
+                if (!catalog.tv.length && !catalog.movies.length && !catalog.series.length) {
+                    msgEl.textContent = "Tentando carregar a playlist M3U...";
+                    const playlistResponse = await fetch("/api/playlist", {credentials: "same-origin", cache:"no-store"});
+                    const playlist = await playlistResponse.json();
+                    if (!playlistResponse.ok || !playlist.ok || !Array.isArray(playlist.items)) {
+                        throw new Error(playlist.error || `M3U HTTP ${playlistResponse.status}`);
+                    }
+                    catalog.tv = playlist.items.filter(it => it.type === "tv");
+                    catalog.movies = playlist.items.filter(it => it.type === "movies");
+                    catalog.series = playlist.items.filter(it => it.type === "series");
+                    for (const tab of ["tv", "movies", "series"]) {
+                        const distinct = [...new Set(catalog[tab].map(it => it.group))];
+                        xtreamCategories[tab] = distinct.map((name, index) => ({category_id: String(index + 1),category_name:name}));
+                    }
+                }
                 const hm = catalog.movies.filter(it => !isAdultItem(it)).slice(0, 8);
                 const hs = catalog.series.filter(it => !isAdultItem(it)).slice(0, 8);
                 heroItems = [];
@@ -1996,7 +2212,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 renderHomeCarousels();
             } catch (e) {
                 console.error("Erro no carregamento Xtream:", e);
-                alert("Falha ao comunicar com o servidor IPTV. Verifique o DNS e credenciais.");
+                alert(`Não foi possível carregar a playlist. ${e.message || "Verifique o DNS e as credenciais."}`);
             } finally {
                 cover.classList.remove("active");
             }
@@ -2038,6 +2254,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
         // SÉRIES: MODAL COM ESCOLHER TEMPORADA E EPISÓDIOS REAIS
         async function openSeriesDetails(it) {
+            // Em M3U simples, cada entrada de série já é um episódio reproduzível.
+            if (it.source_m3u && it.url) { openItemPlay(it); return; }
             document.getElementById("series-modal").classList.add("active");
             document.getElementById("series-title").textContent = it.name;
             document.getElementById("series-meta").textContent = `Carregando informações da série...`;
@@ -2534,9 +2752,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         // Preserva os três mecanismos originais; todas as URLs são da mesma origem.
         function makePlaybackCandidates(item, requestedEngine) {
             const url = item.url || "";
-            const isTs = /\.ts(?:[?#]|$)/i.test(url);
-            const isHls = /\.m3u8(?:[?#]|$)/i.test(url);
-            const hlsUrl = isTs ? url.replace(/\.ts(?=[?#]|$)/i, ".m3u8") : url;
+            const isTs = /\.ts(?=[?#]|$)/i.test(url) || String(item.container_extension || "").toLowerCase() === "ts";
+            const isHls = /\.m3u8?(?=[?#]|$)/i.test(url) || ["m3u8", "m3u"].includes(String(item.container_extension || "").toLowerCase());
+            const hlsUrl = isTs && /\.ts(?=[?#]|$)/i.test(url) ? url.replace(/\.ts(?=[?#]|$)/i, ".m3u8") : url;
             const choices = [];
             const add = (engine, link) => { if (link && !choices.some(c => c.engine === engine && c.url === link)) choices.push({engine,url:link}); };
             if (requestedEngine === "native") add("native", url);
@@ -2544,8 +2762,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             else if (requestedEngine === "mpegts") { add("mpegts",url); add("native",url); }
             else if (isHls) { add("hls",url); add("native",url); }
             else if (item.type === "tv" && isTs) {
-                // Em dispositivos Android, HLS costuma funcionar melhor que TS contínuo.
-                add("hls",hlsUrl); add("mpegts",url); add("native",url);
+                // URL assinada da M3U não permite trocar .ts por .m3u8.
+                if (/\.ts(?:[?#]|$)/i.test(url)) add("hls",hlsUrl);
+                add("mpegts",url); add("native",url);
             } else if (isTs) { add("mpegts",url); add("native",url); }
             else add("native",url);
             return choices;
@@ -2963,6 +3182,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             const u = document.getElementById("l-user").value.trim();
             const p = document.getElementById("l-pass").value.trim();
             const mac = getOrCreateMac();
+            if (!p && !(u.startsWith("http://") || u.startsWith("https://"))) {
+                alert("Informe a senha ou cole uma playlist M3U completa no usuário."); return;
+            }
             const r = await fetch("/api/login", { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({ username: u, password: p, mac: mac }) });
             const d = await r.json();
             if (!d.ok) {
@@ -3087,7 +3309,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     body:JSON.stringify({username:currentAuth.username,password:currentAuth.password,mac:getOrCreateMac()})});
                 const result = await login.json();
                 if (result.expired) { showExpiredCard(result.payment_link || currentAuth.payment_link); return false; }
-                if (!result.ok) return false;
+                if (!result.ok) {
+                    console.warn("Sessão não recuperada:", result.error || login.status);
+                    return false;
+                }
                 currentAuth = result;
                 localStorage.setItem("sf_session", JSON.stringify(result));
                 return true;
@@ -3274,7 +3499,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
 @app.route("/api/version")
 def api_version():
-    return jsonify({"name": "StreamFlix Pro", "version": "2026-11-10-integrado-monitoramento-v2"})
+    return jsonify({"name": "StreamFlix Pro", "version": "2026-11-11-restauracao-regressoes-v3.2"})
 
 @app.route("/")
 def index():
