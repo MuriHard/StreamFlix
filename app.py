@@ -15,7 +15,7 @@ import socket
 from urllib.parse import urljoin, urlsplit
 from flask import stream_with_context
 from datetime import datetime
-from flask import Flask, request, jsonify, render_template_string, session, Response
+from flask import Flask, request, jsonify, session, Response
 
 app = Flask(__name__)
 # Segredo persistente fora do código: cookies não podem ser forjados com uma senha pública.
@@ -3176,7 +3176,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                         tr.innerHTML = `
                             <td><strong>${escapeHtml(m.username)}</strong></td>
                             <td style="color:var(--gold);">▶ ${escapeHtml(m.content_title)}</td>
-                            <td><span class="monitor-status ${escapeHtml(m.playback_status || 'connecting')}">${{playing:'▶ Reproduzindo',connecting:'⏳ Conectando',paused:'⏸ Pausado',buffering:'⌛ Carregando',error:'⚠️ Falha'}[m.playback_status] || '⏳ Conectando'}</span></td>
+                            <td><span class="monitor-status ${escapeHtml(m.playback_status || 'connecting')}">${({playing:'▶ Reproduzindo',connecting:'⏳ Conectando',paused:'⏸ Pausado',buffering:'⌛ Carregando',error:'⚠️ Falha'})[m.playback_status] || '⏳ Conectando'}</span></td>
                             <td><span class="badge-live">${escapeHtml(m.elapsed_formatted)}</span></td>
                             <td>${escapeHtml(m.ip)}</td>
                             <td>${escapeHtml(m.location)}</td>
@@ -3278,11 +3278,11 @@ def api_version():
 
 @app.route("/")
 def index():
-    return Response(render_template_string(HTML_TEMPLATE), content_type="text/html; charset=utf-8", headers={"Cache-Control": "no-store, max-age=0"})
+    return Response(HTML_TEMPLATE, content_type="text/html; charset=utf-8", headers={"Cache-Control": "no-store, max-age=0"})
 
 @app.route("/admin")
 def admin_direct():
-    return Response(render_template_string(HTML_TEMPLATE), content_type="text/html; charset=utf-8", headers={"Cache-Control": "no-store, max-age=0"})
+    return Response(HTML_TEMPLATE, content_type="text/html; charset=utf-8", headers={"Cache-Control": "no-store, max-age=0"})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8095))
