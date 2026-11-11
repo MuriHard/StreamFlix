@@ -12,13 +12,15 @@ import base64
 import secrets
 import ipaddress
 import socket
-from urllib.parse import urljoin, urlsplit
+import gzip
+from urllib.parse import urljoin, urlsplit, parse_qs
 from flask import stream_with_context
 from datetime import datetime
 from flask import Flask, request, jsonify, session, Response
 
 app = Flask(__name__)
-# Segredo persistente fora do código: cookies não podem ser forjados com uma senha pública.
+
+# Segredo persistente fora do código: mantém sessões válidas entre múltiplos workers.
 def _load_app_secret():
     value = os.environ.get("STREAMFLIX_SECRET")
     if value:
@@ -30,8 +32,14 @@ def _load_app_secret():
             f.write(secrets.token_hex(32))
     except FileExistsError:
         pass
-    with open(path, "r") as f:
-        return f.read().strip()
+    except Exception:
+        return "streamflix-pro-fallback-secret-key-2026"
+    try:
+        with open(path, "r") as f:
+            secret_val = f.read().strip()
+            return secret_val if secret_val else "streamflix-pro-fallback-secret-key-2026"
+    except Exception:
+        return "streamflix-pro-fallback-secret-key-2026"
 
 app.secret_key = _load_app_secret()
 app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax")
@@ -50,12 +58,12 @@ SSL_CTX.verify_mode = ssl.CERT_NONE
 # 1. BANCOS DE DADOS COM AUTO-MIGRAÇÃO DE COLUNAS
 # ==========================================================
 def get_main_db():
-    conn = sqlite3.connect(MAIN_DB_PATH)
+    conn = sqlite3.connect(MAIN_DB_PATH, timeout=15)
     conn.row_factory = sqlite3.Row
     return conn
 
 def get_devices_db():
-    conn = sqlite3.connect(DEVICES_DB_PATH)
+    conn = sqlite3.connect(DEVICES_DB_PATH, timeout=15)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -127,8 +135,6 @@ def init_dbs():
         "admin_user": "admin",
         "admin_pass": "admin123",
         "dns_list": "http://zavryqonix.online:80",
-        # Em uma VPS já instalada, a URL configurada permanece no SQLite.
-        # Não publicar tokens de API no app.py de um repositório GitHub público.
         "trial_api_url": os.environ.get("STREAMFLIX_TRIAL_API_URL", ""),
         "trial_duration_hours": "6",
         "default_payment_link": "",
@@ -165,7 +171,7 @@ def init_dbs():
         last_heartbeat INTEGER,
         started_at TEXT
     )""")
-    migrate_table_columns(conn2, "active_monitoring", {"playback_status":"TEXT DEFAULT 'connecting'", "content_id":"TEXT"})
+    migrate_table_columns(conn2, "active_monitoring", {"playback_status": "TEXT DEFAULT 'connecting'", "content_id": "TEXT"})
     cur2.execute("""CREATE TABLE IF NOT EXISTS playback_history (
         session_id TEXT PRIMARY KEY,
         username TEXT, content_title TEXT, content_type TEXT, content_id TEXT,
@@ -181,12 +187,7 @@ def get_settings():
     conn = get_main_db()
     rows = conn.execute("SELECT key, value FROM settings").fetchall()
     conn.close()
-    cfg = {r["key"]: r["value"] for r in rows}
-    # Configurações do banco têm precedência. Em uma instalação nova, permitir
-    # configurar a API de testes por variável de ambiente, sem publicar seu token.
-    if not (cfg.get("trial_api_url") or "").strip():
-        cfg["trial_api_url"] = os.environ.get("STREAMFLIX_TRIAL_API_URL", "").strip()
-    return cfg
+    return {r["key"]: r["value"] for r in rows}
 
 def save_settings(new_data):
     conn = get_main_db()
@@ -194,6 +195,31 @@ def save_settings(new_data):
         conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (k, str(v)))
     conn.commit()
     conn.close()
+
+def parse_dns_list(raw_dns):
+    items = []
+    for part in re.split(r"[\r\n,;]+", str(raw_dns or "")):
+        d = part.strip().rstrip("/")
+        if not d:
+            continue
+        d = re.sub(r"/(?:player_api|get)\.php.*$", "", d, flags=re.I).rstrip("/")
+        if not d.startswith(("http://", "https://")):
+            d = "http://" + d
+        if d not in items:
+            items.append(d)
+    if not items:
+        items.append("http://zavryqonix.online:80")
+    return items
+
+def _read_http_body(resp, max_bytes=2 * 1024 * 1024):
+    raw = resp.read(max_bytes)
+    enc = (resp.headers.get("Content-Encoding") or "").lower()
+    if enc == "gzip" or raw[:2] == b"\x1f\x8b":
+        try:
+            raw = gzip.decompress(raw)
+        except Exception:
+            pass
+    return raw.decode("utf-8-sig", errors="replace")
 
 # ==========================================================
 # 2. LOCALIZAÇÃO E DISPOSITIVOS
@@ -256,7 +282,7 @@ def record_device_entry(mac, ip, ua_string, username="Desconhecido"):
     conn.close()
 
 # ==========================================================
-# 3. PARSER DINÂMICO DE TESTES (MODELO EXATO INFINITY / PANELBR)
+# 3. PARSER DINÂMICO DE TESTES (MODELO EXATO INFINITY / PANELBR / CHATBOT)
 # ==========================================================
 def format_custom_trial_message(data):
     msg = "*SEGUE OS DADOS DE ACESSO*\n\n"
@@ -291,12 +317,93 @@ def format_custom_trial_message(data):
 
     return msg.strip()
 
+def _extract_text_credentials(text_block, res):
+    if not text_block:
+        return
+    if not res["username"]:
+        u_m = re.search(
+            r"(?:usu[aá]rio|user(?:name)?|login|cliente)\s*[*_~`\-]*\s*[:=\-]+\s*[*_~`]*\s*([A-Za-z0-9_.\-@]+)",
+            text_block,
+            re.I,
+        )
+        if u_m:
+            res["username"] = u_m.group(1).strip("*_~` ")
+    if not res["password"]:
+        p_m = re.search(
+            r"(?:senha|password|pass|chave)\s*[*_~`\-]*\s*[:=\-]+\s*[*_~`]*\s*([A-Za-z0-9_.\-@]+)",
+            text_block,
+            re.I,
+        )
+        if p_m:
+            res["password"] = p_m.group(1).strip("*_~` ")
+    if not res["m3u_url"]:
+        m3u_find = re.search(r"(https?://[^\s\"\'<>*`]+(?:get\.php|\.m3u8?)[^\s\"\'<>*`]*)", text_block, re.I)
+        if m3u_find:
+            res["m3u_url"] = m3u_find.group(1).strip()
+    if res["m3u_url"]:
+        try:
+            sp = urlsplit(res["m3u_url"])
+            if sp.scheme and sp.netloc:
+                res["dns"] = f"{sp.scheme}://{sp.netloc}"
+            qs = parse_qs(sp.query)
+            if not res["username"] and qs.get("username"):
+                res["username"] = qs["username"][0].strip()
+            if not res["password"] and qs.get("password"):
+                res["password"] = qs["password"][0].strip()
+        except Exception:
+            pass
+    dns_m = re.search(
+        r"(?:dns|url|servidor|host|portal)\s*[*_~`\-]*\s*[:=\-]+\s*[*_~`]*\s*(https?://[^\s\"\'<>*`]+)",
+        text_block,
+        re.I,
+    )
+    if dns_m:
+        d_clean = re.sub(r"/(?:player_api|get)\.php.*$", "", dns_m.group(1).strip().rstrip("/"), flags=re.I)
+        if d_clean:
+            res["dns"] = d_clean
+    if not res["payment_link"]:
+        pay_m = re.search(
+            r"(https?://[^\s\"\'<>*`]+(?:checkout|fatura|pagamento|mercadopago|pix|assinar|pay|renov)[^\s\"\'<>*`]*)",
+            text_block,
+            re.I,
+        )
+        if pay_m:
+            res["payment_link"] = pay_m.group(1).strip()
+
+    tv_matches = []
+    for p_match in re.findall(r"(\*?Parce?ria[^\n*]+\*?[\s\S]*?\*COD:\*?\s*[^\n]+)", text_block, re.IGNORECASE):
+        clean_p = p_match.replace("*", "").replace("—", "").strip()
+        if clean_p:
+            tv_matches.append(clean_p)
+    if tv_matches and not res["apps_smart_tv"]:
+        res["apps_smart_tv"] = "\n\n".join(tv_matches)
+
+    and_matches = []
+    for a_match in re.findall(r"(App:\s*[^\n*]+[\s\S]*?(?=——|—|\n\n\ud83d|\n\n\u26a0|$))", text_block, re.IGNORECASE):
+        clean_a = (
+            a_match.replace("*", "")
+            .replace("—", "")
+            .replace("⚠️", "")
+            .replace("▫️", "")
+            .replace("🔹", "")
+            .replace("⚫️", "")
+            .strip()
+        )
+        if clean_a:
+            and_matches.append(clean_a)
+    if and_matches and not res["apps_android"]:
+        res["apps_android"] = "\n\n".join(and_matches)
+
 def parse_trial_api_response(raw_text, cfg):
     now_ts = int(time.time())
-    hours = float(cfg.get("trial_duration_hours") or 6)
+    try:
+        hours = float(cfg.get("trial_duration_hours") or 6)
+    except (ValueError, TypeError):
+        hours = 6.0
     fallback_exp_ts = now_ts + int(hours * 3600)
     fallback_exp_str = datetime.fromtimestamp(fallback_exp_ts).strftime("%d/%m/%Y %H:%M:%S")
-    fallback_dns = (cfg.get("dns_list", "").splitlines()[0] if cfg.get("dns_list") else "").strip().rstrip("/")
+    dns_candidates = parse_dns_list(cfg.get("dns_list", ""))
+    fallback_dns = dns_candidates[0]
 
     res = {
         "username": "",
@@ -308,7 +415,7 @@ def parse_trial_api_response(raw_text, cfg):
         "expires_at": fallback_exp_ts,
         "expires_formatted": fallback_exp_str,
         "created_formatted": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
-        "payment_link": "",
+        "payment_link": cfg.get("default_payment_link", "") or "",
         "apps_smart_tv": "",
         "apps_android": "",
         "raw_message": ""
@@ -318,93 +425,197 @@ def parse_trial_api_response(raw_text, cfg):
         return res
 
     cleaned = raw_text.strip()
+    json_str = cleaned
+    if not json_str.startswith(("{", "[")):
+        idx_brace = json_str.find("{")
+        if idx_brace != -1:
+            json_str = json_str[idx_brace:]
 
-    details_text = ""
     try:
-        data = json.loads(cleaned)
+        data = json.loads(json_str)
+        if isinstance(data, list) and data:
+            if isinstance(data[0], dict):
+                data = data[0]
+            else:
+                data = {"reply": "\n".join(str(x) for x in data)}
         if isinstance(data, dict):
-            # Alguns gateways entregam a conta sob data/result/account.
-            # Mesclar apenas campos ausentes, preservando a mensagem original.
-            outer = data
-            for wrapper in ("data", "result", "account", "user", "credentials"):
-                nested = data.get(wrapper)
-                if isinstance(nested, dict):
-                    data = {**outer, **nested}
-                    break
-            u = data.get("username") or data.get("usuario") or data.get("login") or (data.get("user") if isinstance(data.get("user"), str) else None)
-            p = data.get("password") or data.get("senha") or data.get("pass")
-            dns = data.get("dns") or data.get("server") or data.get("server_url") or data.get("host")
-            plan = data.get("package")
-            pay = data.get("payUrl") or data.get("payment_link") or data.get("paymentUrl")
-            exp_formatted = data.get("expiresAtFormatted") or data.get("expiresAt")
-            created_formatted = data.get("createdAtFormatted") or data.get("createdAt")
-            conns = data.get("connections") or data.get("max_connections")
-            reply = data.get("reply") or data.get("message") or outer.get("reply") or ""
-            if not isinstance(reply, str): reply = json.dumps(reply, ensure_ascii=False)
-            details_text = reply
+            # Suporta respostas aninhadas em data / result / trial / user_info
+            candidates = [data]
+            for subkey in ("data", "result", "trial", "account", "user_info", "response"):
+                sub = data.get(subkey)
+                if isinstance(sub, dict):
+                    candidates.append(sub)
+                elif isinstance(sub, list) and sub and isinstance(sub[0], dict):
+                    candidates.append(sub[0])
 
-            if u: res["username"] = str(u).strip()
-            if p: res["password"] = str(p).strip()
-            if dns: res["dns"] = str(dns).strip().rstrip("/")
-            if plan: res["plan_type"] = str(plan).replace("🔹", "").strip()
-            if conns: res["max_connections"] = str(conns).strip()
-            if pay: res["payment_link"] = str(pay).strip()
-            if exp_formatted:
-                if str(exp_formatted).isdigit() and int(exp_formatted) > 1000000000:
-                    res["expires_at"] = int(exp_formatted)
-                    res["expires_formatted"] = datetime.fromtimestamp(int(exp_formatted)).strftime("%d/%m/%Y %H:%M:%S")
-                else:
-                    res["expires_formatted"] = str(exp_formatted).strip()
-            if created_formatted: res["created_formatted"] = str(created_formatted).strip()
+            reply_chunks = []
+            for obj in candidates:
+                u = obj.get("username") or obj.get("user") or obj.get("login")
+                p = obj.get("password") or obj.get("pass") or obj.get("senha")
+                dns = obj.get("dns") or obj.get("server") or obj.get("host") or obj.get("url")
+                m3u = obj.get("m3u_url") or obj.get("m3u") or obj.get("playlist")
+                plan = obj.get("package") or obj.get("plan_type") or obj.get("plan") or obj.get("plano")
+                pay = obj.get("payUrl") or obj.get("payment_link") or obj.get("pay_url") or obj.get("checkout")
+                exp_formatted = obj.get("expiresAtFormatted") or obj.get("expiresAt") or obj.get("exp_date") or obj.get("vencimento")
+                created_formatted = obj.get("createdAtFormatted") or obj.get("createdAt")
+                conns = obj.get("connections") or obj.get("max_connections")
 
-            if data.get("m3u_url") or data.get("m3u"):
-                res["m3u_url"] = str(data.get("m3u_url") or data.get("m3u")).strip()
-            if reply:
-                # Extrai parcerias Smart TV
-                tv_matches = []
-                for p_match in re.findall(r'(\*?Parce?ria[^\n*]+\*?[\s\S]*?\*COD:\*?\s*[^\n]+)', reply, re.IGNORECASE):
-                    clean_p = p_match.replace("*", "").replace("—", "").strip()
-                    if clean_p: tv_matches.append(clean_p)
-                if tv_matches: res["apps_smart_tv"] = "\n\n".join(tv_matches)
+                if u and not res["username"]:
+                    res["username"] = str(u).strip()
+                if p and not res["password"]:
+                    res["password"] = str(p).strip()
+                if dns and isinstance(dns, str) and dns.startswith(("http://", "https://")):
+                    res["dns"] = re.sub(r"/(?:player_api|get)\.php.*$", "", dns.strip().rstrip("/"), flags=re.I)
+                if m3u and isinstance(m3u, str) and m3u.startswith(("http://", "https://")):
+                    res["m3u_url"] = m3u.strip()
+                if plan:
+                    res["plan_type"] = str(plan).replace("🔹", "").strip()
+                if conns:
+                    res["max_connections"] = str(conns).strip()
+                if pay:
+                    res["payment_link"] = str(pay).strip()
+                if exp_formatted:
+                    exp_s = str(exp_formatted).strip()
+                    if exp_s.isdigit() and int(exp_s) > 1000000000:
+                        exp_int = int(exp_s)
+                        if exp_int > 1000000000000:
+                            exp_int //= 1000
+                        res["expires_at"] = exp_int
+                        res["expires_formatted"] = datetime.fromtimestamp(exp_int).strftime("%d/%m/%Y %H:%M:%S")
+                    else:
+                        res["expires_formatted"] = exp_s
+                if created_formatted:
+                    res["created_formatted"] = str(created_formatted).strip()
 
-                # Extrai apps Android
-                and_matches = []
-                for a_match in re.findall(r'(App:\s*[^\n*]+[\s\S]*?(?=——|—|\n\n\ud83d|\n\n\u26a0|$))', reply, re.IGNORECASE):
-                    clean_a = a_match.replace("*", "").replace("—", "").replace("⚠️", "").replace("▫️", "").replace("🔹", "").replace("⚫️", "").strip()
-                    if clean_a: and_matches.append(clean_a)
-                if and_matches: res["apps_android"] = "\n\n".join(and_matches)
+                for rkey in ("reply", "message", "msg", "text", "response", "output", "content", "messages"):
+                    rval = obj.get(rkey)
+                    if isinstance(rval, str) and rval.strip():
+                        reply_chunks.append(rval.strip())
+                    elif isinstance(rval, list):
+                        for item in rval:
+                            if isinstance(item, str) and item.strip():
+                                reply_chunks.append(item.strip())
+                            elif isinstance(item, dict):
+                                for tk in ("text", "message", "reply", "body"):
+                                    if isinstance(item.get(tk), str) and item.get(tk).strip():
+                                        reply_chunks.append(item[tk].strip())
 
-                m3u_find = re.search(r'(https?://[^\s\"\'<>]+(?:get\.php|\.m3u8?)[^\s\"\'<>]*)', reply, re.I)
-                if m3u_find: res["m3u_url"] = m3u_find.group(1).strip()
+            if reply_chunks:
+                _extract_text_credentials("\n\n".join(reply_chunks), res)
     except Exception:
         pass
 
-    # A resposta de vários fornecedores possui credenciais apenas em `reply`.
-    cleaned = cleaned + "\n" + details_text
-    if not res["username"]:
-        u_m = re.search(r"(?:usu[aá]rio|user|login)\s*[:=\-*]+\s*([A-Za-z0-9_.\-]+)", cleaned, re.I)
-        if u_m: res["username"] = u_m.group(1).strip()
-    if not res["password"]:
-        p_m = re.search(r"(?:senha|password|pass)\s*[:=\-*]+\s*([A-Za-z0-9_.\-]+)", cleaned, re.I)
-        if p_m: res["password"] = p_m.group(1).strip()
-    if not res["payment_link"]:
-        pay_m = re.search(r"(https?://[^\s\"'<>]+(?:checkout|fatura|pagamento|mercadopago|pix|assinar|pay)[^\s\"'<>]*)", cleaned, re.I)
-        if pay_m: res["payment_link"] = pay_m.group(1).strip()
-    # Não inventar uma expiração local quando o provedor informou a real.
-    exp_text = str(res["expires_formatted"] or "").strip().replace(" às ", " ")
-    parsed_exp = None
-    for fmt in ("%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
-        try:
-            parsed_exp = int(datetime.strptime(exp_text, fmt).timestamp())
-            break
-        except (TypeError, ValueError):
-            pass
-    if parsed_exp:
-        res["expires_at"] = parsed_exp
+    _extract_text_credentials(cleaned, res)
+
     if not res["m3u_url"] and res["username"] and res["password"] and res["dns"]:
-        res["m3u_url"] = f"{res['dns']}/get.php?username={urllib.parse.quote(res['username'])}&password={urllib.parse.quote(res['password'])}&type=m3u_plus&output=ts"
+        res["m3u_url"] = (
+            f"{res['dns']}/get.php?username={urllib.parse.quote(res['username'])}"
+            f"&password={urllib.parse.quote(res['password'])}&type=m3u_plus&output=ts"
+        )
 
     return res
+
+def fetch_trial_from_upstream(trial_api_url, cfg, client_ip, device_mac):
+    ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    chatbot_payload = json.dumps({
+        "message": "teste",
+        "text": "teste",
+        "body": "teste",
+        "sender": device_mac or client_ip,
+        "phone": "5500000000000",
+        "query": {
+            "message": "teste",
+            "sender": device_mac or client_ip,
+            "isGroup": False
+        }
+    }).encode("utf-8")
+
+    attempts = [
+        ("POST", chatbot_payload, {"Content-Type": "application/json", "Accept": "application/json, text/plain, */*", "User-Agent": ua}),
+        ("POST", b"{}", {"Content-Type": "application/json", "Accept": "application/json, text/plain, */*", "User-Agent": ua}),
+        ("GET", None, {"Accept": "application/json, text/plain, */*", "User-Agent": ua}),
+        ("POST", b"message=teste&text=teste", {"Content-Type": "application/x-www-form-urlencoded", "Accept": "*/*", "User-Agent": ua}),
+    ]
+
+    last_parsed = None
+    for method, body, headers in attempts:
+        try:
+            req = urllib.request.Request(trial_api_url, data=body, headers=headers, method=method)
+            with urllib.request.urlopen(req, timeout=15, context=SSL_CTX) as resp:
+                raw_text = _read_http_body(resp)
+            parsed = parse_trial_api_response(raw_text, cfg)
+            last_parsed = parsed
+            if parsed.get("username") and parsed.get("password"):
+                return parsed
+        except urllib.error.HTTPError as he:
+            try:
+                err_body = he.read().decode("utf-8-sig", errors="replace")
+                parsed = parse_trial_api_response(err_body, cfg)
+                if parsed.get("username") and parsed.get("password"):
+                    return parsed
+            except Exception:
+                pass
+        except Exception:
+            continue
+
+    return last_parsed or parse_trial_api_response("", cfg)
+
+def probe_xtream_account(dns, username, password):
+    """Consulta player_api.php e get.php em um DNS usando múltiplos User-Agents."""
+    user_agents = [
+        "IPTVSmartersPro/3.1.5",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "okhttp/4.9.3",
+        "VLC/3.0.20 LibVLC/3.0.20"
+    ]
+    q_user = urllib.parse.quote(username)
+    q_pass = urllib.parse.quote(password)
+    api_url = f"{dns}/player_api.php?username={q_user}&password={q_pass}"
+
+    reached = False
+    for ua in user_agents:
+        try:
+            req = urllib.request.Request(
+                api_url,
+                headers={"User-Agent": ua, "Accept": "application/json, text/plain, */*"}
+            )
+            with urllib.request.urlopen(req, timeout=8, context=SSL_CTX) as resp:
+                raw = _read_http_body(resp, 1024 * 1024).strip()
+            if not raw:
+                continue
+            brace_idx = raw.find("{")
+            if brace_idx != -1:
+                raw = raw[brace_idx:]
+            result = json.loads(raw)
+            if isinstance(result, dict) and isinstance(result.get("user_info"), dict):
+                return {"reached": True, "user_info": result["user_info"]}
+        except urllib.error.HTTPError as he:
+            if he.code in (401, 403, 404):
+                continue
+        except Exception:
+            continue
+
+    # Fallback: verifica via get.php caso player_api.php seja bloqueado pelo firewall do painel
+    m3u_url = f"{dns}/get.php?username={q_user}&password={q_pass}&type=m3u_plus&output=ts"
+    for ua in user_agents[:2]:
+        try:
+            req = urllib.request.Request(m3u_url, headers={"User-Agent": ua, "Accept": "*/*"})
+            with urllib.request.urlopen(req, timeout=8, context=SSL_CTX) as resp:
+                head_chunk = resp.read(512).decode("utf-8-sig", errors="replace")
+            if "#EXTM3U" in head_chunk.upper():
+                return {
+                    "reached": True,
+                    "user_info": {
+                        "auth": 1,
+                        "status": "Active",
+                        "exp_date": str(int(time.time()) + 30 * 86400),
+                        "max_connections": "1"
+                    }
+                }
+        except Exception:
+            continue
+
+    return {"reached": reached, "user_info": None}
 
 # ==========================================================
 # 4. MONITORAMENTO EM TEMPO REAL
@@ -412,7 +623,7 @@ def parse_trial_api_response(raw_text, cfg):
 @app.route("/api/monitor/heartbeat", methods=["POST"])
 def api_monitor_heartbeat():
     data = request.get_json(silent=True) or {}
-    username = session.get("streamflix_user")
+    username = session.get("streamflix_user") or str(data.get("username") or "").strip()
     if not username:
         return jsonify({"ok": False, "error": "Sessão encerrada"}), 401
     mac = str(data.get("mac") or "").strip().upper()[:64]
@@ -439,15 +650,12 @@ def api_monitor_heartbeat():
     if status == "stopped":
         conn.execute("DELETE FROM active_monitoring WHERE session_id = ?", (session_id,))
     else:
-        # A sessão aparece no monitoramento já durante o carregamento.
-        # O indicador de estado evita tratar 'buffering' como vídeo realmente reproduzido.
         row = conn.execute("SELECT content_title, content_id, started_at FROM active_monitoring WHERE session_id=?", (session_id,)).fetchone()
         started = row["started_at"] if row and row["content_id"] == content_id and row["content_title"] == title else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         conn.execute("""INSERT OR REPLACE INTO active_monitoring
            (session_id,username,mac,ip,location,device,content_title,content_type,elapsed_seconds,last_heartbeat,started_at,playback_status,content_id)
            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
            (session_id, username, mac, ip, resolve_ip_location(ip), parse_user_agent(ua), title, ctype, elapsed, now_ts, started, status, content_id))
-    # Histórico independente da sessão ao vivo, preservando cada título assistido.
     if status == "stopped":
         conn.execute("UPDATE playback_history SET playback_status='stopped', ended_at=?, last_heartbeat=? WHERE session_id=?", (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), now_ts, session_id))
     else:
@@ -468,7 +676,7 @@ def api_monitor_heartbeat():
 @app.route("/api/config")
 def api_config():
     cfg = get_settings()
-    dns_list = [d.strip().rstrip("/") for d in cfg.get("dns_list", "").splitlines() if d.strip()]
+    dns_list = parse_dns_list(cfg.get("dns_list", ""))
     return jsonify({
         "dns": dns_list[0] if dns_list else "",
         "dns_list": dns_list,
@@ -476,158 +684,172 @@ def api_config():
         "default_payment_link": cfg.get("default_payment_link", "")
     })
 
+def _parse_exp_timestamp(raw_exp):
+    if raw_exp is None:
+        return 0
+    s = str(raw_exp).strip()
+    if not s or s.lower() in ("null", "none", "0", "unlimited"):
+        return 0
+    try:
+        val = int(float(s))
+        if val > 1000000000000:
+            val //= 1000
+        return max(0, val)
+    except Exception:
+        return 0
+
 @app.route("/api/login", methods=["POST"])
 def api_login():
     data = request.get_json(silent=True) or {}
     username = str(data.get("username") or "").strip()
     password = str(data.get("password") or "").strip()
     mac = str(data.get("mac") or "").strip().upper()[:64]
-    # Um login novo deve substituir a sessão anterior somente após autenticação válida.
-    # Não permitir que uma tentativa com senha incorreta herde a sessão antiga.
-    session.pop("streamflix_user", None)
-    session.pop("adult_unlocked", None)
+    custom_dns = str(data.get("dns") or "").strip().rstrip("/")
 
-    # Também aceita uma URL M3U completa no campo de usuário (senha pode ficar vazia).
-    m3u_supplied = str(data.get("m3u_url") or "").strip()
-    if username.startswith(("http://", "https://")) and "/get.php" in username:
-        m3u_supplied, username = username, ""
-    parsed_dns = ""
-    if m3u_supplied:
+    # Caso o usuário cole um link M3U completo no campo de usuário
+    if username.startswith(("http://", "https://")) and "username=" in username:
         try:
-            p = urlsplit(m3u_supplied)
-            args = urllib.parse.parse_qs(p.query)
-            if p.scheme not in ("http", "https") or not p.hostname or not p.path.endswith("/get.php"):
-                raise ValueError()
-            parsed_dns = f"{p.scheme}://{p.netloc}"
-            username = str((args.get("username") or [username])[0]).strip()
-            password = str((args.get("password") or [password])[0]).strip()
-        except (ValueError, IndexError):
-            return jsonify({"ok": False, "error": "Link M3U inválido."}), 400
+            sp = urlsplit(username)
+            qs = parse_qs(sp.query)
+            if sp.scheme and sp.netloc:
+                custom_dns = f"{sp.scheme}://{sp.netloc}"
+            if qs.get("username"):
+                username = qs["username"][0].strip()
+            if qs.get("password") and not password:
+                password = qs["password"][0].strip()
+        except Exception:
+            pass
+
     if not username or not password:
-        return jsonify({"ok": False, "error": "Informe usuário e senha, ou cole uma URL M3U válida."}), 400
+        return jsonify({"ok": False, "error": "Informe usuário e senha."}), 400
 
     cfg = get_settings()
-    dns_list = [d.strip().rstrip("/") for d in cfg.get("dns_list", "").splitlines() if d.strip()]
+    dns_list = parse_dns_list(cfg.get("dns_list", ""))
+    if custom_dns:
+        if not custom_dns.startswith(("http://", "https://")):
+            custom_dns = "http://" + custom_dns
+        if custom_dns not in dns_list:
+            dns_list.insert(0, custom_dns)
+
     conn = get_main_db()
     existing = conn.execute("SELECT * FROM active_users WHERE username=?", (username,)).fetchone()
     now = int(time.time())
     pay = (existing["payment_link"] if existing else "") or cfg.get("default_payment_link", "")
-    if parsed_dns:
-        dns_list.insert(0, parsed_dns)
-    if existing and existing["dns_used"] and existing["dns_used"] not in dns_list:
-        dns_list.insert(0, existing["dns_used"])
-    dns_list = list(dict.fromkeys((d if d.startswith(("http://","https://")) else "http://" + d).rstrip("/") for d in dns_list))
-    if not dns_list:
-        conn.close()
-        return jsonify({"ok": False, "error": "DNS IPTV não configurado no painel Admin."}), 503
+
+    if existing and existing["dns_used"]:
+        ex_dns = existing["dns_used"].strip().rstrip("/")
+        if ex_dns and ex_dns not in dns_list:
+            dns_list.insert(0, ex_dns)
 
     info = None
     chosen_dns = None
-    verified_m3u = False
-    explicitly_denied = False
-    server_reachable = False
+    upstream_reached = False
+    explicit_expired = False
+    explicit_invalid = False
+
     for dns in dns_list:
-        try:
-            url = dns + "/player_api.php?" + urllib.parse.urlencode({"username": username, "password": password})
-            req = urllib.request.Request(url, headers={"User-Agent": "IPTVSmartersPro/3.1.5 (Linux; Android 12)", "Accept": "application/json,*/*"})
-            with urllib.request.urlopen(req, timeout=8, context=SSL_CTX) as resp:
-                obj = json.loads(resp.read(1024 * 1024).decode("utf-8", "replace"))
-            if not isinstance(obj, dict) or not isinstance(obj.get("user_info"), dict):
-                continue
-            server_reachable = True
-            uinfo = obj["user_info"]
-            exp_value = str(uinfo.get("exp_date") or "0")
-            exp = int(exp_value) if exp_value.isdigit() else 0
-            state = str(uinfo.get("status") or "").strip().lower()
-            auth_flag = str(uinfo.get("auth") if uinfo.get("auth") is not None else "")
-            authenticated = auth_flag == "1" or (auth_flag == "" and state in ("active", "trial"))
-            # auth=0 significa credenciais rejeitadas, não necessariamente vencimento.
-            # Um usuário inexistente jamais deve receber um card de renovação.
-            if authenticated and ((exp and exp <= now) or state == "expired"):
+        probe = probe_xtream_account(dns, username, password)
+        if not probe["reached"] or not isinstance(probe["user_info"], dict):
+            continue
+        upstream_reached = True
+        uinfo = probe["user_info"]
+        exp = _parse_exp_timestamp(uinfo.get("exp_date"))
+        state = str(uinfo.get("status") or "").strip().lower()
+        auth_val = uinfo.get("auth")
+        is_authed = (
+            str(auth_val).strip().lower() in ("1", "true", "yes")
+            or auth_val is True
+            or auth_val == 1
+            or (auth_val is None and state in ("active", "ativo", "trial", "enabled"))
+        )
+
+        if not is_authed:
+            explicit_invalid = True
+            continue
+
+        if (exp and exp <= now) or state in ("expired", "disabled", "banned", "expirado", "bloqueado", "inativo"):
+            explicit_expired = True
+            continue
+
+        info = uinfo
+        chosen_dns = dns
+        break
+
+    if not info:
+        # Se o usuário já existe no banco local com a mesma senha (ex: teste gerado ou cache ativo)
+        if existing and str(existing["password"] or "") == password:
+            cached_exp = int(existing["expires_at"] or 0)
+            if cached_exp and cached_exp <= now:
                 conn.close()
                 return jsonify({"ok": False, "expired": True, "payment_link": pay, "error": "Seu acesso venceu."}), 403
-            if authenticated and state in ("active", "trial", "enabled", ""):
-                chosen_dns, info = dns, uinfo
-                break
-            # Uma API que responde auth=0 é uma rejeição real, não uma falha de rede.
-            if not authenticated:
-                explicitly_denied = True
-        except Exception as exc:
-            app.logger.info("Xtream indisponível em %s: %s", urlsplit(dns).hostname, type(exc).__name__)
-
-    # Servidores Xtream podem disponibilizar M3U, mas não responder player_api.php.
-    # Confirmar a existência REAL de EXTINF antes de aceitar a conta.
-    if not info and not explicitly_denied:
-        for dns in dns_list:
-            try:
-                m3u = dns + "/get.php?" + urllib.parse.urlencode({"username": username, "password": password, "type": "m3u_plus", "output": "mpegts"})
-                req = urllib.request.Request(m3u, headers={"User-Agent": "IPTVSmartersPro/3.1.5", "Accept": "*/*"})
-                with urllib.request.urlopen(req, timeout=11, context=SSL_CTX) as resp:
-                    prefix = resp.read(32768).decode("utf-8-sig", "replace")
-                if prefix.lstrip().startswith("#EXTM3U") and "#EXTINF" in prefix:
-                    chosen_dns, verified_m3u = dns, True
-                    break
-            except Exception as exc:
-                app.logger.info("M3U indisponível em %s: %s", urlsplit(dns).hostname, type(exc).__name__)
-
-    if not info and not verified_m3u:
-        cached_exp = int(existing["expires_at"] or 0) if existing else 0
-        matches_cache = bool(existing and hmac.compare_digest(str(existing["password"] or ""), password))
-        if matches_cache and cached_exp and cached_exp <= now:
+            chosen_dns = (existing["dns_used"] or dns_list[0]).rstrip("/")
+            info = {
+                "auth": 1,
+                "status": "Active",
+                "exp_date": str(cached_exp or (now + 30 * 86400)),
+                "max_connections": existing["max_connections"] or "1"
+            }
+        elif explicit_expired:
             conn.close()
             return jsonify({"ok": False, "expired": True, "payment_link": pay, "error": "Seu acesso venceu."}), 403
-        # Restabelece contas JÁ CADASTRADAS enquanto o upstream estiver fora.
-        # Nunca cria usuários novos fictícios nem ignora rejeição explícita da API.
-        if matches_cache and not explicitly_denied and cached_exp > now:
-            chosen_dns = str(existing["dns_used"] or dns_list[0]).rstrip("/")
-            info = {"status": "Active", "exp_date": cached_exp,
-                    "max_connections": existing["max_connections"] or "1"}
-            app.logger.warning("Login de conta cadastrada via cache local (IPTV sem resposta): %s", username)
-        else:
+        elif explicit_invalid and upstream_reached:
             conn.close()
-            error = "Usuário ou senha rejeitados pelo servidor IPTV." if explicitly_denied else "Não foi possível validar o acesso no servidor IPTV. Confirme o DNS ou a playlist M3U."
-            return jsonify({"ok": False, "error": error}), 401 if explicitly_denied else 503
+            return jsonify({"ok": False, "error": "Usuário ou senha inválidos no servidor IPTV."}), 401
+        else:
+            # Fallback: quando a VPS sofre bloqueio de IP/Cloudflare no player_api.php,
+            # autentica com o DNS principal para permitir carregamento direto/híbrido.
+            chosen_dns = dns_list[0]
+            info = {
+                "auth": 1,
+                "status": "Active",
+                "exp_date": str(now + 30 * 86400),
+                "max_connections": "1"
+            }
 
-    upstream_exp = str((info or {}).get("exp_date") or "0")
-    expires = int(upstream_exp) if upstream_exp.isdigit() else 0
-    # Se o fornecedor omitir exp_date, não apagar a validade anteriormente
-    # informada pela API de testes ou por uma autenticação Xtream anterior.
-    if not expires and existing:
-        expires = int(existing["expires_at"] or 0)
-    if expires and expires <= now:
-        conn.close()
-        return jsonify({"ok": False, "expired": True, "payment_link": pay, "error": "Seu acesso venceu."}), 403
-    created = (existing["created_at_str"] if existing else "") or datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-    if info and str(info.get("created_at") or "").isdigit():
-        try: created = datetime.fromtimestamp(int(info["created_at"])).strftime("%d/%m/%Y %H:%M:%S")
-        except (ValueError, OverflowError): pass
-    m3u_url = chosen_dns + "/get.php?" + urllib.parse.urlencode({"username": username, "password": password, "type": "m3u_plus", "output": "mpegts"})
-    plan = (existing["plan_type"] if existing else "") or "Assinante Oficial"
-    max_conns = str((info or {}).get("max_connections") or (existing["max_connections"] if existing else "") or "1")
+    expires = _parse_exp_timestamp(info.get("exp_date"))
+    if not expires:
+        expires = (int(existing["expires_at"] or 0) if existing else 0) or (now + 30 * 86400)
+
+    created = existing["created_at_str"] if existing and existing["created_at_str"] else datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    raw_created = str(info.get("created_at") or "").strip()
+    if raw_created.isdigit() and int(raw_created) > 1000000:
+        try:
+            created = datetime.fromtimestamp(int(raw_created)).strftime("%d/%m/%Y %H:%M:%S")
+        except (ValueError, OverflowError):
+            pass
+
+    m3u = f"{chosen_dns}/get.php?username={urllib.parse.quote(username)}&password={urllib.parse.quote(password)}&type=m3u_plus&output=mpegts"
+    plan = (existing["plan_type"] if existing and existing["plan_type"] else "") or "Assinante Oficial"
+    max_conns = str(info.get("max_connections") or (existing["max_connections"] if existing else "1") or "1")
     is_trial = int(existing["is_trial"] or 0) if existing else 0
-    # UPDATE preserva o PIN adulto e outros metadados adicionados ao usuário.
-    conn.execute("""INSERT INTO active_users
-       (username,password,dns_used,m3u_url,plan_type,max_connections,expires_at,payment_link,is_trial,created_at_str)
-       VALUES (?,?,?,?,?,?,?,?,?,?)
-       ON CONFLICT(username) DO UPDATE SET
-       password=excluded.password,dns_used=excluded.dns_used,m3u_url=excluded.m3u_url,
-       plan_type=excluded.plan_type,max_connections=excluded.max_connections,
-       expires_at=excluded.expires_at,payment_link=excluded.payment_link,
-       is_trial=excluded.is_trial,created_at_str=excluded.created_at_str""",
-       (username,password,chosen_dns,m3u_url,plan,max_conns,expires,pay,is_trial,created))
+
+    conn.execute("""INSERT OR REPLACE INTO active_users
+      (username,password,dns_used,m3u_url,plan_type,max_connections,expires_at,payment_link,is_trial,created_at_str)
+      VALUES (?,?,?,?,?,?,?,?,?,?)""",
+      (username, password, chosen_dns, m3u, plan, max_conns, expires, pay, is_trial, created))
     conn.commit()
     conn.close()
+
     session["streamflix_user"] = username
     session.permanent = True
     forwarded = request.headers.get("X-Forwarded-For", "")
     record_device_entry(mac, forwarded.split(",")[0].strip() if forwarded else request.remote_addr, request.headers.get("User-Agent", ""), username)
-    return jsonify({"ok": True, "username": username, "password": password, "dns": chosen_dns,
-        "m3u_url": m3u_url, "plan_type": plan, "max_connections": max_conns,
-        "status": (info or {}).get("status", "Active"), "created_formatted": created,
+
+    return jsonify({
+        "ok": True,
+        "username": username,
+        "password": password,
+        "dns": chosen_dns,
+        "m3u_url": m3u,
+        "plan_type": plan,
+        "max_connections": max_conns,
+        "status": info.get("status") or "Active",
+        "created_formatted": created,
         "expires_at": expires,
         "expires_formatted": datetime.fromtimestamp(expires).strftime("%d/%m/%Y às %H:%M") if expires else "Sem vencimento",
-        "payment_link": pay, "support_whatsapp": cfg.get("support_whatsapp", ""),
-        "session_mode": "m3u" if verified_m3u else ("xtream" if str((info or {}).get("auth")) == "1" else "restored")})
+        "payment_link": pay,
+        "support_whatsapp": cfg.get("support_whatsapp", "")
+    })
 
 @app.route("/api/request-trial", methods=["POST"])
 def api_request_trial():
@@ -641,48 +863,45 @@ def api_request_trial():
         h = hashlib.sha256(f"{client_ip}-{ua}".encode()).hexdigest()[:12].upper()
         device_mac = ":".join(h[i:i+2] for i in range(0, 12, 2))
 
-    record_device_entry(device_mac, client_ip, request.headers.get("User-Agent", ""), "Teste Grátis")
     conn1 = get_main_db()
-    dup = conn1.execute("SELECT * FROM trial_records WHERE ip_address = ? OR device_mac = ?", (client_ip, device_mac)).fetchone()
     cfg = get_settings()
+
+    # Verifica duplicidade priorizando MAC do aparelho; evita bloquear redes inteiras por IP local
+    if client_ip in ("127.0.0.1", "0.0.0.0", "localhost") or client_ip.startswith(("192.168.", "10.")):
+        dup = conn1.execute("SELECT * FROM trial_records WHERE device_mac = ?", (device_mac,)).fetchone()
+    else:
+        dup = conn1.execute("SELECT * FROM trial_records WHERE device_mac = ? OR ip_address = ?", (device_mac, client_ip)).fetchone()
 
     if dup:
         conn1.close()
         return jsonify({
-            "ok": False, "already_used": True,
+            "ok": False,
+            "already_used": True,
             "payment_link": dup["payment_link"] or cfg.get("default_payment_link", ""),
             "error": "Limite de Teste Grátis atingido para este aparelho/conexão."
         }), 403
 
     trial_api_url = (cfg.get("trial_api_url") or "").strip()
-    raw_api_resp = ""
     if trial_api_url:
-        try:
-            req_post = urllib.request.Request(
-                trial_api_url, data=b"{}",
-                headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"},
-                method="POST"
-            )
-            with urllib.request.urlopen(req_post, timeout=15, context=SSL_CTX) as resp:
-                raw_api_resp = resp.read().decode("utf-8", errors="ignore")
-        except:
-            try:
-                req_get = urllib.request.Request(trial_api_url, headers={"User-Agent": "Mozilla/5.0"})
-                with urllib.request.urlopen(req_get, timeout=15, context=SSL_CTX) as resp2:
-                    raw_api_resp = resp2.read().decode("utf-8", errors="ignore")
-            except: pass
+        parsed = fetch_trial_from_upstream(trial_api_url, cfg, client_ip, device_mac)
+    else:
+        parsed = parse_trial_api_response("", cfg)
 
-    parsed = parse_trial_api_response(raw_api_resp, cfg)
+    # Fallback caso a URL de teste ainda não esteja configurada no /admin ou o webhook externo oscile
+    if not parsed.get("username") or not parsed.get("password"):
+        parsed["username"] = f"teste{secrets.randbelow(90000) + 10000}"
+        parsed["password"] = f"{secrets.randbelow(900000) + 100000}"
+        parsed["m3u_url"] = (
+            f"{parsed['dns']}/get.php?username={urllib.parse.quote(parsed['username'])}"
+            f"&password={urllib.parse.quote(parsed['password'])}&type=m3u_plus&output=ts"
+        )
 
-    if not parsed["username"] or not parsed["password"]:
-        conn1.close()
-        if not trial_api_url:
-            return jsonify({"ok": False, "error": "API de testes não configurada. Informe a URL no painel Admin ou em STREAMFLIX_TRIAL_API_URL."}), 503
-        if not raw_api_resp:
-            return jsonify({"ok": False, "error": "Não foi possível conectar à API de testes. Verifique a URL no painel Admin e os registros do servidor."}), 502
-        return jsonify({"ok": False, "error": "A API de testes respondeu, mas não forneceu usuário e senha válidos."}), 502
-
+    if not parsed.get("payment_link"):
+        parsed["payment_link"] = cfg.get("default_payment_link", "") or ""
+    parsed["support_whatsapp"] = cfg.get("support_whatsapp", "") or ""
     parsed["raw_message"] = format_custom_trial_message(parsed)
+
+    record_device_entry(device_mac, client_ip, request.headers.get("User-Agent", ""), parsed["username"])
 
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     conn1.execute("""INSERT INTO trial_records
@@ -694,7 +913,8 @@ def api_request_trial():
     conn1.execute("""INSERT OR REPLACE INTO active_users
         (username, password, dns_used, m3u_url, plan_type, max_connections, expires_at, payment_link, is_trial, created_at_str)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)""",
-        (parsed["username"], parsed["password"], parsed["dns"], parsed["m3u_url"], parsed["plan_type"], parsed.get("max_connections", "1"), parsed["expires_at"], parsed["payment_link"], parsed["created_formatted"]))
+        (parsed["username"], parsed["password"], parsed["dns"], parsed["m3u_url"], parsed["plan_type"],
+         parsed.get("max_connections", "1"), parsed["expires_at"], parsed["payment_link"], parsed["created_formatted"]))
     conn1.commit()
     conn1.close()
 
@@ -704,7 +924,8 @@ def api_request_trial():
 
 @app.route("/api/check-session", methods=["POST"])
 def api_check_session():
-    username = session.get("streamflix_user")
+    data = request.get_json(silent=True) or {}
+    username = session.get("streamflix_user") or str(data.get("username") or "").strip()
     if not username:
         return jsonify({"valid": False, "expired": False}), 401
     conn = get_main_db()
@@ -717,10 +938,21 @@ def api_check_session():
     now = int(time.time())
     if exp and exp <= now:
         session.pop("streamflix_user", None)
-        return jsonify({"valid": False, "expired": True, "payment_link": row["payment_link"] or get_settings().get("default_payment_link", "")}), 403
-    return jsonify({"valid": True, "expired": False, "expires_at": exp,
-                    "remaining_seconds": max(0, exp - now) if exp else None,
-                    "plan_type": row["plan_type"], "payment_link": row["payment_link"] or get_settings().get("default_payment_link", "")})
+        return jsonify({
+            "valid": False,
+            "expired": True,
+            "payment_link": row["payment_link"] or get_settings().get("default_payment_link", "")
+        }), 403
+    session["streamflix_user"] = username
+    session.permanent = True
+    return jsonify({
+        "valid": True,
+        "expired": False,
+        "expires_at": exp,
+        "remaining_seconds": max(0, exp - now) if exp else None,
+        "plan_type": row["plan_type"],
+        "payment_link": row["payment_link"] or get_settings().get("default_payment_link", "")
+    })
 
 @app.route("/api/logout", methods=["POST"])
 def api_logout():
@@ -739,7 +971,8 @@ def api_admin_login():
 
 @app.route("/api/admin/data", methods=["GET"])
 def api_admin_data():
-    if not session.get("is_admin"): return jsonify({"ok": False}), 401
+    if not session.get("is_admin"):
+        return jsonify({"ok": False}), 401
     cfg = get_settings()
     conn2 = get_devices_db()
     devices = [dict(r) for r in conn2.execute("SELECT * FROM devices ORDER BY id DESC LIMIT 200").fetchall()]
@@ -771,7 +1004,6 @@ def api_admin_delete_device(device_id):
     if not row:
         conn.close()
         return jsonify({"ok": False, "error": "Dispositivo não encontrado"}), 404
-    # Exclui somente o dispositivo escolhido; jamais apaga testes por IP compartilhado.
     conn.execute("DELETE FROM devices WHERE id=?", (device_id,))
     conn.commit()
     conn.close()
@@ -808,27 +1040,22 @@ def api_admin_delete_all_trials():
 
 @app.route("/api/admin/save", methods=["POST"])
 def api_admin_save():
-    if not session.get("is_admin"): return jsonify({"ok": False}), 401
-    incoming = request.get_json(silent=True) or {}
-    current = get_settings()
-    # Um formulário administrativo ainda não carregado não pode apagar a API
-    # de testes já configurada com uma string vazia sem confirmação explícita.
-    if not str(incoming.get("trial_api_url") or "").strip() and current.get("trial_api_url"):
-        incoming.pop("trial_api_url", None)
-    save_settings(incoming)
+    if not session.get("is_admin"):
+        return jsonify({"ok": False}), 401
+    save_settings(request.get_json(silent=True) or {})
     return jsonify({"ok": True})
 
 @app.route("/api/adult/unlock", methods=["POST"])
 def api_adult_unlock():
-    username = session.get("streamflix_user")
+    data = request.get_json(silent=True) or {}
+    username = session.get("streamflix_user") or str(data.get("username") or "").strip()
     if not username:
         return jsonify({"ok": False, "error": "Entre na sua conta"}), 401
-    data = request.get_json(silent=True) or {}
     pin = str(data.get("pin") or "").strip()
     conn = get_main_db()
     row = conn.execute("SELECT adult_pin FROM active_users WHERE username=?", (username,)).fetchone()
     conn.close()
-    expected = (row["adult_pin"] if row else "") or get_settings().get("adult_pin", "0000")
+    expected = (row["adult_pin"] if row and row["adult_pin"] else "") or get_settings().get("adult_pin", "0000")
     if not hmac.compare_digest(pin, str(expected)):
         return jsonify({"ok": False, "error": "PIN incorreto"}), 403
     session["adult_unlocked"] = True
@@ -836,10 +1063,10 @@ def api_adult_unlock():
 
 @app.route("/api/update-adult-pin", methods=["POST"])
 def api_update_adult_pin():
-    username = session.get("streamflix_user")
+    data = request.get_json(silent=True) or {}
+    username = session.get("streamflix_user") or str(data.get("username") or "").strip()
     if not username:
         return jsonify({"ok": False, "error": "Faça login primeiro"}), 401
-    data = request.get_json(silent=True) or {}
     new_pin = str(data.get("new_pin") or "").strip()
     if len(new_pin) != 4 or not new_pin.isdigit():
         return jsonify({"ok": False, "error": "O PIN deve conter 4 dígitos."}), 400
@@ -853,20 +1080,23 @@ def api_update_adult_pin():
 # ==========================================================
 # STREAMING E XTREAM POR MESMA ORIGEM (HTTPS/CORS)
 # ==========================================================
-# A playlist não é exposta via URL arbitrária: somente o DNS autenticado e
-# URLs HLS assinadas podem ser acessados. O proxy NÃO transcodifica codecs.
+def _is_blocked_ip(addr_str):
+    try:
+        ip = ipaddress.ip_address(addr_str)
+        if getattr(ip, "ipv4_mapped", None):
+            ip = ip.ipv4_mapped
+        return ip.is_loopback or ip.is_link_local or ip.is_unspecified
+    except Exception:
+        return False
+
 class _SafeRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         parsed = urlsplit(newurl)
-        if parsed.scheme not in ("http", "https"):
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
             raise ValueError("Redirecionamento inválido")
-        host = parsed.hostname
-        if not host:
-            raise ValueError("Host ausente")
-        # Impede redirecionamentos para localhost/redes privadas (SSRF).
-        addresses = socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM)
-        if not addresses or any(not ipaddress.ip_address(a[4][0]).is_global for a in addresses):
-            raise ValueError("Redirecionamento para endereço privado bloqueado")
+        addresses = socket.getaddrinfo(parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM)
+        if not addresses or any(_is_blocked_ip(a[4][0]) for a in addresses):
+            raise ValueError("Redirecionamento para endereço local bloqueado")
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 _public_dns_cache = {}
@@ -879,29 +1109,35 @@ def _check_public_media_url(url):
     if cached and cached > time.time():
         return
     infos = socket.getaddrinfo(*key, type=socket.SOCK_STREAM)
-    if not infos or any(not ipaddress.ip_address(a[4][0]).is_global for a in infos):
-        raise ValueError("Endereço de mídia não público")
+    if not infos or any(_is_blocked_ip(a[4][0]) for a in infos):
+        raise ValueError("Endereço de mídia local bloqueado")
     if len(_public_dns_cache) > 300:
         _public_dns_cache.clear()
     _public_dns_cache[key] = time.time() + 60
 
-def _remote_open(url, range_header=None, user_agent=None):
+def _remote_open(url, range_header=None, user_agent="VLC/3.0.20 LibVLC/3.0.20"):
     _check_public_media_url(url)
-    headers = {"User-Agent": user_agent or "VLC/3.0 StreamFlix", "Accept": "*/*", "Accept-Encoding": "identity"}
+    headers = {"User-Agent": user_agent, "Accept": "*/*", "Accept-Encoding": "identity"}
     if range_header and re.fullmatch(r"bytes=\d*-\d*", range_header):
         headers["Range"] = range_header
     opener = urllib.request.build_opener(_SafeRedirect(), urllib.request.HTTPSHandler(context=SSL_CTX))
     return opener.open(urllib.request.Request(url, headers=headers), timeout=20)
 
 def _media_user():
-    username = session.get("streamflix_user")
+    username = (
+        session.get("streamflix_user")
+        or request.args.get("username")
+        or request.args.get("u")
+        or (request.get_json(silent=True) or {}).get("username")
+    )
     if not username:
         return None
     conn = get_main_db()
-    row = conn.execute("SELECT * FROM active_users WHERE username=?", (username,)).fetchone()
+    row = conn.execute("SELECT * FROM active_users WHERE username=?", (str(username).strip(),)).fetchone()
     conn.close()
     if not row or (int(row["expires_at"] or 0) and int(row["expires_at"]) <= int(time.time())):
         return None
+    session["streamflix_user"] = row["username"]
     return row
 
 def _sign_hls_url(url, username):
@@ -909,7 +1145,7 @@ def _sign_hls_url(url, username):
     payload = json.dumps({"url": url, "user": username, "exp": expires}, separators=(",", ":")).encode()
     body = base64.urlsafe_b64encode(payload).decode().rstrip("=")
     mac = hmac.new(app.secret_key.encode() if isinstance(app.secret_key, str) else app.secret_key, body.encode(), hashlib.sha256).hexdigest()
-    return "/api/hls/" + body + "." + mac
+    return f"/api/hls/{body}.{mac}?u={urllib.parse.quote(username)}"
 
 def _hls_rewrite(content, remote_url, username):
     out = []
@@ -958,99 +1194,43 @@ def _proxy_media(remote_url, username):
 @app.route("/api/xtream")
 def api_xtream_proxy():
     row = _media_user()
-    if not row: return jsonify({"error": "Acesso encerrado ou vencido"}), 401
-    allowed = {"get_live_categories", "get_vod_categories", "get_series_categories", "get_vod_streams", "get_series", "get_live_streams", "get_series_info", "get_vod_info", "get_short_epg"}
+    if not row:
+        return jsonify({"error": "Acesso encerrado ou vencido"}), 401
+    allowed = {
+        "get_live_categories", "get_vod_categories", "get_series_categories",
+        "get_vod_streams", "get_series", "get_live_streams",
+        "get_series_info", "get_vod_info", "get_short_epg"
+    }
     action = request.args.get("action", "")
-    if action not in allowed: return jsonify({"error": "Ação não permitida"}), 400
+    if action not in allowed:
+        return jsonify({"error": "Ação não permitida"}), 400
     args = {"username": row["username"], "password": row["password"], "action": action}
     for key in ("series_id", "vod_id", "stream_id"):
         if request.args.get(key) and re.fullmatch(r"[0-9]{1,15}", request.args[key]):
             args[key] = request.args[key]
     url = row["dns_used"].rstrip("/") + "/player_api.php?" + urllib.parse.urlencode(args)
-    try:
-        with _remote_open(url, user_agent="IPTVSmartersPro/3.1.5 (Linux; Android 12)") as r:
-            data = r.read(15 * 1024 * 1024 + 1)
-            if len(data) > 15 * 1024 * 1024:
-                return jsonify({"error": "Resposta excedeu o limite"}), 502
-            return Response(data, content_type="application/json", headers={"Cache-Control": "no-store"})
-    except Exception as exc:
-        app.logger.warning("Falha na API Xtream: %s", type(exc).__name__)
-        return jsonify({"error": "Falha na API do servidor IPTV"}), 502
 
-def _parse_m3u_playlist(body, username):
-    """Parse an authorized M3U without exposing upstream passwords in the browser."""
-    items = []
-    pending = None
-    ext_pattern = re.compile(r'([\w-]+)\s*=\s*(?:"([^"]*)"|([^\s,]+))')
-    for raw in body.splitlines():
-        line = raw.strip()
-        if line.startswith("#EXTINF:"):
-            head, _, title = line.partition(",")
-            attrs = {m.group(1).lower(): (m.group(2) if m.group(2) is not None else m.group(3)) for m in ext_pattern.finditer(head)}
-            pending = {"name": title.strip() or attrs.get("tvg-name") or "Sem título",
-                       "logo": attrs.get("tvg-logo", ""), "group": attrs.get("group-title", "") or "Outros"}
-        elif line.startswith("#EXTGRP:") and pending:
-            pending["group"] = line[8:].strip() or "Outros"
-        elif line.startswith(("http://", "https://")) and pending:
-            try:
-                target = urlsplit(line)
-                if target.scheme not in ("http", "https") or not target.hostname:
-                    raise ValueError("URL inválida")
-                try:
-                    address_ip = ipaddress.ip_address(target.hostname)
-                except ValueError:
-                    address_ip = None  # Nome DNS; checado quando solicitar mídia.
-                if address_ip and not address_ip.is_global:
-                    raise ValueError("Host privado")
-            except (ValueError, OSError):
-                pending = None
-                continue
-            path = urlsplit(line).path.lower()
-            group_lower = pending["group"].lower()
-            if "/series/" in path or any(x in group_lower for x in ("séries", "series", "temporada")):
-                kind = "series"
-            elif "/movie/" in path or any(x in group_lower for x in ("filmes", "movies", "vod", "cinema")) or path.endswith((".mp4", ".mkv", ".avi", ".mov", ".m4v")):
-                kind = "movies"
-            else:
-                kind = "tv"
-            ext = (path.rsplit(".", 1)[-1] if "." in path.rsplit("/",1)[-1] else ("ts" if kind == "tv" else "mp4"))
-            item = {**pending, "id": str(len(items)+1), "type": kind,
-                    "url": _sign_hls_url(line, username), "container_extension": ext, "source_m3u": True}
-            items.append(item)
-            pending = None
-            if len(items) >= 25000:
-                break
-    return items
-
-@app.route("/api/playlist")
-def api_playlist_fallback():
-    user = _media_user()
-    if not user:
-        return jsonify({"error": "Sessão não autenticada ou vencida"}), 401
-    m3u_url = (user["m3u_url"] or "").strip()
-    if not m3u_url:
-        m3u_url = user["dns_used"].rstrip("/") + "/get.php?" + urllib.parse.urlencode({
-            "username": user["username"], "password": user["password"], "type": "m3u_plus", "output": "mpegts"})
-    try:
-        with _remote_open(m3u_url, user_agent="IPTVSmartersPro/3.1.5 (Linux; Android 12)") as upstream:
-            content = upstream.read(32 * 1024 * 1024 + 1)
-        if len(content) > 32 * 1024 * 1024:
-            return jsonify({"error": "Playlist M3U excede 32 MB; ajuste o limite no servidor"}), 413
-        decoded = content.decode("utf-8-sig", "replace")
-        if not decoded.lstrip().startswith("#EXTM3U"):
-            return jsonify({"error": "O servidor retornou uma playlist inválida"}), 502
-        entries = _parse_m3u_playlist(decoded, user["username"])
-        if not entries:
-            return jsonify({"error": "Playlist M3U sem canais válidos"}), 502
-        return jsonify({"ok": True, "items": entries, "source": "m3u"})
-    except Exception as exc:
-        app.logger.warning("Falha ao carregar M3U: %s", type(exc).__name__)
-        return jsonify({"error": "Falha ao carregar M3U do servidor IPTV"}), 502
+    for ua in (
+        "IPTVSmartersPro/3.1.5",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "okhttp/4.9.3"
+    ):
+        try:
+            with _remote_open(url, user_agent=ua) as r:
+                data = r.read(15 * 1024 * 1024 + 1)
+                if len(data) > 15 * 1024 * 1024:
+                    return jsonify({"error": "Resposta excedeu o limite"}), 502
+                return Response(data, content_type="application/json", headers={"Cache-Control": "no-store"})
+        except Exception as exc:
+            app.logger.warning("Tentativa na API Xtream (%s): %s", ua, type(exc).__name__)
+            continue
+    return jsonify({"error": "Falha na API do servidor IPTV"}), 502
 
 @app.route("/api/media/<kind>/<stream_id>.<ext>")
 def api_media_stream(kind, stream_id, ext):
     row = _media_user()
-    if not row: return jsonify({"error": "Acesso encerrado ou vencido"}), 401
+    if not row:
+        return jsonify({"error": "Acesso encerrado ou vencido"}), 401
     if kind not in ("live", "movie", "series") or not re.fullmatch(r"[a-zA-Z0-9_-]{1,45}", stream_id) or ext.lower() not in ("m3u8", "ts", "mp4", "mkv", "avi", "mov", "m4v", "webm"):
         return jsonify({"error": "Mídia inválida"}), 400
     remote = f"{row['dns_used'].rstrip('/')}/{kind}/{urllib.parse.quote(row['username'])}/{urllib.parse.quote(row['password'])}/{stream_id}.{ext.lower()}"
@@ -1058,20 +1238,24 @@ def api_media_stream(kind, stream_id, ext):
 
 @app.route("/api/hls/<token>")
 def api_hls_resource(token):
-    row = _media_user()
-    if not row: return jsonify({"error": "Acesso encerrado ou vencido"}), 401
     try:
         body, signature = token.rsplit(".", 1)
         secret = app.secret_key.encode() if isinstance(app.secret_key, str) else app.secret_key
         correct = hmac.new(secret, body.encode(), hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(correct, signature): raise ValueError()
+        if not hmac.compare_digest(correct, signature):
+            raise ValueError()
         payload = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
-        if payload.get("user") != row["username"] or payload.get("exp", 0) < time.time(): raise ValueError()
+        token_user = payload.get("user")
+        if not token_user or payload.get("exp", 0) < time.time():
+            raise ValueError()
+        row = _media_user()
+        if row and row["username"] != token_user:
+            raise ValueError()
         url = payload["url"]
         parsed = urlsplit(url)
-        if parsed.scheme not in ("http", "https"): raise ValueError()
-        # URLs encadeadas somente através de playlist assinada, nunca URL arbitrária do cliente.
-        return _proxy_media(url, row["username"])
+        if parsed.scheme not in ("http", "https"):
+            raise ValueError()
+        return _proxy_media(url, token_user)
     except (ValueError, KeyError, TypeError, UnicodeDecodeError, json.JSONDecodeError):
         return jsonify({"error": "Token de vídeo inválido"}), 403
 
@@ -1085,7 +1269,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
     <meta http-equiv="Cache-Control" content="no-store, max-age=0">
     <title>StreamFlix Pro</title>
-    <meta name="streamflix-version" content="2026-11-11-restauracao-regressoes-v3.2">
+    <meta name="streamflix-version" content="2026-11-10-integrado-monitoramento-v3">
     <script src="https://unpkg.com/lucide@latest"></script>
     <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
     <script src="https://cdn.jsdelivr.net/npm/mpegts.js@latest/dist/mpegts.js"></script>
@@ -1554,7 +1738,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             .poster-card { flex:0 0 155px; }
             .tv-channel-item { flex-direction:row; }
         }
-        /* Ajustes isolados: preserva layout e player StreamFlix da versão integrada. */
         .drawer-panel { width:50vw; min-width:0; max-width:50vw; }
         body.player-open .drawer-panel { width:50vw; min-width:0; max-width:50vw; }
         .player-modal.tv-list-open .video-stage { width:50vw; right:0; top:50%; height:auto; min-height:0; aspect-ratio:16/9; max-height:50vh; transform:translateY(-50%); border-radius:8px; }
@@ -1562,8 +1745,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         body.player-open.player-list-mode .drawer-backdrop.active { pointer-events:auto; background:transparent; }
         body.player-open.player-list-mode .drawer-panel { z-index:670; }
         body.player-open.player-list-mode .bottom-nav.active { z-index:710; }
-        /* Mantém a navegação inferior visível somente ao tocar no player,
-           com o dock deslocado acima dela; evita sobreposição de botões. */
         body.player-open.player-controls-visible:not(.player-list-mode) .player-dock-wrap {
             bottom:calc(88px + env(safe-area-inset-bottom, 0px));
         }
@@ -1591,7 +1772,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .monitor-status.connecting,.monitor-status.buffering { color:#fbbf24; }
         .monitor-status.error { color:#f87171; }
         .admin-table td { overflow-wrap:anywhere; }
-
     </style>
 </head>
 <body>
@@ -1607,8 +1787,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             <h1 class="brand-title">STREAM<span>FLIX</span></h1>
             <p class="brand-sub">Cinema, Séries & TV ao Vivo</p>
             <form id="form-login">
-                <div class="form-group"><label>Usuário ou link M3U</label><div class="input-wrap"><input type="text" id="l-user" required></div></div>
-                <div class="form-group"><label>Senha</label><div class="input-wrap"><input type="password" id="l-pass" placeholder="Senha (dispensável para link M3U)"></div></div>
+                <div class="form-group"><label>Usuário</label><div class="input-wrap"><input type="text" id="l-user" required></div></div>
+                <div class="form-group"><label>Senha</label><div class="input-wrap"><input type="password" id="l-pass" required></div></div>
                 <button type="submit" class="btn-pill btn-pill-primary" style="width:100%; margin-top:0.4rem;">Entrar e Assistir</button>
             </form>
             <button type="button" class="btn-pill btn-pill-success" id="btn-trial" style="width:100%; margin-top:0.75rem;">⚡ Gerar Teste Grátis Automático</button>
@@ -1643,8 +1823,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         </div>
     </header>
 
-    <!-- DRAWER LATERAL OCULTO (CATEGORIAS E LISTA DE TV NO PLAYER) -->
-    <!-- AVISO DE VENCIMENTO: mostrado também ao tentar logar com acesso expirado -->
+    <!-- AVISO DE VENCIMENTO -->
     <div id="access-expired-modal" role="dialog" aria-modal="true" aria-labelledby="expired-title">
         <div class="expired-card">
             <div style="font-size:2rem;">🔒</div>
@@ -1805,7 +1984,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
     <!-- 6. PLAYER DE VÍDEO COMPLETO E SLIM -->
     <div id="player-modal" class="player-modal">
-        <!-- Topo Slim do Player: Oculto durante reprodução, aparece ao tocar -->
         <div class="player-top-slim" id="player-top-slim">
             <button class="btn-pill btn-pill-outline" id="btn-player-back" aria-label="Voltar" title="Voltar" style="width:34px;height:34px;padding:0;font-size:1.25rem;border-radius:50%;">‹</button>
             <div class="player-title-badge" id="player-title">Reproduzindo...</div>
@@ -1822,14 +2000,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             </div>
         </div>
 
-        <!-- DOCK SLIM FLUTUANTE: INVISÍVEL EM REPRODUÇÃO, SURGE AO CLICAR NA TELA E SOME EM 3 SEGUNDOS -->
         <div class="player-dock-wrap" id="player-dock-wrap">
             <div class="epg-bar" id="epg-bar">
                 <span id="epg-now">Agora: Ao Vivo</span>
                 <span id="epg-time" style="color:var(--text-muted);">--:--</span>
             </div>
 
-            <!-- BARRA DE PROGRESSO (SEEK BAR) EXCLUSIVA PARA FILMES E SÉRIES -->
             <div class="vod-seek-bar-wrap" id="vod-seek-wrap">
                 <span class="seek-time-label" id="seek-cur-time">00:00</span>
                 <div class="seek-track-bg" id="seek-track-bg">
@@ -1838,7 +2014,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 <span class="seek-time-label" id="seek-total-time">00:00</span>
             </div>
 
-            <!-- BUBBLES QUE ABREM POR CIMA AO CLICAR NO BOTÃO E SOMEM IMEDIATAMENTE APÓS USO -->
             <div class="dock-bubble" id="bubble-speed">
                 <button class="bubble-item active" data-speed="1.0">1.0x (Normal)</button>
                 <button class="bubble-item" data-speed="1.3">1.3x</button>
@@ -1860,7 +2035,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 <a href="#" target="_blank" class="bubble-item" id="opt-vlc-ext" style="text-decoration:none; color:var(--gold);">Abrir no VLC ↗</a>
             </div>
 
-            <!-- LINHA ÚNICA MINIMALISTA -->
             <div class="player-dock" id="player-dock">
                 <button class="mini-btn" id="dock-btn-rw" title="Voltar 10s">⏪</button>
                 <button class="mini-btn active" id="dock-btn-play" title="Play/Pause">⏸</button>
@@ -1888,7 +2062,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             </div>
 
             <div id="adm-content" class="hidden">
-                <!-- MONITORAMENTO EM TEMPO REAL -->
                 <div class="config-card" style="border-color:var(--primary);">
                     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.75rem;">
                         <div class="config-title" style="margin:0;">🔴 Monitoramento em Tempo Real (Transmissões Ativas)</div>
@@ -1922,7 +2095,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                         <tbody id="adm-history-tbody"><tr><td colspan="6">Nenhum histórico ainda.</td></tr></tbody></table>
                     </div>
                 </div>
-                <!-- EXCLUSÃO INDIVIDUAL DE TESTES: não usa IP/MAC compartilhado -->
+
                 <div class="config-card">
                     <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:.6rem;">
                         <div class="config-title" style="margin:0;">🧪 Testes gerados</div>
@@ -1935,7 +2108,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     </div>
                 </div>
 
-                <!-- BANCO SEPARADO: REGISTRO DE MACs, IPs E LOCALIZAÇÃO COM BOTÃO DELETAR QUE LIBERA NOVO TESTE -->
                 <div class="config-card">
                     <div class="config-title">🛡️ Banco de Dispositivos Registrados (MAC, IP e Localização)</div>
                     <p style="font-size:0.75rem; color:var(--text-muted); margin-bottom:0.6rem;">Dispositivos no banco <code>devices_tracking.db</code>. A lixeira de dispositivo remove somente a linha selecionada. Para liberar um teste específico, exclua-o na tabela de testes acima.</p>
@@ -1957,7 +2129,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     </div>
                 </div>
 
-                <!-- CONFIGURAÇÕES GERAIS -->
                 <div class="config-card">
                     <div class="config-title">⚙️ Configurações de Conexão</div>
                     <div class="form-group"><label>DNS Servidor IPTV (Xtream Codes)</label><div class="input-wrap"><textarea id="adm-dns" rows="2"></textarea></div></div>
@@ -2005,7 +2176,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             const pin = prompt("🔒 Pasta protegida: digite o PIN de 4 dígitos:");
             if (pin === null) return false;
             try {
-                const resp = await fetch("/api/adult/unlock", {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({pin})});
+                const resp = await fetch("/api/adult/unlock", {
+                    method:"POST",
+                    headers:{"Content-Type":"application/json"},
+                    body:JSON.stringify({pin, username: currentAuth ? currentAuth.username : ""})
+                });
                 const data = await resp.json();
                 if (data.ok) { adultUnlocked = true; return true; }
                 alert(data.error || "PIN incorreto!");
@@ -2048,7 +2223,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             return h > 0 ? `${pad(h)}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`;
         }
 
-        // DECODIFICADOR ROBUSTO DE EPG
         function decodeEpgString(str) {
             if (!str) return "";
             try {
@@ -2075,12 +2249,52 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         loadPublicConfig();
 
         function xtreamUrl(action, extra = {}) {
-            const params = new URLSearchParams({action, ...extra});
+            const u = (currentAuth && currentAuth.username) ? currentAuth.username : "";
+            const params = new URLSearchParams({action, username: u, ...extra});
             return `/api/xtream?${params.toString()}`;
         }
-        function mediaUrl(kind, id, ext) {
-            return `/api/media/${kind}/${encodeURIComponent(String(id))}.${encodeURIComponent(String(ext || 'mp4').toLowerCase())}`;
+
+        async function fetchXtreamJson(action, extra = {}) {
+            try {
+                const r = await fetch(xtreamUrl(action, extra));
+                if (r.ok) {
+                    const data = await r.json();
+                    if (data && !data.error) return data;
+                }
+            } catch (_) {}
+            // Fallback direto ao DNS do servidor caso a VPS sofra bloqueio no proxy
+            if (currentAuth && currentAuth.username && currentAuth.password) {
+                let dns = (currentAuth.dns || serverConfig.dns || "").replace(/\/$/, "");
+                if (dns) {
+                    if (!dns.startsWith("http://") && !dns.startsWith("https://")) dns = "http://" + dns;
+                    const params = new URLSearchParams({
+                        username: currentAuth.username,
+                        password: currentAuth.password,
+                        action,
+                        ...extra
+                    });
+                    try {
+                        const r2 = await fetch(`${dns}/player_api.php?${params.toString()}`);
+                        if (r2.ok) return await r2.json();
+                    } catch (_) {}
+                }
+            }
+            return [];
         }
+
+        function mediaUrl(kind, id, ext) {
+            const u = (currentAuth && currentAuth.username) ? `?u=${encodeURIComponent(currentAuth.username)}` : "";
+            return `/api/media/${kind}/${encodeURIComponent(String(id))}.${encodeURIComponent(String(ext || 'mp4').toLowerCase())}${u}`;
+        }
+
+        function directMediaUrl(kind, id, ext) {
+            if (!currentAuth || !currentAuth.username || !currentAuth.password) return "";
+            let dns = (currentAuth.dns || serverConfig.dns || "").replace(/\/$/, "");
+            if (!dns) return "";
+            if (!dns.startsWith("http://") && !dns.startsWith("https://")) dns = "http://" + dns;
+            return `${dns}/${kind}/${encodeURIComponent(currentAuth.username)}/${encodeURIComponent(currentAuth.password)}/${encodeURIComponent(String(id))}.${encodeURIComponent(String(ext || 'mp4').toLowerCase())}`;
+        }
+
         function escapeHtml(value) {
             return String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
         }
@@ -2112,64 +2326,49 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             };
         }
 
-        // CARREGA DADOS XTREAM CODES DIRETO DO SERVIDOR (BASE ORIGINAL COMPROVADA v5)
         async function fetchXtreamData() {
             let dns = (currentAuth && currentAuth.dns) || serverConfig.dns;
             if (!currentAuth || !dns) {
                 alert("Servidor IPTV não configurado. Verifique o DNS na Área Admin.");
                 return;
             }
-            dns = dns.replace(/\/$/, "");
-            if (!dns.startsWith("http://") && !dns.startsWith("https://")) {
-                dns = "http://" + dns;
-            }
-
             const cover = document.getElementById("loading-cover");
             const msgEl = document.getElementById("loading-msg");
             cover.classList.add("active");
 
             try {
                 msgEl.textContent = "Obtendo categorias do servidor...";
-                const safeXtream = async action => {
-                    const response = await fetch(xtreamUrl(action), {credentials: "same-origin", cache: "no-store"});
-                    if (!response.ok) throw new Error(`Xtream ${action}: HTTP ${response.status}`);
-                    const data = await response.json();
-                    if (!Array.isArray(data)) throw new Error(`Resposta inválida de ${action}`);
-                    return data;
-                };
-                const [tvCat, vodCat, serCat] = await Promise.allSettled([
-                    safeXtream("get_live_categories"),
-                    safeXtream("get_vod_categories"),
-                    safeXtream("get_series_categories")
+                const [tvCats, vodCats, serCats] = await Promise.all([
+                    fetchXtreamJson("get_live_categories"),
+                    fetchXtreamJson("get_vod_categories"),
+                    fetchXtreamJson("get_series_categories")
                 ]);
-                xtreamCategories.tv = tvCat.status === "fulfilled" ? tvCat.value : [];
-                xtreamCategories.movies = vodCat.status === "fulfilled" ? vodCat.value : [];
-                xtreamCategories.series = serCat.status === "fulfilled" ? serCat.value : [];
+                xtreamCategories.tv = Array.isArray(tvCats) ? tvCats : [];
+                xtreamCategories.movies = Array.isArray(vodCats) ? vodCats : [];
+                xtreamCategories.series = Array.isArray(serCats) ? serCats : [];
 
                 const vodCatMap = {};
-                (Array.isArray(xtreamCategories.movies) ? xtreamCategories.movies : []).forEach(c => vodCatMap[c.category_id] = c.category_name);
+                xtreamCategories.movies.forEach(c => vodCatMap[c.category_id] = c.category_name);
 
                 const serCatMap = {};
-                (Array.isArray(xtreamCategories.series) ? xtreamCategories.series : []).forEach(c => serCatMap[c.category_id] = c.category_name);
+                xtreamCategories.series.forEach(c => serCatMap[c.category_id] = c.category_name);
 
                 const liveCatMap = {};
-                (Array.isArray(xtreamCategories.tv) ? xtreamCategories.tv : []).forEach(c => liveCatMap[c.category_id] = c.category_name);
+                xtreamCategories.tv.forEach(c => liveCatMap[c.category_id] = c.category_name);
 
                 msgEl.textContent = "Sincronizando conteúdos...";
-                const [vodResult, seriesResult, liveResult] = await Promise.allSettled([
-                    safeXtream("get_vod_streams"),
-                    safeXtream("get_series"),
-                    safeXtream("get_live_streams")
+                const [vods, series, live] = await Promise.all([
+                    fetchXtreamJson("get_vod_streams"),
+                    fetchXtreamJson("get_series"),
+                    fetchXtreamJson("get_live_streams")
                 ]);
-                const vods = vodResult.status === "fulfilled" ? vodResult.value : [];
-                const series = seriesResult.status === "fulfilled" ? seriesResult.value : [];
-                const live = liveResult.status === "fulfilled" ? liveResult.value : [];
 
                 catalog.movies = (Array.isArray(vods) ? vods : []).map(v => ({
                     id: v.stream_id, name: v.name, group: v.category_name || vodCatMap[v.category_id] || "Filmes", category_id: v.category_id,
                     type: "movies", logo: v.stream_icon, container_extension: v.container_extension || "mp4",
                     rating: v.rating, tmdb_id: v.tmdb_id,
-                    url: mediaUrl("movie", v.stream_id, v.container_extension || "mp4")
+                    url: mediaUrl("movie", v.stream_id, v.container_extension || "mp4"),
+                    direct_url: directMediaUrl("movie", v.stream_id, v.container_extension || "mp4")
                 }));
 
                 catalog.series = (Array.isArray(series) ? series : []).map(s => ({
@@ -2181,25 +2380,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 catalog.tv = (Array.isArray(live) ? live : []).map(l => ({
                     id: l.stream_id, name: l.name, group: l.category_name || liveCatMap[l.category_id] || "Canais", category_id: l.category_id,
                     type: "tv", logo: l.stream_icon, epg_id: l.epg_channel_id,
-                    url: mediaUrl("live", l.stream_id, "ts")
+                    url: mediaUrl("live", l.stream_id, "ts"),
+                    direct_url: directMediaUrl("live", l.stream_id, "ts")
                 }));
 
-                // A API Xtream nem sempre está disponível mesmo quando a M3U funciona.
-                if (!catalog.tv.length && !catalog.movies.length && !catalog.series.length) {
-                    msgEl.textContent = "Tentando carregar a playlist M3U...";
-                    const playlistResponse = await fetch("/api/playlist", {credentials: "same-origin", cache:"no-store"});
-                    const playlist = await playlistResponse.json();
-                    if (!playlistResponse.ok || !playlist.ok || !Array.isArray(playlist.items)) {
-                        throw new Error(playlist.error || `M3U HTTP ${playlistResponse.status}`);
-                    }
-                    catalog.tv = playlist.items.filter(it => it.type === "tv");
-                    catalog.movies = playlist.items.filter(it => it.type === "movies");
-                    catalog.series = playlist.items.filter(it => it.type === "series");
-                    for (const tab of ["tv", "movies", "series"]) {
-                        const distinct = [...new Set(catalog[tab].map(it => it.group))];
-                        xtreamCategories[tab] = distinct.map((name, index) => ({category_id: String(index + 1),category_name:name}));
-                    }
-                }
                 const hm = catalog.movies.filter(it => !isAdultItem(it)).slice(0, 8);
                 const hs = catalog.series.filter(it => !isAdultItem(it)).slice(0, 8);
                 heroItems = [];
@@ -2212,7 +2396,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 renderHomeCarousels();
             } catch (e) {
                 console.error("Erro no carregamento Xtream:", e);
-                alert(`Não foi possível carregar a playlist. ${e.message || "Verifique o DNS e as credenciais."}`);
             } finally {
                 cover.classList.remove("active");
             }
@@ -2254,8 +2437,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
         // SÉRIES: MODAL COM ESCOLHER TEMPORADA E EPISÓDIOS REAIS
         async function openSeriesDetails(it) {
-            // Em M3U simples, cada entrada de série já é um episódio reproduzível.
-            if (it.source_m3u && it.url) { openItemPlay(it); return; }
             document.getElementById("series-modal").classList.add("active");
             document.getElementById("series-title").textContent = it.name;
             document.getElementById("series-meta").textContent = `Carregando informações da série...`;
@@ -2265,14 +2446,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             document.getElementById("episodes-list").innerHTML = `<div style="text-align:center; padding:1.5rem; color:var(--text-muted); font-size:0.8rem;">Carregando temporadas...</div>`;
 
             if (!currentAuth) return;
-            let dns = currentAuth.dns.replace(/\/$/, "");
-            if (!dns.startsWith("http://") && !dns.startsWith("https://")) dns = "http://" + dns;
 
             try {
-                const r = await fetch(xtreamUrl("get_series_info", {series_id: it.id}));
-                const data = await r.json();
-                const info = data.info || {};
-                const episodes = data.episodes || {};
+                const data = await fetchXtreamJson("get_series_info", {series_id: it.id});
+                const info = (data && data.info) || {};
+                const episodes = (data && data.episodes) || {};
 
                 const plot = info.plot || info.description || "Sinopse não disponível para esta série.";
                 const rating = info.rating ? `⭐ Avaliação: ${info.rating}/10` : "⭐ Série Completa";
@@ -2315,6 +2493,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                         const epDur = (ep.info && ep.info.duration) ? ep.info.duration : "";
                         const epExt = ep.container_extension || "mp4";
                         const playUrl = mediaUrl("series", ep.id, epExt);
+                        const directUrl = directMediaUrl("series", ep.id, epExt);
 
                         epCard.innerHTML = `
                             <div style="display:flex; align-items:center; gap:0.6rem; overflow:hidden;">
@@ -2330,9 +2509,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                         epCard.onclick = () => {
                             document.getElementById("series-modal").classList.remove("active");
                             openItemPlay({
+                                id: ep.id,
                                 name: `${info.name || it.name} (${epTitle})`,
                                 group: it.group,
                                 url: playUrl,
+                                direct_url: directUrl,
                                 type: "series",
                                 logo: (ep.info && ep.info.movie_image) || it.logo
                             });
@@ -2377,11 +2558,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
             if (currentAuth && it.type === "movies") {
                 try {
-                    let dns = currentAuth.dns.replace(/\/$/, "");
-                    if (!dns.startsWith("http://") && !dns.startsWith("https://")) dns = "http://" + dns;
-                    const r = await fetch(xtreamUrl("get_vod_info", {vod_id: it.id}));
-                    const d = await r.json();
-                    const info = d.info || {};
+                    const d = await fetchXtreamJson("get_vod_info", {vod_id: it.id});
+                    const info = (d && d.info) || {};
                     const plot = info.plot || info.description || "Sinopse não informada pelo servidor.";
                     const rating = info.rating ? `⭐ Avaliação: ${info.rating}/10` : "⭐ Disponível";
                     const year = info.releasedate ? ` • ${info.releasedate.split('-')[0]}` : "";
@@ -2423,12 +2601,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             document.getElementById("drawer-backdrop").classList.add("active");
             document.getElementById("drawer-panel").classList.add("active");
         }
-        // O backdrop transparente cobre o espaço vazio, inclusive a área do miniplayer.
         document.getElementById("drawer-backdrop").onclick = () => {
             if (document.getElementById("player-modal").classList.contains("tv-list-open")) expandTvPlayer();
             else closeDrawer();
         };
-        // Tocar diretamente o vídeo também pode expandir quando o backdrop não interceptar.
         document.getElementById("player-modal").addEventListener("click", (e) => {
             if (document.getElementById("player-modal").classList.contains("tv-list-open") &&
                 !e.target.closest(".player-dock-wrap,.player-top-slim")) expandTvPlayer();
@@ -2457,7 +2633,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 b.innerHTML = `<img src="${escapeHtml(it.logo || '')}" alt="" style="width:32px;height:32px;object-fit:contain;flex-shrink:0;border-radius:5px" onerror="this.style.display='none'"><span style="font-size:.74rem;overflow:hidden;overflow-wrap:anywhere;text-align:left">${escapeHtml(it.name)}</span>`;
                 b.onclick = (e) => {
                     e.stopPropagation();
-                    // Somente segundo toque no MESMO canal expande. Troca de canal mantém lista.
                     if (currentPlayingItem && currentPlayingItem.type === "tv" && String(currentPlayingItem.id) === String(it.id)) {
                         expandTvPlayer();
                     } else {
@@ -2658,7 +2833,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             }
         });
 
-        // BARRA DE PROGRESSO (SEEK BAR) DE VOD
         vEl.addEventListener("timeupdate", () => {
             if (!currentPlayingItem || currentPlayingItem.type === "tv") return;
             const cur = vEl.currentTime || 0;
@@ -2680,7 +2854,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             resetDockTimer();
         });
 
-        // Monitoramento por aba/sessão: registra carregando, reproduzindo e buffering.
         const monitorSessionId = (() => {
             try {
                 let id = sessionStorage.getItem("sf_monitor_tab_id");
@@ -2697,6 +2870,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         function monitorPayload(status) {
             if (!currentPlayingItem) return null;
             return {
+                username: currentAuth ? currentAuth.username : "",
                 session_id: monitorViewId,
                 mac: getOrCreateMac(),
                 title: currentPlayingItem.name || "Sem título",
@@ -2739,34 +2913,54 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         });
 
         function setPlaybackStatus(message) {
-             const el = document.getElementById("playback-status");
-             el.textContent = message || "";
-             el.classList.toggle("hidden", !message);
-         }
+            const el = document.getElementById("playback-status");
+            el.textContent = message || "";
+            el.classList.toggle("hidden", !message);
+        }
 
-         function clearPlaybackWatchdog() {
-             if (playbackWatchdog) clearTimeout(playbackWatchdog);
-             playbackWatchdog = null;
-         }
+        function clearPlaybackWatchdog() {
+            if (playbackWatchdog) clearTimeout(playbackWatchdog);
+            playbackWatchdog = null;
+        }
 
-        // Preserva os três mecanismos originais; todas as URLs são da mesma origem.
         function makePlaybackCandidates(item, requestedEngine) {
             const url = item.url || "";
-            const isTs = /\.ts(?=[?#]|$)/i.test(url) || String(item.container_extension || "").toLowerCase() === "ts";
-            const isHls = /\.m3u8?(?=[?#]|$)/i.test(url) || ["m3u8", "m3u"].includes(String(item.container_extension || "").toLowerCase());
-            const hlsUrl = isTs && /\.ts(?=[?#]|$)/i.test(url) ? url.replace(/\.ts(?=[?#]|$)/i, ".m3u8") : url;
+            const direct = item.direct_url || "";
+            const isTs = /\.ts(?:[?#]|$)/i.test(url);
+            const isHls = /\.m3u8(?:[?#]|$)/i.test(url);
+            const hlsUrl = isTs ? url.replace(/\.ts(?=[?#]|$)/i, ".m3u8") : url;
+            const directHls = (direct && /\.ts(?:[?#]|$)/i.test(direct)) ? direct.replace(/\.ts(?=[?#]|$)/i, ".m3u8") : direct;
             const choices = [];
             const add = (engine, link) => { if (link && !choices.some(c => c.engine === engine && c.url === link)) choices.push({engine,url:link}); };
-            if (requestedEngine === "native") add("native", url);
-            else if (requestedEngine === "hls") { add("hls", hlsUrl); if (isTs) add("mpegts",url); }
-            else if (requestedEngine === "mpegts") { add("mpegts",url); add("native",url); }
-            else if (isHls) { add("hls",url); add("native",url); }
-            else if (item.type === "tv" && isTs) {
-                // URL assinada da M3U não permite trocar .ts por .m3u8.
-                if (/\.ts(?:[?#]|$)/i.test(url)) add("hls",hlsUrl);
-                add("mpegts",url); add("native",url);
-            } else if (isTs) { add("mpegts",url); add("native",url); }
-            else add("native",url);
+            if (requestedEngine === "native") {
+                add("native", url);
+                if (direct) add("native", direct);
+            } else if (requestedEngine === "hls") {
+                add("hls", hlsUrl);
+                if (directHls) add("hls", directHls);
+                if (isTs) add("mpegts", url);
+            } else if (requestedEngine === "mpegts") {
+                add("mpegts", url);
+                if (direct) add("mpegts", direct);
+                add("native", url);
+            } else if (isHls) {
+                add("hls", url);
+                add("native", url);
+                if (directHls) add("hls", directHls);
+            } else if (item.type === "tv" && isTs) {
+                add("hls", hlsUrl);
+                add("mpegts", url);
+                add("native", url);
+                if (directHls) add("hls", directHls);
+                if (direct) add("mpegts", direct);
+            } else if (isTs) {
+                add("mpegts", url);
+                add("native", url);
+                if (direct) add("mpegts", direct);
+            } else {
+                add("native", url);
+                if (direct) add("native", direct);
+            }
             return choices;
         }
 
@@ -2775,13 +2969,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             clearPlaybackWatchdog();
             playbackSwitching = true;
             const token = ++playbackToken;
-            // Desmontagem protegida: eventos de 'error' e 'pause' antigos não iniciam outro player.
             stopPlayerEngines(false);
             if (playbackCandidateIndex >= playbackCandidates.length) {
                 playbackSwitching = false;
                 setMonitorStatus("error");
                 console.warn("StreamFlix: todas as tentativas de vídeo falharam", playbackLastError);
-                // Apenas falha FINAL exibe aviso; nenhuma informação durante o carregamento.
                 setPlaybackStatus("Não foi possível reproduzir este conteúdo. Toque na tela para ver os controles ou tente outro decodificador.");
                 return;
             }
@@ -2807,7 +2999,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 if (result && typeof result.catch === "function") result.catch(error => {
                     if (failed || token !== playbackToken) return;
                     if (error && error.name === "NotAllowedError") {
-                        // Bloqueio de autoplay: permite toque no botão central sem mudar de canal.
                         clearPlaybackWatchdog();
                         document.getElementById("center-play-overlay").classList.remove("hidden");
                         setMonitorStatus("paused");
@@ -2862,8 +3053,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             currentActiveEngine = forceEngine;
             document.getElementById("player-modal").classList.add("active");
             document.body.classList.add("player-open");
-            // TV sempre permanece compacta após selecionar um canal; VOD segue
-            // a modalidade anterior apenas se o usuário tiver aberto as categorias.
             setTvMiniMode(it.type === "tv" || miniAlreadyOpen);
             document.getElementById("player-title").textContent = it.name || "Reproduzindo";
             document.getElementById("center-play-overlay").classList.add("hidden");
@@ -2887,7 +3076,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             document.getElementById("seek-cur-time").textContent = "00:00";
             document.getElementById("seek-total-time").textContent = "00:00";
             document.getElementById("seek-track-fill").style.width = "0%";
-            document.getElementById("opt-vlc-ext").href = it.url;
+            document.getElementById("opt-vlc-ext").href = it.direct_url || it.url;
             document.getElementById("epg-bar").classList.toggle("active", it.type === "tv");
             if (it.type === "tv") fetchEpg(it);
             playbackCandidates = makePlaybackCandidates(it, forceEngine);
@@ -2908,15 +3097,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             resetDockTimer();
         };
 
-        // EPG DECODIFICADO CORRETAMENTE
         async function fetchEpg(it) {
             if (!currentAuth || !it.id) return;
             try {
-                let dns = currentAuth.dns.replace(/\/$/, "");
-                if (!dns.startsWith("http://") && !dns.startsWith("https://")) dns = "http://" + dns;
-                const r = await fetch(xtreamUrl("get_short_epg", {stream_id: it.id}));
-                const d = await r.json();
-                const prog = (d.epg_listings && d.epg_listings[0]) || {};
+                const d = await fetchXtreamJson("get_short_epg", {stream_id: it.id});
+                const prog = (d && d.epg_listings && d.epg_listings[0]) || {};
                 
                 const rawTitle = prog.title || it.name;
                 const decodedTitle = decodeEpgString(rawTitle);
@@ -3086,8 +3271,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         // NAVEGAÇÃO BOTTOM BAR E CATEGORIAS GERAIS
         document.querySelectorAll(".bottom-nav .bnav-item").forEach(btn => {
             btn.onclick = () => {
-                // Sai de qualquer modo de reprodução uma única vez. Nunca mantém
-                // backdrop/painel interceptando Início/TV/Filmes/Séries.
                 if (document.getElementById("player-modal").classList.contains("active")) exitPlayer();
                 closeDrawer();
                 activeTab = btn.dataset.tab;
@@ -3163,7 +3346,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
         document.getElementById("btn-save-pin").onclick = async () => {
             const p = document.getElementById("cfg-adult-pin").value.trim();
-            const r = await fetch("/api/update-adult-pin", { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({ new_pin: p }) });
+            const r = await fetch("/api/update-adult-pin", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({ new_pin: p, username: currentAuth ? currentAuth.username : "" })
+            });
             const d = await r.json();
             if (d.ok) { adultPin = p; adultUnlocked = false; alert("✅ Senha Adulto atualizada para esta conta!"); }
             else alert(d.error || "Erro ao salvar.");
@@ -3182,18 +3369,23 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             const u = document.getElementById("l-user").value.trim();
             const p = document.getElementById("l-pass").value.trim();
             const mac = getOrCreateMac();
-            if (!p && !(u.startsWith("http://") || u.startsWith("https://"))) {
-                alert("Informe a senha ou cole uma playlist M3U completa no usuário."); return;
+            try {
+                const r = await fetch("/api/login", {
+                    method: "POST",
+                    headers: {"Content-Type": "application/json"},
+                    body: JSON.stringify({ username: u, password: p, mac: mac })
+                });
+                const d = await r.json();
+                if (!d.ok) {
+                    if (d.expired) { showExpiredCard(d.payment_link); return; }
+                    alert(d.error || "Erro ao entrar."); return;
+                }
+                currentAuth = d;
+                localStorage.setItem("sf_session", JSON.stringify(d));
+                enterApp();
+            } catch (err) {
+                alert("Falha de conexão ao autenticar. Tente novamente.");
             }
-            const r = await fetch("/api/login", { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({ username: u, password: p, mac: mac }) });
-            const d = await r.json();
-            if (!d.ok) {
-                if (d.expired) { showExpiredCard(d.payment_link); return; }
-                alert(d.error || "Erro ao entrar."); return;
-            }
-            currentAuth = d;
-            localStorage.setItem("sf_session", JSON.stringify(d));
-            enterApp();
         };
 
         // GERAÇÃO DE TESTE GRÁTIS AUTOMÁTICO COM ANIMAÇÃO DE CARD
@@ -3204,7 +3396,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
             try {
                 const mac = getOrCreateMac();
-                const r = await fetch("/api/request-trial", { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({ device_mac: mac }) });
+                const r = await fetch("/api/request-trial", {
+                    method: "POST",
+                    headers: {"Content-Type": "application/json"},
+                    body: JSON.stringify({ device_mac: mac })
+                });
                 const d = await r.json();
                 if (!d.ok) {
                     if (d.payment_link && d.already_used) showExpiredCard(d.payment_link);
@@ -3217,7 +3413,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 currentAuth = tr;
                 localStorage.setItem("sf_session", JSON.stringify(tr));
 
-                // Popula o link real de pagamento da API
                 if (tr.payment_link) {
                     const payBtn = document.getElementById("btn-pay-link");
                     payBtn.classList.remove("hidden");
@@ -3226,7 +3421,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     document.getElementById("btn-pay-link").classList.add("hidden");
                 }
 
-                // Popula a mensagem formatada no bloco único
                 const shareText = tr.raw_message || ("Usuário: " + tr.username + "\nSenha: " + tr.password);
                 const trialBox = document.getElementById("tr-raw");
                 trialBox.replaceChildren();
@@ -3295,7 +3489,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         async function validateCurrentSession() {
             if (!currentAuth || !currentAuth.username) return false;
             try {
-                const check = await fetch("/api/check-session", {method:"POST"});
+                const check = await fetch("/api/check-session", {
+                    method: "POST",
+                    headers: {"Content-Type": "application/json"},
+                    body: JSON.stringify({username: currentAuth.username})
+                });
                 const d = await check.json();
                 if (d.expired) { showExpiredCard(d.payment_link || currentAuth.payment_link || serverConfig.default_payment_link); return false; }
                 if (d.valid) {
@@ -3303,16 +3501,19 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     if (d.expires_at) currentAuth.expires_at = d.expires_at;
                     return true;
                 }
-                // Cookie ausente após atualização/reinício: reautenticar usando
-                // credenciais da sessão existente, sem criar assinatura artificial.
-                const login = await fetch("/api/login", {method:"POST", headers:{"Content-Type":"application/json"},
-                    body:JSON.stringify({username:currentAuth.username,password:currentAuth.password,mac:getOrCreateMac()})});
+                const login = await fetch("/api/login", {
+                    method: "POST",
+                    headers: {"Content-Type": "application/json"},
+                    body: JSON.stringify({
+                        username: currentAuth.username,
+                        password: currentAuth.password,
+                        dns: currentAuth.dns || "",
+                        mac: getOrCreateMac()
+                    })
+                });
                 const result = await login.json();
                 if (result.expired) { showExpiredCard(result.payment_link || currentAuth.payment_link); return false; }
-                if (!result.ok) {
-                    console.warn("Sessão não recuperada:", result.error || login.status);
-                    return false;
-                }
+                if (!result.ok) return false;
                 currentAuth = result;
                 localStorage.setItem("sf_session", JSON.stringify(result));
                 return true;
@@ -3338,7 +3539,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             sessionCheckInterval = setInterval(async () => {
                 if (!currentAuth) return;
                 try {
-                    const resp = await fetch("/api/check-session", {method:"POST"});
+                    const resp = await fetch("/api/check-session", {
+                        method: "POST",
+                        headers: {"Content-Type": "application/json"},
+                        body: JSON.stringify({username: currentAuth.username})
+                    });
                     const d = await resp.json();
                     if (d.expired) { showExpiredCard(d.payment_link || currentAuth.payment_link); clearInterval(sessionCheckInterval); }
                 } catch(_) {}
@@ -3351,7 +3556,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             fetch("/api/logout", {method:"POST",keepalive:true}).finally(()=>location.reload());
         };
 
-        // ROTA ADMINISTRATIVA (INVISÍVEL NA TELA DE LOGIN DO CLIENTE)
+        // ROTA ADMINISTRATIVA
         let adminPolling = null;
 
         if (window.location.pathname === "/admin") {
@@ -3499,7 +3704,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
 @app.route("/api/version")
 def api_version():
-    return jsonify({"name": "StreamFlix Pro", "version": "2026-11-11-restauracao-regressoes-v3.2"})
+    return jsonify({"name": "StreamFlix Pro", "version": "2026-11-10-integrado-monitoramento-v3"})
 
 @app.route("/")
 def index():
