@@ -302,6 +302,38 @@ def parse_trial_api_response(raw_text, cfg):
     except Exception as e:
         pass
 
+    # O servidor pode devolver o checkout em campos aninhados ou na mensagem de resposta.
+    def find_payment_link(value, depth=0):
+        if depth > 5:
+            return ""
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if re.search(r"pay(?:ment|url|link)?|checkout|renov|assinar|fatura|pagamento|invoice", str(key), re.I):
+                    if isinstance(item, str) and re.match(r"^https?://", item.strip(), re.I):
+                        return item.strip().rstrip('.,;')
+            for item in value.values():
+                found = find_payment_link(item, depth + 1)
+                if found:
+                    return found
+        elif isinstance(value, list):
+            for item in value:
+                found = find_payment_link(item, depth + 1)
+                if found:
+                    return found
+        return ""
+
+    if not res["payment_link"]:
+        try:
+            res["payment_link"] = find_payment_link(json.loads(cleaned))
+        except (ValueError, TypeError):
+            pass
+    if not res["payment_link"]:
+        payment_match = re.search(
+            r"(?:assinar\s*[/\-]\s*renovar|renovar|assin(?:ar|atura)|pagamento|checkout|fatura|link\s*(?:de\s*)?pagamento)"
+            r"[^\n]{0,90}?(https?://[^\s<>\\\"']+)", cleaned, re.I)
+        if payment_match:
+            res["payment_link"] = payment_match.group(1).rstrip('.,;)*')
+
     # Fallback Regex caso a resposta venha puramente em texto
     if not res["username"]:
         u_m = re.search(r"(?:usu[aá]rio|user|login)\s*[:=\-*]+\s*([A-Za-z0-9_.\-]+)", cleaned, re.I)
@@ -475,7 +507,7 @@ def api_login():
         "status": status_str,
         "expires_at": expires_at,
         "expires_formatted": datetime.fromtimestamp(expires_at).strftime("%d/%m/%Y às %H:%M") if expires_at else "Sem Vencimento",
-        "payment_link": cfg.get("default_payment_link", ""),
+        "payment_link": (existing["payment_link"] if existing and existing["payment_link"] else cfg.get("default_payment_link", "")),
         "support_whatsapp": cfg.get("support_whatsapp", "")
     })
 
@@ -1182,6 +1214,33 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .expired-card h2 {margin-bottom:0.6rem;}
         .expired-card p {color:var(--text-muted);font-size:.85rem;margin-bottom:1rem;}
         @media (max-width:380px) { #player-modal.tv-list-open .video-stage{height:26vh;min-height:110px;}}
+
+        /* Carrossel de 15 capas: duas capas por vez a cada seis segundos. */
+        .hero-box {height:auto;min-height:240px;padding:14px 12px 18px;}
+        .hero-poster-pair {display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;justify-content:center;max-width:345px;margin:auto;}
+        .hero-poster-pair .poster-card {width:100%;min-width:0;flex:auto;animation:sfFade 0.25s ease;}
+        .hero-poster-pair .poster-info h4 {white-space:normal;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;line-height:1.3;min-height:2.6em;}
+        .hero-poster-pair .poster-badge {display:none;}
+        @keyframes sfFade {from{opacity:.35;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
+        /* Lista TV legível, seleção amarela e navegação sempre acessível. */
+        .drawer-panel {display:flex;flex-direction:column;}
+        .drawer-list {min-height:0;flex:1;overflow-y:auto;overscroll-behavior:contain;padding-bottom:14px;}
+        .drawer-back-button {flex-shrink:0;position:relative;bottom:0;width:calc(100% - 16px);margin:7px 8px max(12px,env(safe-area-inset-bottom));padding:12px;border-radius:12px;border:1px solid #eab308;background:#181407;color:#fde047;font-weight:800;cursor:pointer;z-index:2;}
+        .tv-channel-item {min-height:58px;align-items:center;position:relative;}
+        .tv-channel-item span {min-width:0;flex:1;white-space:normal;overflow-wrap:anywhere;word-break:normal;text-overflow:clip;line-height:1.35;font-size:0.78rem;}
+        .tv-channel-item.selected-channel {border:2px solid #ffe500;background:#302600;box-shadow:0 0 11px rgba(255,229,0,.65),inset 0 0 7px rgba(255,229,0,.17);}
+        .tv-channel-item .favorite-toggle {flex:0 0 auto;border:0;background:none;color:#a1a1aa;font-size:19px;padding:6px;cursor:pointer;}
+        .tv-channel-item .favorite-toggle.is-favorite {color:#fde047;}
+        .drawer-panel {z-index:680;}
+        #player-modal.tv-list-open .video-stage {width:50%;}
+        body.player-open .drawer-panel {z-index:680;}
+        body.player-open .drawer-back-button {display:block;}
+        .epg-bar {gap:10px;align-items:center;justify-content:center;}
+        .epg-bar span {white-space:normal;overflow-wrap:anywhere;}
+        .seek-track-bg {height:14px;touch-action:none;overflow:visible;}
+        .seek-track-fill {height:6px;top:4px;pointer-events:none;}
+        .seek-track-bg::after {content:'';position:absolute;left:var(--seek-percent,0%);top:0;transform:translateX(-50%);width:14px;height:14px;background:#fff;border:3px solid var(--primary);border-radius:50%;pointer-events:none;}
+        .seek-track-bg.dragging::after {width:20px;height:20px;top:-3px;}
     </style>
 </head>
 <body>
@@ -1269,7 +1328,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             <div class="nav-brand">STREAM<span>FLIX</span></div>
         </div>
         <div style="display:flex; gap:0.4rem; align-items:center;">
-            <button class="btn-pill btn-pill-outline" id="btn-open-drawer" style="padding:0.35rem 0.75rem; font-size:0.75rem;">📂 Categorias</button>
+
         </div>
     </header>
 
@@ -1278,23 +1337,18 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <aside class="drawer-panel" id="drawer-panel">
         <div class="drawer-header">
             <strong style="font-size:0.9rem;" id="drawer-title">Categorias</strong>
-            <button class="btn-pill btn-pill-outline" id="btn-close-drawer" style="padding:0.3rem 0.65rem; font-size:0.72rem;">✕ Fechar</button>
+
         </div>
         <div class="drawer-list" id="drawer-list"></div>
+        <button id="drawer-back-button" class="drawer-back-button hidden" type="button">‹ Voltar</button>
     </aside>
 
     <!-- 4. TELAS PRINCIPAIS -->
     <main class="content-wrap hidden" id="main-content">
         <!-- TELA HOME -->
         <div id="view-home">
-            <div class="hero-box">
-                <div class="hero-bg" id="hero-bg"></div>
-                <div class="hero-overlay">
-                    <span class="hero-tag">RECÉM ADICIONADO (5s)</span>
-                    <h2 class="hero-title" id="hero-title">Carregando Destaques...</h2>
-                    <p class="hero-meta" id="hero-meta">Prévia automática exclusiva de Filmes e Séries</p>
-                    <button class="btn-pill btn-pill-primary" id="btn-hero-play" style="align-self:flex-start;">▶ Assistir Agora</button>
-                </div>
+            <div class="hero-box" id="hero-box">
+                <div id="hero-poster-pair" class="hero-poster-pair" aria-label="Destaques de filmes e séries"></div>
                 <div class="hero-timer"><div class="hero-timer-fill" id="hero-timer-fill"></div></div>
             </div>
 
@@ -1444,7 +1498,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <!-- DOCK SLIM FLUTUANTE: INVISÍVEL EM REPRODUÇÃO, SURGE AO CLICAR NA TELA E SOME EM 3 SEGUNDOS -->
         <div class="player-dock-wrap" id="player-dock-wrap">
             <div class="epg-bar" id="epg-bar">
-                <span id="epg-now">Agora: Ao Vivo</span>
+                <span id="epg-now">Programação</span>
                 <span id="epg-time" style="color:var(--text-muted);">--:--</span>
             </div>
 
@@ -1476,7 +1530,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 <button class="bubble-item" data-engine="hls">HLS (.m3u8)</button>
                 <button class="bubble-item" data-engine="mpegts">MPEG-TS (.ts)</button>
                 <button class="bubble-item" data-engine="native">Nativo (MP4)</button>
-                <a href="#" target="_blank" class="bubble-item" id="opt-vlc-ext" style="text-decoration:none; color:var(--gold);">Abrir no VLC ↗</a>
+
             </div>
 
             <!-- LINHA ÚNICA MINIMALISTA -->
@@ -1665,33 +1719,31 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         }
         document.getElementById("expired-close").onclick = () => document.getElementById("expired-dialog").classList.remove("active");
 
-        // HERO CAROUSEL 5s (EXCLUSIVO FILMES E SÉRIES - ZERO CANAIS E ZERO ADULTO)
+        // Ciclo com quinze capas, exibidas em pares a cada seis segundos.
         let heroItems = [];
         let heroIdx = 0;
         let heroMs = 0;
         setInterval(() => {
             if (activeTab !== "home" || document.getElementById("player-modal").classList.contains("active")) return;
             heroMs += 100;
-            document.getElementById("hero-timer-fill").style.width = `${Math.min(100, (heroMs / 5000) * 100)}%`;
-            if (heroMs >= 5000) {
+            document.getElementById("hero-timer-fill").style.width = `${Math.min(100,heroMs/6000*100)}%`;
+            if (heroMs >= 6000) {
                 heroMs = 0;
-                if (heroItems.length > 0) {
-                    heroIdx = (heroIdx + 1) % heroItems.length;
-                    renderHeroSlide(heroItems[heroIdx]);
+                if (heroItems.length) {
+                    heroIdx = (heroIdx + 2) % heroItems.length;
+                    renderHeroPair();
                 }
             }
-        }, 100);
-
-        function renderHeroSlide(it) {
-            if (!it) return;
-            document.getElementById("hero-bg").style.backgroundImage = `url('${it.logo}')`;
-            document.getElementById("hero-title").textContent = it.name;
-            document.getElementById("hero-meta").textContent = `${it.group} • Destaque 5s`;
-            document.getElementById("btn-hero-play").onclick = () => {
-                if (it.type === 'movies') openTmdbDetails(it);
-                else if (it.type === 'series') openSeriesDetails(it);
-                else openItemPlay(it);
-            };
+        },100);
+        function renderHeroPair() {
+            const holder=document.getElementById("hero-poster-pair");
+            holder.replaceChildren();
+            if (!heroItems.length) { holder.textContent="Sem destaques disponíveis";return; }
+            [0,1].forEach(offset=>{
+                const it=heroItems[(heroIdx+offset)%heroItems.length];
+                const card=createPosterCard(it);
+                holder.appendChild(card);
+            });
         }
 
         // CARREGA DADOS XTREAM CODES DIRETO DO SERVIDOR (BASE ORIGINAL COMPROVADA v5)
@@ -1761,8 +1813,15 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     url: `${dns}/live/${currentAuth.username}/${currentAuth.password}/${l.stream_id}.ts`
                 }));
 
-                heroItems = [...catalog.movies, ...catalog.series].filter(it => !isAdultItem(it)).slice(0, 15);
-                if (heroItems.length > 0) renderHeroSlide(heroItems[0]);
+                // Alterna filmes e séries em vez de favorecer os primeiros filmes da lista.
+                const highlightsMovies=catalog.movies.filter(it=>!isAdultItem(it));
+                const highlightsSeries=catalog.series.filter(it=>!isAdultItem(it));
+                heroItems=[];
+                for(let i=0;heroItems.length<15 && (i<highlightsMovies.length || i<highlightsSeries.length);i++) {
+                    if(i<highlightsMovies.length && heroItems.length<15)heroItems.push(highlightsMovies[i]);
+                    if(i<highlightsSeries.length && heroItems.length<15)heroItems.push(highlightsSeries[i]);
+                }
+                if (heroItems.length > 0) renderHeroPair();
 
                 renderHomeCarousels();
             } catch (e) {
@@ -1950,90 +2009,133 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         }
         document.getElementById("btn-tmdb-close").onclick = () => document.getElementById("tmdb-modal").classList.remove("active");
 
-        // CATEGORIAS COM PROTEÇÃO +18, SEM EXIBIR NOMES ANTES DO PIN
+        // Estado persistente de favoritos/último canal por conta.
+        function tvStorageKey(suffix) { return `sf_${suffix}_${currentAuth?.username || "guest"}`; }
+        function favoriteIds() {
+            try { return JSON.parse(localStorage.getItem(tvStorageKey("tv_favorites")) || "[]").map(String); }
+            catch(e) { return []; }
+        }
+        function isFavoriteTv(it) { return favoriteIds().includes(String(it.id)); }
+        function toggleFavoriteTv(it) {
+            let ids=favoriteIds(); const id=String(it.id);
+            ids=ids.includes(id) ? ids.filter(x=>x!==id) : [...ids,id];
+            localStorage.setItem(tvStorageKey("tv_favorites"),JSON.stringify(ids));
+            if (tvDrawerCategory==="Favoritos") openTvChannelList("Favoritos");
+            else if (tvListVisible) openTvChannelList(tvDrawerCategory);
+            if(activeTab==="tv") renderTvList();
+        }
+        function availableTvChannels(cat) {
+            return (catalog.tv||[]).filter(it=> (!isAdultItem(it)||adultCategoryUnlocked) &&
+                (cat==="Todas" || (cat==="Favoritos" ? isFavoriteTv(it) : it.group===cat)));
+        }
+        function rememberTvChannel(it) {
+            if (it?.type==="tv") localStorage.setItem(tvStorageKey("tv_last"),String(it.id));
+        }
+        function lastTvChannel() {
+            const id=localStorage.getItem(tvStorageKey("tv_last"));
+            return (catalog.tv||[]).find(it=>String(it.id)===id && (!isAdultItem(it)||adultCategoryUnlocked)) || null;
+        }
+        function makeTvChannelButton(it) {
+            const btn=document.createElement("div");btn.className="tv-channel-item";btn.setAttribute("role","button");btn.tabIndex=0;
+            if (currentPlayingItem?.type==="tv" && String(currentPlayingItem.id)===String(it.id))
+                btn.classList.add("selected-channel");
+            const img=document.createElement("img");img.src=it.logo||"";img.alt="";
+            const label=document.createElement("span");label.textContent=it.name;
+            const star=document.createElement("button");star.type="button";star.className="favorite-toggle"+(isFavoriteTv(it)?" is-favorite":"");
+            star.textContent=isFavoriteTv(it)?"★":"☆";star.title=isFavoriteTv(it)?"Remover dos favoritos":"Adicionar aos favoritos";
+            star.onclick=e=>{e.stopPropagation();toggleFavoriteTv(it);};
+            btn.append(img,label,star);
+            btn.onkeydown=e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();btn.click();}};
+            btn.onclick=()=>{
+                if (currentPlayingItem?.type==="tv" && String(currentPlayingItem.id)===String(it.id) && tvListVisible) {
+                    closeDrawer(); // segundo toque no canal abre player grande, sem interromper vídeo.
+                    return;
+                }
+                openItemPlay(it);
+                openTvChannelList(tvDrawerCategory || it.group);
+            };
+            return btn;
+        }
         function renderTvList() {
-            const el = document.getElementById("tv-list");
-            if (!el) return;
+            const el=document.getElementById("tv-list");if(!el)return;
             el.replaceChildren();
-            const query = document.getElementById("tv-search").value.trim().toLowerCase();
-            (catalog.tv || []).filter(it => (activeCategory === "Todas" ? (!isAdultItem(it) || adultCategoryUnlocked) : it.group === activeCategory) && (!isAdultItem(it) || adultCategoryUnlocked) && (!query || it.name.toLowerCase().includes(query))).slice(0,500).forEach(it => {
-                const btn = document.createElement("button"); btn.className = "tv-channel-item";
-                const img = document.createElement("img"); img.src = it.logo || ""; img.alt = "";
-                const label = document.createElement("span"); label.textContent = it.name;
-                btn.append(img,label);
-                btn.onclick = () => openItemPlay(it);
-                el.appendChild(btn);
-            });
+            const query=document.getElementById("tv-search").value.trim().toLowerCase();
+            availableTvChannels(activeCategory).filter(it=>!query||it.name.toLowerCase().includes(query)).slice(0,500)
+              .forEach(it=>el.appendChild(makeTvChannelButton(it)));
         }
         document.getElementById("tv-search").addEventListener("input",renderTvList);
         function openTvChannelList(catName) {
-            tvDrawerCategory = catName || tvDrawerCategory || "Todas";
-            const list = document.getElementById("drawer-list");
-            list.replaceChildren();
-            document.getElementById("drawer-title").textContent = tvDrawerCategory;
-            const back = document.createElement("button"); back.className = "drawer-item"; back.textContent = "‹ Categorias";
-            back.onclick = () => openCategoriesDrawer(); list.appendChild(back);
-            (catalog.tv || []).filter(it => (tvDrawerCategory === "Todas" || it.group === tvDrawerCategory) && (!isAdultItem(it) || adultCategoryUnlocked)).forEach(it => {
-                const btn = document.createElement("button");btn.className="tv-channel-item";
-                const img=document.createElement("img");img.src=it.logo||"";img.alt="";
-                const label=document.createElement("span");label.textContent=it.name;
-                btn.append(img,label);
-                btn.onclick=()=>{openItemPlay(it);setTvMiniMode(true);};
-                list.appendChild(btn);
-            });
+            tvDrawerCategory=catName||tvDrawerCategory||"Todas";
+            const list=document.getElementById("drawer-list");list.replaceChildren();
+            document.getElementById("drawer-title").textContent=tvDrawerCategory;
+            document.getElementById("drawer-back-button").classList.remove("hidden");
+            availableTvChannels(tvDrawerCategory).forEach(it=>list.appendChild(makeTvChannelButton(it)));
+            if(!list.children.length){const msg=document.createElement("p");msg.textContent="Nenhum canal nesta categoria.";msg.style.padding="12px";list.appendChild(msg);}
+            document.getElementById("drawer-panel").classList.add("active");
+            document.getElementById("drawer-backdrop").classList.add("active");
             setTvMiniMode(true);
         }
         function setTvMiniMode(visible) {
-            tvListVisible=visible;
+            tvListVisible=Boolean(visible);
             const player=document.getElementById("player-modal");
-            const enabled=visible && player.classList.contains("active") && currentPlayingItem && currentPlayingItem.type === "tv";
+            const enabled=tvListVisible && player.classList.contains("active") && currentPlayingItem?.type==="tv";
             player.classList.toggle("tv-list-open",Boolean(enabled));
             document.body.classList.toggle("player-open",Boolean(enabled));
-            document.getElementById("drawer-panel").classList.toggle("active",Boolean(enabled));
-            document.getElementById("drawer-backdrop").classList.toggle("active",Boolean(enabled));
+            if(enabled){document.getElementById("drawer-panel").classList.add("active");document.getElementById("drawer-backdrop").classList.add("active");}
         }
         function openCategoriesDrawer() {
             const list=document.getElementById("drawer-list");list.replaceChildren();
-            const t=activeTab === "home" || activeTab === "config" ? "tv" : activeTab;
-            const cats=xtreamCategories[t] || [];
+            const t=activeTab==="home"||activeTab==="config"?"tv":activeTab;
+            const cats=xtreamCategories[t]||[];
             document.getElementById("drawer-title").textContent="Categorias";
+            document.getElementById("drawer-back-button").classList.add("hidden");
             const add=(title,name,isAdult=false)=>{
                 const btn=document.createElement("button");btn.className="drawer-item";btn.textContent=title;
                 btn.onclick=()=>{
-                    if(isAdult && !adultCategoryUnlocked){
+                    if(isAdult&&!adultCategoryUnlocked){
                         const pin=prompt("Digite seu PIN de 4 dígitos para conteúdo adulto:");
-                        if(pin!==adultPin) return alert("PIN incorreto!");
+                        if(pin!==adultPin)return alert("PIN incorreto!");
                         adultCategoryUnlocked=true;
                     }
                     selectCategory(name);
-                    if(t==="tv" && document.getElementById("player-modal").classList.contains("active")) openTvChannelList(name);
-                    else closeDrawer();
+                    if(t==="tv"){
+                        const channels=availableTvChannels(name);
+                        if(channels.length && !channels.some(it=>it.id===currentPlayingItem?.id)) openItemPlay(channels[0]);
+                        openTvChannelList(name);
+                    }else closeDrawer();
                 };list.appendChild(btn);
             };
             add("Todas as categorias","Todas");
+            if(t==="tv") add("⭐ Favoritos","Favoritos");
             cats.filter(c=>!ADULT_REGEX.test(c.category_name||"")).forEach(c=>add(c.category_name,c.category_name));
             const adultCats=cats.filter(c=>ADULT_REGEX.test(c.category_name||""));
             if(adultCats.length){
-                if(!adultCategoryUnlocked) {
-                    const b=document.createElement("button");b.className="drawer-item";b.textContent="🔒 Conteúdo adulto";
-                    b.onclick=()=>{
-                        const pin=prompt("Digite seu PIN de 4 dígitos para conteúdo adulto:");
-                        if(pin!==adultPin)return alert("PIN incorreto!");
-                        adultCategoryUnlocked=true;openCategoriesDrawer();
-                    };list.appendChild(b);
-                } else adultCats.forEach(c=>add(c.category_name,c.category_name,true));
+                if(!adultCategoryUnlocked){const b=document.createElement("button");b.className="drawer-item";b.textContent="🔒 Conteúdo adulto";
+                    b.onclick=()=>{const pin=prompt("Digite seu PIN de 4 dígitos para conteúdo adulto:");
+                        if(pin!==adultPin)return alert("PIN incorreto!");adultCategoryUnlocked=true;openCategoriesDrawer();};list.appendChild(b);
+                }else adultCats.forEach(c=>add(c.category_name,c.category_name,true));
             }
             document.getElementById("drawer-backdrop").classList.add("active");
             document.getElementById("drawer-panel").classList.add("active");
+            if(currentPlayingItem?.type==="tv") setTvMiniMode(true);
         }
         function closeDrawer() {
             document.getElementById("drawer-backdrop").classList.remove("active");
             document.getElementById("drawer-panel").classList.remove("active");
             setTvMiniMode(false);
         }
-        document.getElementById("btn-open-drawer").onclick=openCategoriesDrawer;
-        document.getElementById("btn-close-drawer").onclick=closeDrawer;
         document.getElementById("drawer-backdrop").onclick=closeDrawer;
+        document.getElementById("drawer-list").addEventListener("click",e=>{
+            if(e.target===e.currentTarget && tvListVisible)closeDrawer();
+        });
+        document.getElementById("player-modal").addEventListener("click",e=>{
+            if(e.target===e.currentTarget && tvListVisible)closeDrawer();
+        });
+        document.getElementById("drawer-back-button").onclick=e=>{
+            e.stopPropagation();
+            // Retorna às categorias e mantém mini player aberto e reproduzindo.
+            openCategoriesDrawer();
+        };
         function selectCategory(catName) {
             activeCategory=catName;
             if(activeTab==="tv") {
@@ -2110,18 +2212,37 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             document.getElementById("seek-total-time").textContent = formatTime(dur);
             if (dur > 0) {
                 const pct = (cur / dur) * 100;
-                document.getElementById("seek-track-fill").style.width = `${pct}%`;
+                if(!isSeeking){document.getElementById("seek-track-fill").style.width = `${pct}%`;
+                    document.getElementById("seek-track-bg").style.setProperty("--seek-percent",`${pct}%`);}
             }
         });
 
-        document.getElementById("seek-track-bg").addEventListener("click", (e) => {
-            e.stopPropagation();
-            if (!vEl.duration) return;
-            const rect = e.currentTarget.getBoundingClientRect();
-            const clickPos = (e.clientX - rect.left) / rect.width;
-            vEl.currentTime = clickPos * vEl.duration;
-            resetDockTimer();
+        // Arrastar deslizando o cursor do VOD: mouse, toque e caneta (Pointer Events).
+        const seekTrack=document.getElementById("seek-track-bg");
+        let isSeeking=false;
+        function seekAtPointer(e) {
+            if(currentPlayingItem?.type==="tv")return;
+            const dur=vEl.duration;
+            if(!Number.isFinite(dur)||dur<=0)return;
+            const rect=seekTrack.getBoundingClientRect();
+            const fraction=Math.max(0,Math.min(1,(e.clientX-rect.left)/rect.width));
+            seekTrack.style.setProperty("--seek-percent",`${fraction*100}%`);
+            document.getElementById("seek-track-fill").style.width=`${fraction*100}%`;
+            document.getElementById("seek-cur-time").textContent=formatTime(dur*fraction);
+            try{vEl.currentTime=dur*fraction;}catch(err){}
+        }
+        seekTrack.addEventListener("pointerdown",e=>{
+            if(currentPlayingItem?.type==="tv"||!Number.isFinite(vEl.duration)||vEl.duration<=0)return;
+            e.preventDefault();e.stopPropagation();isSeeking=true;
+            seekTrack.classList.add("dragging");seekTrack.setPointerCapture(e.pointerId);
+            seekAtPointer(e);if(dockTimeout)clearTimeout(dockTimeout);
         });
+        seekTrack.addEventListener("pointermove",e=>{if(!isSeeking)return;e.preventDefault();seekAtPointer(e);});
+        function finishSeeking(e){if(!isSeeking)return;seekAtPointer(e);isSeeking=false;
+            seekTrack.classList.remove("dragging");resetDockTimer();}
+        seekTrack.addEventListener("pointerup",finishSeeking);
+        seekTrack.addEventListener("pointercancel",()=>{isSeeking=false;seekTrack.classList.remove("dragging");resetDockTimer();});
+        seekTrack.addEventListener("click",e=>e.stopPropagation());
 
         function sendMonitorHeartbeat(isPlaying) {
             if (!currentPlayingItem) return;
@@ -2142,6 +2263,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
         function openItemPlay(it, forceEngine = "auto") {
             const keepTvMini = tvListVisible && it.type === "tv";
+            if (it.type === "tv") rememberTvChannel(it);
             stopPlayerEngines();
             currentPlayingItem = it;
             playSecondsCounter = 0;
@@ -2176,7 +2298,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 document.getElementById("seek-track-fill").style.width = "0%";
             }
 
-            document.getElementById("opt-vlc-ext").href = it.url;
+
 
             const epgBar = document.getElementById("epg-bar");
             if (it.type === "tv") {
@@ -2285,6 +2407,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             resetDockTimer();
         };
 
+        function epgClock(value) {
+            const raw=String(value || "");
+            const match=raw.match(/(?:^|\s)(\d{1,2}:\d{2})(?::\d{2})?(?:\s|$)/);
+            return match ? match[1] : "";
+        }
+
         // EPG DECODIFICADO CORRETAMENTE
         async function fetchEpg(it) {
             if (!currentAuth || !it.id) return;
@@ -2298,10 +2426,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 const rawTitle = prog.title || it.name;
                 const decodedTitle = decodeEpgString(rawTitle);
                 
-                document.getElementById("epg-now").textContent = `Agora: ${decodedTitle}`;
-                document.getElementById("epg-time").textContent = prog.start ? `${prog.start} - ${prog.end}` : "Ao Vivo";
+                document.getElementById("epg-now").textContent = decodedTitle;
+                document.getElementById("epg-time").textContent = epgClock(prog.start) ? `${epgClock(prog.start)}${epgClock(prog.end) ? " - " + epgClock(prog.end) : ""}` : "--:--";
             } catch (e) {
-                document.getElementById("epg-now").textContent = `Agora: ${it.name}`;
+                document.getElementById("epg-now").textContent = it.name;
             }
         }
 
@@ -2448,32 +2576,33 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
         document.addEventListener("click", () => closeAllBubbles());
 
-        // Navegação independente: nenhuma seção herda o estado oculto da anterior.
-        document.querySelectorAll(".bottom-nav .bnav-item").forEach(btn=>{
-            btn.onclick=()=>{
-                const tab=btn.dataset.tab;
-                if(document.getElementById("player-modal").classList.contains("active")) {
-                    if(tab==="tv" && currentPlayingItem && currentPlayingItem.type==="tv"){
-                        if(tvListVisible)closeDrawer();else openTvChannelList(currentPlayingItem.group);
-                        return;
-                    }
-                    document.getElementById("btn-player-back").click();
-                }
-                activeTab=tab;
-                closeDrawer();
-                document.querySelectorAll(".bottom-nav .bnav-item").forEach(b=>b.classList.toggle("active",b===btn));
-                ["home","catalog","tv","config"].forEach(v=>document.getElementById("view-"+v).classList.add("hidden"));
-                const section=tab==="home"?"home":tab==="config"?"config":tab==="tv"?"tv":"catalog";
-                document.getElementById("view-"+section).classList.remove("hidden");
-                document.getElementById("btn-global-back").classList.toggle("hidden",tab==="home");
-                document.getElementById("btn-open-drawer").classList.toggle("hidden",tab==="home"||tab==="config");
-                activeCategory="Todas";
-                if(tab==="tv")renderTvList();
-                if(tab==="movies"||tab==="series")renderCatalogGrid();
-                if(tab==="config")fillConfigScreen();
-                window.scrollTo({top:0,behavior:"smooth"});
-            };
-        });
+        // TV abre imediatamente as categorias e retoma o último canal reproduzido.
+        function activateTab(btn) {
+            const tab=btn.dataset.tab;
+            const player=document.getElementById("player-modal");
+            if(tab==="tv" && player.classList.contains("active") && currentPlayingItem?.type==="tv") {
+                openCategoriesDrawer();return;
+            }
+            if(player.classList.contains("active")) document.getElementById("btn-player-back").click();
+            activeTab=tab;
+            closeDrawer();
+            document.querySelectorAll(".bottom-nav .bnav-item").forEach(b=>b.classList.toggle("active",b===btn));
+            ["home","catalog","tv","config"].forEach(v=>document.getElementById("view-"+v).classList.add("hidden"));
+            const section=tab==="home"?"home":tab==="config"?"config":tab==="tv"?"tv":"catalog";
+            document.getElementById("view-"+section).classList.remove("hidden");
+            document.getElementById("btn-global-back").classList.toggle("hidden",tab==="home");
+            activeCategory="Todas";
+            if(tab==="tv") {
+                renderTvList();
+                const last=lastTvChannel();
+                if(last){openItemPlay(last);tvDrawerCategory=last.group;}
+                openCategoriesDrawer();
+            }
+            if(tab==="movies"||tab==="series")renderCatalogGrid();
+            if(tab==="config")fillConfigScreen();
+            window.scrollTo({top:0,behavior:"smooth"});
+        }
+        document.querySelectorAll(".bottom-nav .bnav-item").forEach(btn=>btn.onclick=()=>activateTab(btn));
         document.getElementById("btn-global-back").onclick=()=>document.querySelector('.bottom-nav .bnav-item[data-tab="home"]').click();
 
         function fillConfigScreen() {
@@ -2558,10 +2687,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     document.getElementById("row-tr-and").classList.add("hidden");
                 }
 
-                if (tr.payment_link) {
+                if (/^https?:\/\//i.test(tr.payment_link || serverConfig.default_payment_link || "")) {
                     const payBtn = document.getElementById("btn-pay-link");
                     payBtn.classList.remove("hidden");
-                    payBtn.href = tr.payment_link;
+                    payBtn.href = tr.payment_link || serverConfig.default_payment_link;
                 } else {
                     document.getElementById("btn-pay-link").classList.add("hidden");
                 }
