@@ -7,11 +7,34 @@ import hashlib
 import ssl
 import urllib.request
 import urllib.parse
+import hmac
+import base64
+import secrets
+import ipaddress
+import socket
+from urllib.parse import urljoin, urlsplit
+from flask import stream_with_context
 from datetime import datetime
 from flask import Flask, request, jsonify, render_template_string, session, Response
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("STREAMFLIX_SECRET", "streamflix-super-secret-key-2026")
+# Segredo persistente fora do código: cookies não podem ser forjados com uma senha pública.
+def _load_app_secret():
+    value = os.environ.get("STREAMFLIX_SECRET")
+    if value:
+        return value
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".streamflix_secret")
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(secrets.token_hex(32))
+    except FileExistsError:
+        pass
+    with open(path, "r") as f:
+        return f.read().strip()
+
+app.secret_key = _load_app_secret()
+app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MAIN_DB_PATH = os.path.join(BASE_DIR, "streamflix.db")
@@ -84,7 +107,8 @@ def init_dbs():
         "expires_at": "INTEGER",
         "payment_link": "TEXT",
         "is_trial": "INTEGER DEFAULT 0",
-        "created_at_str": "TEXT"
+        "created_at_str": "TEXT",
+        "adult_pin": "TEXT"
     })
     migrate_table_columns(conn1, "trial_records", {
         "ip_address": "TEXT",
@@ -103,7 +127,9 @@ def init_dbs():
         "admin_user": "admin",
         "admin_pass": "admin123",
         "dns_list": "http://zavryqonix.online:80",
-        "trial_api_url": "https://infinity.panelbr.site/api/chatbot/lKWOwGbWzo/boQ1Ye1ONY",
+        # Em uma VPS já instalada, a URL configurada permanece no SQLite.
+        # Não publicar tokens de API no app.py de um repositório GitHub público.
+        "trial_api_url": os.environ.get("STREAMFLIX_TRIAL_API_URL", ""),
         "trial_duration_hours": "6",
         "default_payment_link": "",
         "support_whatsapp": "https://wa.me/5500000000000?text=Preciso%20de%20suporte%20no%20StreamFlix",
@@ -138,6 +164,13 @@ def init_dbs():
         elapsed_seconds INTEGER,
         last_heartbeat INTEGER,
         started_at TEXT
+    )""")
+    migrate_table_columns(conn2, "active_monitoring", {"playback_status":"TEXT DEFAULT 'connecting'", "content_id":"TEXT"})
+    cur2.execute("""CREATE TABLE IF NOT EXISTS playback_history (
+        session_id TEXT PRIMARY KEY,
+        username TEXT, content_title TEXT, content_type TEXT, content_id TEXT,
+        started_at TEXT, last_heartbeat INTEGER, elapsed_seconds INTEGER,
+        playback_status TEXT, ended_at TEXT
     )""")
     conn2.commit()
     conn2.close()
@@ -343,36 +376,54 @@ def parse_trial_api_response(raw_text, cfg):
 @app.route("/api/monitor/heartbeat", methods=["POST"])
 def api_monitor_heartbeat():
     data = request.get_json(silent=True) or {}
-    mac = (data.get("mac") or "").strip().upper()
-    username = (data.get("username") or "Anônimo").strip()
-    title = (data.get("title") or "Nenhum").strip()
-    ctype = (data.get("type") or "tv").strip()
-    elapsed = int(data.get("elapsed") or 0)
-    is_playing = bool(data.get("playing", True))
-
+    username = session.get("streamflix_user")
+    if not username:
+        return jsonify({"ok": False, "error": "Sessão encerrada"}), 401
+    mac = str(data.get("mac") or "").strip().upper()[:64]
+    title = str(data.get("title") or "Sem título").strip()[:250]
+    ctype = str(data.get("type") or "tv").strip()[:24]
+    content_id = str(data.get("content_id") or "")[:80]
+    status = str(data.get("status") or ("playing" if data.get("playing") else "stopped"))[:32]
+    if status not in ("connecting", "playing", "paused", "buffering", "error", "stopped"):
+        status = "connecting"
+    try:
+        elapsed = max(0, min(int(data.get("elapsed") or 0), 365 * 24 * 3600))
+    except (ValueError, TypeError):
+        elapsed = 0
+    client_id = re.sub(r"[^a-zA-Z0-9_-]", "", str(data.get("session_id") or ""))[:64]
+    if not client_id:
+        return jsonify({"ok": False, "error": "Identificador de sessão ausente"}), 400
+    session_id = hashlib.sha256((username + ":" + client_id).encode()).hexdigest()
     forwarded = request.headers.get("X-Forwarded-For", "")
     ip = (forwarded.split(",")[0].strip() if forwarded else request.remote_addr) or "0.0.0.0"
     ua = request.headers.get("User-Agent", "")
-
     record_device_entry(mac, ip, ua, username)
-
-    session_id = f"{mac}_{username}"
     now_ts = int(time.time())
-    now_str = datetime.now().strftime("%H:%M:%S")
-
     conn = get_devices_db()
-    if not is_playing:
+    if status == "stopped":
         conn.execute("DELETE FROM active_monitoring WHERE session_id = ?", (session_id,))
     else:
-        location = resolve_ip_location(ip)
-        device_name = parse_user_agent(ua)
+        # A sessão aparece no monitoramento já durante o carregamento.
+        # O indicador de estado evita tratar 'buffering' como vídeo realmente reproduzido.
+        row = conn.execute("SELECT content_title, content_id, started_at FROM active_monitoring WHERE session_id=?", (session_id,)).fetchone()
+        started = row["started_at"] if row and row["content_id"] == content_id and row["content_title"] == title else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         conn.execute("""INSERT OR REPLACE INTO active_monitoring
-            (session_id, username, mac, ip, location, device, content_title, content_type, elapsed_seconds, last_heartbeat, started_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT started_at FROM active_monitoring WHERE session_id = ?), ?))
-        """, (session_id, username, mac, ip, location, device_name, title, ctype, elapsed, now_ts, session_id, now_str))
+           (session_id,username,mac,ip,location,device,content_title,content_type,elapsed_seconds,last_heartbeat,started_at,playback_status,content_id)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+           (session_id, username, mac, ip, resolve_ip_location(ip), parse_user_agent(ua), title, ctype, elapsed, now_ts, started, status, content_id))
+    # Histórico independente da sessão ao vivo, preservando cada título assistido.
+    if status == "stopped":
+        conn.execute("UPDATE playback_history SET playback_status='stopped', ended_at=?, last_heartbeat=? WHERE session_id=?", (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), now_ts, session_id))
+    else:
+        conn.execute("""INSERT INTO playback_history
+          (session_id,username,content_title,content_type,content_id,started_at,last_heartbeat,elapsed_seconds,playback_status,ended_at)
+          VALUES (?,?,?,?,?,?,?,?,?,NULL)
+          ON CONFLICT(session_id) DO UPDATE SET
+          last_heartbeat=excluded.last_heartbeat,elapsed_seconds=excluded.elapsed_seconds,
+          playback_status=excluded.playback_status""",
+          (session_id, username, title, ctype, content_id, started, now_ts, elapsed, status))
     conn.commit()
     conn.close()
-
     return jsonify({"ok": True})
 
 # ==========================================================
@@ -386,100 +437,82 @@ def api_config():
         "dns": dns_list[0] if dns_list else "",
         "dns_list": dns_list,
         "support_whatsapp": cfg.get("support_whatsapp", ""),
-        "adult_pin": cfg.get("adult_pin", "0000"),
         "default_payment_link": cfg.get("default_payment_link", "")
     })
 
 @app.route("/api/login", methods=["POST"])
 def api_login():
     data = request.get_json(silent=True) or {}
-    username = (data.get("username") or "").strip()
-    password = (data.get("password") or "").strip()
-    mac = (data.get("mac") or "").strip().upper()
-
+    username = str(data.get("username") or "").strip()
+    password = str(data.get("password") or "").strip()
+    mac = str(data.get("mac") or "").strip().upper()[:64]
     if not username or not password:
         return jsonify({"ok": False, "error": "Informe usuário e senha."}), 400
-
-    forwarded = request.headers.get("X-Forwarded-For", "")
-    ip = (forwarded.split(",")[0].strip() if forwarded else request.remote_addr) or "0.0.0.0"
-    record_device_entry(mac, ip, request.headers.get("User-Agent", ""), username)
-
     cfg = get_settings()
     dns_list = [d.strip().rstrip("/") for d in cfg.get("dns_list", "").splitlines() if d.strip()]
-    primary_dns = dns_list[0] if dns_list else "http://zavryqonix.online:80"
-
     conn = get_main_db()
-    existing = conn.execute("SELECT * FROM active_users WHERE username = ?", (username,)).fetchone()
-    now_ts = int(time.time())
-
-    chosen_dns = primary_dns
-    expires_at = now_ts + (30 * 86400)
-    max_conns = "1"
-    status_str = "Active"
-    plan_type = "Assinante Oficial"
-    created_at_str = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-    payment_link = cfg.get("default_payment_link", "")
-
+    existing = conn.execute("SELECT * FROM active_users WHERE username=?", (username,)).fetchone()
+    now = int(time.time())
+    pay = (existing["payment_link"] if existing else "") or cfg.get("default_payment_link", "")
+    # Não criar acesso fictício de 30 dias quando os servidores não respondem.
+    if existing and existing["dns_used"] and existing["dns_used"] not in dns_list:
+        dns_list.insert(0, existing["dns_used"])
+    info = None
+    chosen_dns = None
+    upstream_reached = False
     for dns in dns_list:
-        if not dns.startswith("http://") and not dns.startswith("https://"): dns = "http://" + dns
+        if not dns.startswith(("http://", "https://")):
+            dns = "http://" + dns
         try:
             api_url = f"{dns}/player_api.php?username={urllib.parse.quote(username)}&password={urllib.parse.quote(password)}"
-            req = urllib.request.Request(api_url, headers={"User-Agent": "IPTVSmartersPro/3.1.5 (Linux; Android 12)", "Accept": "*/*"})
+            req = urllib.request.Request(api_url, headers={"User-Agent": "IPTVSmartersPro/3.1.5", "Accept": "application/json"})
             with urllib.request.urlopen(req, timeout=7, context=SSL_CTX) as resp:
-                info = json.loads(resp.read().decode("utf-8", errors="ignore"))
-                u_info = info.get("user_info", {})
-                if str(u_info.get("auth")) == "1" or str(u_info.get("status")).lower() in ["active", "trial"]:
-                    chosen_dns = dns
-                    status_str = u_info.get("status", "Active")
-                    max_conns = str(u_info.get("max_connections", "1"))
-                    if u_info.get("created_at"):
-                        try:
-                            created_at_str = datetime.fromtimestamp(int(u_info.get("created_at"))).strftime("%d/%m/%Y %H:%M:%S")
-                        except: pass
-                    exp_date = u_info.get("exp_date")
-                    if exp_date and str(exp_date).isdigit():
-                        expires_at = int(exp_date)
-                        if now_ts >= expires_at:
-                            conn.close()
-                            return jsonify({
-                                "ok": False, "expired": True,
-                                "payment_link": existing["payment_link"] if existing else payment_link,
-                                "error": "Assinatura vencida! Redirecionando..."
-                            }), 403
-                    break
+                result = json.loads(resp.read(1024 * 1024).decode("utf-8", errors="replace"))
+            if not isinstance(result, dict) or not isinstance(result.get("user_info"), dict):
+                continue
+            upstream_reached = True
+            uinfo = result["user_info"]
+            exp = int(uinfo.get("exp_date") or 0) if str(uinfo.get("exp_date") or "0").isdigit() else 0
+            state = str(uinfo.get("status") or "").lower()
+            if (exp and exp <= now) or state in ("expired", "disabled", "banned"):
+                conn.close()
+                return jsonify({"ok": False, "expired": True, "payment_link": pay, "error": "Seu acesso venceu."}), 403
+            if str(uinfo.get("auth")) == "1" and (state in ("active", "trial", "") or not state):
+                info = uinfo
+                chosen_dns = dns
+                break
         except Exception:
             continue
-
-    m3u_url = f"{chosen_dns}/get.php?username={urllib.parse.quote(username)}&password={urllib.parse.quote(password)}&type=m3u_plus&output=ts"
-
-    if not existing:
-        conn.execute("""INSERT OR REPLACE INTO active_users
-            (username, password, dns_used, m3u_url, plan_type, max_connections, expires_at, payment_link, is_trial, created_at_str)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)""",
-            (username, password, chosen_dns, m3u_url, plan_type, max_conns, expires_at, payment_link, created_at_str))
-        conn.commit()
-    else:
-        conn.execute("UPDATE active_users SET expires_at = ?, max_connections = ?, created_at_str = ? WHERE username = ?", (expires_at, max_conns, created_at_str, username))
-        conn.commit()
-        plan_type = existing["plan_type"] or plan_type
-        payment_link = existing["payment_link"] or payment_link
+    if not info:
+        cached_exp = int(existing["expires_at"] or 0) if existing else 0
+        conn.close()
+        if existing and cached_exp and cached_exp <= now:
+            return jsonify({"ok": False, "expired": True, "payment_link": pay, "error": "Seu acesso venceu."}), 403
+        return jsonify({"ok": False, "error": "Credenciais inválidas ou servidor IPTV indisponível." if upstream_reached else "Não foi possível validar o acesso no servidor IPTV."}), 401
+    expires = int(info.get("exp_date") or 0) if str(info.get("exp_date") or "0").isdigit() else 0
+    created = existing["created_at_str"] if existing else datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    if str(info.get("created_at") or "").isdigit():
+        try: created = datetime.fromtimestamp(int(info["created_at"])).strftime("%d/%m/%Y %H:%M:%S")
+        except (ValueError, OverflowError): pass
+    m3u = f"{chosen_dns}/get.php?username={urllib.parse.quote(username)}&password={urllib.parse.quote(password)}&type=m3u_plus&output=mpegts"
+    plan = (existing["plan_type"] if existing else "") or "Assinante Oficial"
+    max_conns = str(info.get("max_connections") or "1")
+    is_trial = int(existing["is_trial"] or 0) if existing else 0
+    conn.execute("""INSERT OR REPLACE INTO active_users
+      (username,password,dns_used,m3u_url,plan_type,max_connections,expires_at,payment_link,is_trial,created_at_str)
+      VALUES (?,?,?,?,?,?,?,?,?,?)""",
+      (username,password,chosen_dns,m3u,plan,max_conns,expires,pay,is_trial,created))
+    conn.commit()
     conn.close()
-
-    return jsonify({
-        "ok": True,
-        "username": username,
-        "password": password,
-        "dns": chosen_dns,
-        "m3u_url": m3u_url,
-        "plan_type": plan_type,
-        "max_connections": max_conns,
-        "status": status_str,
-        "created_formatted": created_at_str,
-        "expires_at": expires_at,
-        "expires_formatted": datetime.fromtimestamp(expires_at).strftime("%d/%m/%Y às %H:%M") if expires_at else "Sem Vencimento",
-        "payment_link": payment_link,
-        "support_whatsapp": cfg.get("support_whatsapp", "")
-    })
+    session["streamflix_user"] = username
+    session.permanent = True
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    record_device_entry(mac, forwarded.split(",")[0].strip() if forwarded else request.remote_addr, request.headers.get("User-Agent", ""), username)
+    return jsonify({"ok": True, "username": username, "password": password, "dns": chosen_dns,
+      "m3u_url": m3u, "plan_type": plan, "max_connections": max_conns,
+      "status": info.get("status") or "Active", "created_formatted": created,
+      "expires_at": expires, "expires_formatted": datetime.fromtimestamp(expires).strftime("%d/%m/%Y às %H:%M") if expires else "Sem vencimento",
+      "payment_link": pay, "support_whatsapp": cfg.get("support_whatsapp", "")})
 
 @app.route("/api/request-trial", methods=["POST"])
 def api_request_trial():
@@ -526,11 +559,9 @@ def api_request_trial():
 
     parsed = parse_trial_api_response(raw_api_resp, cfg)
 
-    if not parsed["username"]:
-        rand_suffix = hashlib.md5(f"{client_ip}{time.time()}".encode()).hexdigest()[:5]
-        parsed["username"] = f"teste_{rand_suffix}"
-        parsed["password"] = f"{int(time.time()) % 900000 + 100000}"
-        if parsed["dns"]: parsed["m3u_url"] = f"{parsed['dns']}/get.php?username={parsed['username']}&password={parsed['password']}&type=m3u_plus&output=ts"
+    if not parsed["username"] or not parsed["password"]:
+        conn1.close()
+        return jsonify({"ok": False, "error": "A API de testes não forneceu uma conta IPTV válida. Nenhum teste fictício foi registrado."}), 502
 
     parsed["raw_message"] = format_custom_trial_message(parsed)
 
@@ -548,28 +579,34 @@ def api_request_trial():
     conn1.commit()
     conn1.close()
 
+    session["streamflix_user"] = parsed["username"]
+    session.permanent = True
     return jsonify({"ok": True, "trial": parsed})
 
 @app.route("/api/check-session", methods=["POST"])
 def api_check_session():
-    data = request.get_json(silent=True) or {}
-    username = (data.get("username") or "").strip()
-    if not username: return jsonify({"valid": False})
+    username = session.get("streamflix_user")
+    if not username:
+        return jsonify({"valid": False, "expired": False}), 401
     conn = get_main_db()
     row = conn.execute("SELECT * FROM active_users WHERE username = ?", (username,)).fetchone()
     conn.close()
-    if row:
-        exp_ts = int(row["expires_at"] or 0)
-        now_ts = int(time.time())
-        if exp_ts > 0 and now_ts >= exp_ts:
-            return jsonify({"valid": False, "expired": True, "payment_link": row["payment_link"]})
-        return jsonify({
-            "valid": True, "expired": False, "expires_at": exp_ts,
-            "remaining_seconds": max(0, exp_ts - now_ts) if exp_ts > 0 else 999999,
-            "plan_type": row["plan_type"],
-            "payment_link": row["payment_link"]
-        })
-    return jsonify({"valid": True, "expired": False, "remaining_seconds": 86400})
+    if not row:
+        session.pop("streamflix_user", None)
+        return jsonify({"valid": False, "expired": False}), 401
+    exp = int(row["expires_at"] or 0)
+    now = int(time.time())
+    if exp and exp <= now:
+        session.pop("streamflix_user", None)
+        return jsonify({"valid": False, "expired": True, "payment_link": row["payment_link"] or get_settings().get("default_payment_link", "")}), 403
+    return jsonify({"valid": True, "expired": False, "expires_at": exp,
+                    "remaining_seconds": max(0, exp - now) if exp else None,
+                    "plan_type": row["plan_type"], "payment_link": row["payment_link"] or get_settings().get("default_payment_link", "")})
+
+@app.route("/api/logout", methods=["POST"])
+def api_logout():
+    session.pop("streamflix_user", None)
+    return jsonify({"ok": True})
 
 # --- GESTÃO ADMIN COM PURGE TOTAL DE REGISTROS ---
 @app.route("/api/admin/login", methods=["POST"])
@@ -588,7 +625,7 @@ def api_admin_data():
     conn2 = get_devices_db()
     devices = [dict(r) for r in conn2.execute("SELECT * FROM devices ORDER BY id DESC LIMIT 200").fetchall()]
     now_ts = int(time.time())
-    active_rows = conn2.execute("SELECT * FROM active_monitoring WHERE last_heartbeat >= ? ORDER BY last_heartbeat DESC", (now_ts - 25,)).fetchall()
+    active_rows = conn2.execute("SELECT * FROM active_monitoring WHERE last_heartbeat >= ? ORDER BY last_heartbeat DESC", (now_ts - 45,)).fetchall()
     active_monitoring = []
     for r in active_rows:
         d = dict(r)
@@ -598,52 +635,57 @@ def api_admin_data():
         d["elapsed_formatted"] = f"{h:02d}:{m:02d}:{s:02d}"
         active_monitoring.append(d)
     conn2.close()
-    return jsonify({"ok": True, "settings": cfg, "devices": devices, "monitoring": active_monitoring})
-
-def purge_device_and_trials(target_mac=None, target_ip=None, target_username=None, dev_id=None):
     conn1 = get_main_db()
-    conn2 = get_devices_db()
-    if dev_id and (not target_mac or not target_ip):
-        r = conn2.execute("SELECT * FROM devices WHERE id = ?", (dev_id,)).fetchone()
-        if r:
-            target_mac = r["mac"] or target_mac
-            target_ip = r["ip"] or target_ip
-            target_username = r["username"] or target_username
-    if target_mac or target_ip or target_username:
-        conn1.execute("""DELETE FROM trial_records WHERE 
-            (? IS NOT NULL AND device_mac = ?) OR 
-            (? IS NOT NULL AND ip_address = ?) OR 
-            (? IS NOT NULL AND username = ?)""", (target_mac, target_mac, target_ip, target_ip, target_username, target_username))
-        if target_username: conn1.execute("DELETE FROM active_users WHERE username = ?", (target_username,))
-        conn1.commit()
-    if dev_id: conn2.execute("DELETE FROM devices WHERE id = ?", (dev_id,))
-    if target_mac:
-        conn2.execute("DELETE FROM devices WHERE mac = ?", (target_mac,))
-        conn2.execute("DELETE FROM active_monitoring WHERE mac = ?", (target_mac,))
-    if target_ip:
-        conn2.execute("DELETE FROM devices WHERE ip = ?", (target_ip,))
-        conn2.execute("DELETE FROM active_monitoring WHERE ip = ?", (target_ip,))
-    if target_username:
-        conn2.execute("DELETE FROM devices WHERE username = ?", (target_username,))
-        conn2.execute("DELETE FROM active_monitoring WHERE username = ?", (target_username,))
-    conn2.commit()
+    trials = [dict(r) for r in conn1.execute("SELECT id, username, plan_type, expires_at, created_at, device_mac, ip_address, payment_link FROM trial_records ORDER BY id DESC LIMIT 500").fetchall()]
     conn1.close()
-    conn2.close()
+    conn_hist = get_devices_db()
+    history = [dict(r) for r in conn_hist.execute("SELECT username,content_title,content_type,started_at,elapsed_seconds,playback_status FROM playback_history ORDER BY last_heartbeat DESC LIMIT 80").fetchall()]
+    conn_hist.close()
+    return jsonify({"ok": True, "settings": cfg, "devices": devices, "trials": trials, "monitoring": active_monitoring, "history": history})
 
 @app.route("/api/admin/delete-device/<int:device_id>", methods=["DELETE"])
 def api_admin_delete_device(device_id):
-    if not session.get("is_admin"): return jsonify({"ok": False}), 401
-    purge_device_and_trials(dev_id=device_id)
+    if not session.get("is_admin"):
+        return jsonify({"ok": False}), 401
+    conn = get_devices_db()
+    row = conn.execute("SELECT id FROM devices WHERE id=?", (device_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify({"ok": False, "error": "Dispositivo não encontrado"}), 404
+    # Exclui somente o dispositivo escolhido; jamais apaga testes por IP compartilhado.
+    conn.execute("DELETE FROM devices WHERE id=?", (device_id,))
+    conn.commit()
+    conn.close()
     return jsonify({"ok": True})
 
 @app.route("/api/admin/delete-trial/<int:trial_id>", methods=["DELETE"])
 def api_admin_delete_trial(trial_id):
-    if not session.get("is_admin"): return jsonify({"ok": False}), 401
-    conn1 = get_main_db()
-    r = conn1.execute("SELECT * FROM trial_records WHERE id = ?", (trial_id,)).fetchone()
-    conn1.close()
-    if r: purge_device_and_trials(target_mac=r["device_mac"], target_ip=r["ip_address"], target_username=r["username"])
-    return jsonify({"ok": True})
+    if not session.get("is_admin"):
+        return jsonify({"ok": False}), 401
+    conn = get_main_db()
+    row = conn.execute("SELECT username FROM trial_records WHERE id=?", (trial_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify({"ok": False, "error": "Teste não encontrado"}), 404
+    conn.execute("DELETE FROM trial_records WHERE id=?", (trial_id,))
+    remaining = conn.execute("SELECT COUNT(*) FROM trial_records WHERE username=?", (row["username"],)).fetchone()[0]
+    if remaining == 0:
+        conn.execute("DELETE FROM active_users WHERE username=? AND is_trial=1", (row["username"],))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "deleted": 1})
+
+@app.route("/api/admin/delete-all-trials", methods=["DELETE"])
+def api_admin_delete_all_trials():
+    if not session.get("is_admin"):
+        return jsonify({"ok": False}), 401
+    conn = get_main_db()
+    count = conn.execute("SELECT COUNT(*) FROM trial_records").fetchone()[0]
+    conn.execute("DELETE FROM active_users WHERE is_trial=1")
+    conn.execute("DELETE FROM trial_records")
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "deleted": count})
 
 @app.route("/api/admin/save", methods=["POST"])
 def api_admin_save():
@@ -651,13 +693,192 @@ def api_admin_save():
     save_settings(request.get_json(silent=True) or {})
     return jsonify({"ok": True})
 
+@app.route("/api/adult/unlock", methods=["POST"])
+def api_adult_unlock():
+    username = session.get("streamflix_user")
+    if not username:
+        return jsonify({"ok": False, "error": "Entre na sua conta"}), 401
+    data = request.get_json(silent=True) or {}
+    pin = str(data.get("pin") or "").strip()
+    conn = get_main_db()
+    row = conn.execute("SELECT adult_pin FROM active_users WHERE username=?", (username,)).fetchone()
+    conn.close()
+    expected = (row["adult_pin"] if row else "") or get_settings().get("adult_pin", "0000")
+    if not hmac.compare_digest(pin, str(expected)):
+        return jsonify({"ok": False, "error": "PIN incorreto"}), 403
+    session["adult_unlocked"] = True
+    return jsonify({"ok": True})
+
 @app.route("/api/update-adult-pin", methods=["POST"])
 def api_update_adult_pin():
+    username = session.get("streamflix_user")
+    if not username:
+        return jsonify({"ok": False, "error": "Faça login primeiro"}), 401
     data = request.get_json(silent=True) or {}
     new_pin = str(data.get("new_pin") or "").strip()
-    if len(new_pin) != 4 or not new_pin.isdigit(): return jsonify({"ok": False, "error": "O PIN deve conter 4 dígitos."}), 400
-    save_settings({"adult_pin": new_pin})
-    return jsonify({"ok": True, "pin": new_pin})
+    if len(new_pin) != 4 or not new_pin.isdigit():
+        return jsonify({"ok": False, "error": "O PIN deve conter 4 dígitos."}), 400
+    conn = get_main_db()
+    conn.execute("UPDATE active_users SET adult_pin=? WHERE username=?", (new_pin, username))
+    conn.commit()
+    conn.close()
+    session["adult_unlocked"] = False
+    return jsonify({"ok": True})
+
+# ==========================================================
+# STREAMING E XTREAM POR MESMA ORIGEM (HTTPS/CORS)
+# ==========================================================
+# A playlist não é exposta via URL arbitrária: somente o DNS autenticado e
+# URLs HLS assinadas podem ser acessados. O proxy NÃO transcodifica codecs.
+class _SafeRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        parsed = urlsplit(newurl)
+        if parsed.scheme not in ("http", "https"):
+            raise ValueError("Redirecionamento inválido")
+        host = parsed.hostname
+        if not host:
+            raise ValueError("Host ausente")
+        # Impede redirecionamentos para localhost/redes privadas (SSRF).
+        addresses = socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM)
+        if not addresses or any(not ipaddress.ip_address(a[4][0]).is_global for a in addresses):
+            raise ValueError("Redirecionamento para endereço privado bloqueado")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+_public_dns_cache = {}
+def _check_public_media_url(url):
+    parsed = urlsplit(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError("URL de mídia inválida")
+    key = (parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80))
+    cached = _public_dns_cache.get(key)
+    if cached and cached > time.time():
+        return
+    infos = socket.getaddrinfo(*key, type=socket.SOCK_STREAM)
+    if not infos or any(not ipaddress.ip_address(a[4][0]).is_global for a in infos):
+        raise ValueError("Endereço de mídia não público")
+    if len(_public_dns_cache) > 300:
+        _public_dns_cache.clear()
+    _public_dns_cache[key] = time.time() + 60
+
+def _remote_open(url, range_header=None):
+    _check_public_media_url(url)
+    headers = {"User-Agent": "VLC/3.0 StreamFlix", "Accept": "*/*", "Accept-Encoding": "identity"}
+    if range_header and re.fullmatch(r"bytes=\d*-\d*", range_header):
+        headers["Range"] = range_header
+    opener = urllib.request.build_opener(_SafeRedirect(), urllib.request.HTTPSHandler(context=SSL_CTX))
+    return opener.open(urllib.request.Request(url, headers=headers), timeout=20)
+
+def _media_user():
+    username = session.get("streamflix_user")
+    if not username:
+        return None
+    conn = get_main_db()
+    row = conn.execute("SELECT * FROM active_users WHERE username=?", (username,)).fetchone()
+    conn.close()
+    if not row or (int(row["expires_at"] or 0) and int(row["expires_at"]) <= int(time.time())):
+        return None
+    return row
+
+def _sign_hls_url(url, username):
+    expires = int(time.time()) + 6 * 3600
+    payload = json.dumps({"url": url, "user": username, "exp": expires}, separators=(",", ":")).encode()
+    body = base64.urlsafe_b64encode(payload).decode().rstrip("=")
+    mac = hmac.new(app.secret_key.encode() if isinstance(app.secret_key, str) else app.secret_key, body.encode(), hashlib.sha256).hexdigest()
+    return "/api/hls/" + body + "." + mac
+
+def _hls_rewrite(content, remote_url, username):
+    out = []
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#"):
+            out.append(_sign_hls_url(urljoin(remote_url, stripped), username))
+        elif stripped.startswith("#EXT-X-") and 'URI="' in line:
+            out.append(re.sub(r'URI="([^"]+)"', lambda m: 'URI="' + _sign_hls_url(urljoin(remote_url, m.group(1)), username) + '"', line))
+        else:
+            out.append(line)
+    return "\n".join(out) + "\n"
+
+def _proxy_media(remote_url, username):
+    try:
+        source = _remote_open(remote_url, request.headers.get("Range"))
+    except Exception as exc:
+        app.logger.warning("Falha ao abrir mídia: %s", type(exc).__name__)
+        return jsonify({"error": "Servidor de mídia indisponível"}), 502
+    content_type = source.headers.get("Content-Type", "application/octet-stream").split(";")[0]
+    final_url = source.geturl()
+    is_playlist = ("mpegurl" in content_type.lower() or urlsplit(final_url).path.lower().endswith(".m3u8"))
+    if is_playlist:
+        data = source.read(4 * 1024 * 1024 + 1)
+        source.close()
+        if len(data) > 4 * 1024 * 1024:
+            return jsonify({"error": "Playlist muito grande"}), 502
+        body = _hls_rewrite(data.decode("utf-8-sig", "replace"), final_url, username)
+        return Response(body, mimetype="application/vnd.apple.mpegurl", headers={"Cache-Control": "no-store"})
+    status_code = getattr(source, "status", 200)
+    def generate():
+        try:
+            while True:
+                chunk = source.read(64 * 1024)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            source.close()
+    heads = {"Cache-Control": "no-store", "Accept-Ranges": source.headers.get("Accept-Ranges", "bytes")}
+    for key in ("Content-Length", "Content-Range"):
+        if source.headers.get(key):
+            heads[key] = source.headers[key]
+    return Response(stream_with_context(generate()), status=status_code, content_type=content_type, headers=heads)
+
+@app.route("/api/xtream")
+def api_xtream_proxy():
+    row = _media_user()
+    if not row: return jsonify({"error": "Acesso encerrado ou vencido"}), 401
+    allowed = {"get_live_categories", "get_vod_categories", "get_series_categories", "get_vod_streams", "get_series", "get_live_streams", "get_series_info", "get_vod_info", "get_short_epg"}
+    action = request.args.get("action", "")
+    if action not in allowed: return jsonify({"error": "Ação não permitida"}), 400
+    args = {"username": row["username"], "password": row["password"], "action": action}
+    for key in ("series_id", "vod_id", "stream_id"):
+        if request.args.get(key) and re.fullmatch(r"[0-9]{1,15}", request.args[key]):
+            args[key] = request.args[key]
+    url = row["dns_used"].rstrip("/") + "/player_api.php?" + urllib.parse.urlencode(args)
+    try:
+        with _remote_open(url) as r:
+            data = r.read(15 * 1024 * 1024 + 1)
+            if len(data) > 15 * 1024 * 1024:
+                return jsonify({"error": "Resposta excedeu o limite"}), 502
+            return Response(data, content_type="application/json", headers={"Cache-Control": "no-store"})
+    except Exception as exc:
+        app.logger.warning("Falha na API Xtream: %s", type(exc).__name__)
+        return jsonify({"error": "Falha na API do servidor IPTV"}), 502
+
+@app.route("/api/media/<kind>/<stream_id>.<ext>")
+def api_media_stream(kind, stream_id, ext):
+    row = _media_user()
+    if not row: return jsonify({"error": "Acesso encerrado ou vencido"}), 401
+    if kind not in ("live", "movie", "series") or not re.fullmatch(r"[a-zA-Z0-9_-]{1,45}", stream_id) or ext.lower() not in ("m3u8", "ts", "mp4", "mkv", "avi", "mov", "m4v", "webm"):
+        return jsonify({"error": "Mídia inválida"}), 400
+    remote = f"{row['dns_used'].rstrip('/')}/{kind}/{urllib.parse.quote(row['username'])}/{urllib.parse.quote(row['password'])}/{stream_id}.{ext.lower()}"
+    return _proxy_media(remote, row["username"])
+
+@app.route("/api/hls/<token>")
+def api_hls_resource(token):
+    row = _media_user()
+    if not row: return jsonify({"error": "Acesso encerrado ou vencido"}), 401
+    try:
+        body, signature = token.rsplit(".", 1)
+        secret = app.secret_key.encode() if isinstance(app.secret_key, str) else app.secret_key
+        correct = hmac.new(secret, body.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(correct, signature): raise ValueError()
+        payload = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
+        if payload.get("user") != row["username"] or payload.get("exp", 0) < time.time(): raise ValueError()
+        url = payload["url"]
+        parsed = urlsplit(url)
+        if parsed.scheme not in ("http", "https"): raise ValueError()
+        # URLs encadeadas somente através de playlist assinada, nunca URL arbitrária do cliente.
+        return _proxy_media(url, row["username"])
+    except (ValueError, KeyError, TypeError, UnicodeDecodeError, json.JSONDecodeError):
+        return jsonify({"error": "Token de vídeo inválido"}), 403
 
 # ==========================================================
 # 6. FRONTEND ESTILO NETFLIX (CONTROLES SLIM, VOD PROGRESS E LISTA TV)
@@ -669,6 +890,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
     <meta http-equiv="Cache-Control" content="no-store, max-age=0">
     <title>StreamFlix Pro</title>
+    <meta name="streamflix-version" content="2026-11-10-integrado-monitoramento-v2">
     <script src="https://unpkg.com/lucide@latest"></script>
     <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
     <script src="https://cdn.jsdelivr.net/npm/mpegts.js@latest/dist/mpegts.js"></script>
@@ -1137,6 +1359,44 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             .poster-card { flex:0 0 155px; }
             .tv-channel-item { flex-direction:row; }
         }
+        /* Ajustes isolados: preserva layout e player StreamFlix da versão integrada. */
+        .drawer-panel { width:50vw; min-width:0; max-width:50vw; }
+        body.player-open .drawer-panel { width:50vw; min-width:0; max-width:50vw; }
+        .player-modal.tv-list-open .video-stage { width:50vw; right:0; top:50%; height:auto; min-height:0; aspect-ratio:16/9; max-height:50vh; transform:translateY(-50%); border-radius:8px; }
+        @media (max-width:360px) { .drawer-panel,body.player-open .drawer-panel { width:50vw; min-width:0; max-width:50vw; } .player-modal.tv-list-open .video-stage { width:50vw; height:auto; min-height:0; aspect-ratio:16/9; } }
+        body.player-open.player-list-mode .drawer-backdrop.active { pointer-events:auto; background:transparent; }
+        body.player-open.player-list-mode .drawer-panel { z-index:670; }
+        body.player-open.player-list-mode .bottom-nav.active { z-index:710; }
+        /* Mantém a navegação inferior visível somente ao tocar no player,
+           com o dock deslocado acima dela; evita sobreposição de botões. */
+        body.player-open.player-controls-visible:not(.player-list-mode) .player-dock-wrap {
+            bottom:calc(88px + env(safe-area-inset-bottom, 0px));
+        }
+        .player-modal.tv-list-open .player-dock-wrap,.player-modal.tv-list-open .player-top-slim { display:none !important; }
+        .player-modal.tv-list-open .video-stage { cursor:pointer; }
+        #video-player.mode-vertical-extend { width:100%; height:100%; object-fit:fill; max-height:100%; transform:none; }
+        .video-stage.vertical-fit { height:100%; }
+        .series-modal.active { z-index:800; }
+        .series-hero { height:min(45vh, 320px); background-size:contain; background-repeat:no-repeat; background-position:center; background-color:#090911; }
+        .series-hero-overlay { background:linear-gradient(0deg,var(--bg-surface),transparent 38%); pointer-events:none; }
+        .poster-aspect img { object-fit:contain; }
+        .hero-bg { background-size:contain; background-repeat:no-repeat; background-color:#050509; }
+        .player-dock-wrap { bottom:calc(18px + env(safe-area-inset-bottom, 0px)); }
+        .player-dock { max-width:100%; overflow-x:auto; scrollbar-width:none; }
+        .player-dock .mini-btn { flex-shrink:0; }
+        .drawer-item.now-playing { color:#fff; background:rgba(229,9,20,.25); border:1px solid rgba(229,9,20,.6); }
+        .expired-card { background:var(--bg-surface); width:min(92vw,440px); border:1px solid #f87171; border-radius:20px; padding:1.4rem; text-align:center; box-shadow:0 20px 80px rgba(0,0,0,.6); }
+        .expired-card h2 { font-size:1.45rem; margin:.5rem 0; }
+        .expired-card p { font-size:.86rem; color:var(--text-muted); margin:.65rem 0 1.1rem; line-height:1.5; }
+        #access-expired-modal { position:fixed; inset:0; z-index:2000; background:rgba(0,0,0,.96); display:none; align-items:center; justify-content:center; padding:15px; }
+        #access-expired-modal.active { display:flex; }
+        .expiry-banner { background:rgba(245,158,11,.16); color:#fbbf24; border:1px solid rgba(245,158,11,.4); border-radius:12px; padding:.65rem .85rem; margin:10px; font-size:.78rem; text-align:center; }
+        .monitor-status { font-weight:800; font-size:.7rem; }
+        .monitor-status.playing { color:#10b981; }
+        .monitor-status.connecting,.monitor-status.buffering { color:#fbbf24; }
+        .monitor-status.error { color:#f87171; }
+        .admin-table td { overflow-wrap:anywhere; }
+
     </style>
 </head>
 <body>
@@ -1189,6 +1449,18 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     </header>
 
     <!-- DRAWER LATERAL OCULTO (CATEGORIAS E LISTA DE TV NO PLAYER) -->
+    <!-- AVISO DE VENCIMENTO: mostrado também ao tentar logar com acesso expirado -->
+    <div id="access-expired-modal" role="dialog" aria-modal="true" aria-labelledby="expired-title">
+        <div class="expired-card">
+            <div style="font-size:2rem;">🔒</div>
+            <h2 id="expired-title">Seu acesso venceu.</h2>
+            <p>Para voltar a assistir TV, filmes e séries, renove seu acesso.</p>
+            <a id="btn-expired-pay" class="btn-pill btn-pill-primary" href="#" target="_blank" rel="noopener noreferrer" style="display:inline-block; padding:.85rem 1.6rem; text-decoration:none;">Liberar acesso</a>
+            <p id="expired-pay-info" class="hidden">O link de pagamento não está disponível. Procure o suporte para renovar.</p>
+            <div style="margin-top:1rem;"><button type="button" class="btn-pill btn-pill-outline" id="btn-expired-switch">Entrar com outra conta</button></div>
+        </div>
+    </div>
+
     <div class="drawer-backdrop" id="drawer-backdrop"></div>
     <aside class="drawer-panel" id="drawer-panel">
         <div class="drawer-header">
@@ -1400,6 +1672,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 <button class="mini-btn" id="dock-btn-ff" title="Avançar 10s">⏩</button>
                 <button class="mini-btn" id="dock-btn-speed" title="Velocidade">1.0x</button>
                 <button class="mini-btn" id="dock-btn-aspect" title="Ajuste de Tela">📐</button>
+                <button class="mini-btn" id="dock-btn-categories" title="Abrir categorias">☰ Categorias</button>
                 <button class="mini-btn hidden" id="dock-btn-tv-list" title="Lista de canais">☷</button>
                 <button class="mini-btn" id="dock-btn-engine" title="Decodificador">⚙️</button>
             </div>
@@ -1432,6 +1705,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                                 <tr>
                                     <th>Usuário</th>
                                     <th>Conteúdo Reproduzido</th>
+                                    <th>Estado</th>
                                     <th>Tempo</th>
                                     <th>IP</th>
                                     <th>Localização</th>
@@ -1440,16 +1714,36 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                                 </tr>
                             </thead>
                             <tbody id="adm-monitoring-tbody">
-                                <tr><td colspan="7" style="text-align:center; color:var(--text-muted); padding:1rem;">Nenhum usuário assistindo no momento.</td></tr>
+                                <tr><td colspan="8" style="text-align:center; color:var(--text-muted); padding:1rem;">Nenhuma sessão ativa no momento.</td></tr>
                             </tbody>
                         </table>
+                    </div>
+                </div>
+
+                <div class="config-card">
+                    <div class="config-title">📊 Histórico de conteúdos assistidos</div>
+                    <div style="overflow-x:auto; max-height:240px;overflow-y:auto;">
+                        <table class="admin-table"><thead><tr><th>Usuário</th><th>Conteúdo</th><th>Tipo</th><th>Início</th><th>Tempo</th><th>Estado</th></tr></thead>
+                        <tbody id="adm-history-tbody"><tr><td colspan="6">Nenhum histórico ainda.</td></tr></tbody></table>
+                    </div>
+                </div>
+                <!-- EXCLUSÃO INDIVIDUAL DE TESTES: não usa IP/MAC compartilhado -->
+                <div class="config-card">
+                    <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:.6rem;">
+                        <div class="config-title" style="margin:0;">🧪 Testes gerados</div>
+                        <button id="btn-admin-delete-all-trials" class="btn-pill btn-pill-outline" style="color:#fca5a5; border-color:#ef4444;">🗑️ Remover todos os testes</button>
+                    </div>
+                    <p style="font-size:.72rem; color:var(--text-muted); margin:.5rem 0;">A lixeira exclui somente o teste selecionado. A exclusão de todos exige confirmação.</p>
+                    <div style="overflow-x:auto; max-height:350px; overflow-y:auto;">
+                        <table class="admin-table"><thead><tr><th>ID</th><th>Usuário</th><th>Criado</th><th>Vencimento</th><th>Ação</th></tr></thead>
+                        <tbody id="adm-trials-tbody"><tr><td colspan="5">Carregando...</td></tr></tbody></table>
                     </div>
                 </div>
 
                 <!-- BANCO SEPARADO: REGISTRO DE MACs, IPs E LOCALIZAÇÃO COM BOTÃO DELETAR QUE LIBERA NOVO TESTE -->
                 <div class="config-card">
                     <div class="config-title">🛡️ Banco de Dispositivos Registrados (MAC, IP e Localização)</div>
-                    <p style="font-size:0.75rem; color:var(--text-muted); margin-bottom:0.6rem;">Salvo no banco de dados separado <code>devices_tracking.db</code>. Ao deletar, todos os registros daquele aparelho são apagados permitindo novo teste.</p>
+                    <p style="font-size:0.75rem; color:var(--text-muted); margin-bottom:0.6rem;">Dispositivos no banco <code>devices_tracking.db</code>. A lixeira de dispositivo remove somente a linha selecionada. Para liberar um teste específico, exclua-o na tabela de testes acima.</p>
                     <div style="overflow-x:auto;">
                         <table class="admin-table">
                             <thead>
@@ -1482,11 +1776,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     </div>
 
     <script>
-        lucide.createIcons();
+        if (window.lucide && typeof window.lucide.createIcons === "function") window.lucide.createIcons();
 
         let activeTab = "home";
         let activeCategory = "Todas";
-        let currentAuth = JSON.parse(localStorage.getItem("sf_session") || "null");
+        let currentAuth = null;
+        try { currentAuth = JSON.parse(localStorage.getItem("sf_session") || "null"); }
+        catch (_) { localStorage.removeItem("sf_session"); }
         let serverConfig = {};
         let xtreamCategories = { tv: [], movies: [], series: [] };
         let catalog = { tv: [], movies: [], series: [] };
@@ -1510,12 +1806,16 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         const ADULT_REGEX = /(?:18\s*\+|\+\s*18|\b18\s*anos\b|\badult[oa]s?\b|\bxxx\b|\bporn\w*\b|\berotic\w*\b|\bsexy\b|\bplayboy\b|\bvenus\b|\bfor adults\b)/i;
         let adultUnlocked = false;
         function isAdultCategory(name) { return ADULT_REGEX.test(String(name || "")); }
-        function requestAdultAccess() {
+        async function requestAdultAccess() {
             const pin = prompt("🔒 Pasta protegida: digite o PIN de 4 dígitos:");
             if (pin === null) return false;
-            if (pin !== adultPin) { alert("PIN incorreto!"); return false; }
-            adultUnlocked = true;
-            return true;
+            try {
+                const resp = await fetch("/api/adult/unlock", {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({pin})});
+                const data = await resp.json();
+                if (data.ok) { adultUnlocked = true; return true; }
+                alert(data.error || "PIN incorreto!");
+            } catch (_) { alert("Não foi possível validar o PIN."); }
+            return false;
         }
 
         function isAdultItem(item) {
@@ -1572,13 +1872,23 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             try {
                 const r = await fetch("/api/config");
                 serverConfig = await r.json();
-                adultPin = serverConfig.adult_pin || "0000";
                 if (serverConfig.support_whatsapp) {
                     document.getElementById("btn-support-wa").href = serverConfig.support_whatsapp;
                 }
             } catch (e) {}
         }
         loadPublicConfig();
+
+        function xtreamUrl(action, extra = {}) {
+            const params = new URLSearchParams({action, ...extra});
+            return `/api/xtream?${params.toString()}`;
+        }
+        function mediaUrl(kind, id, ext) {
+            return `/api/media/${kind}/${encodeURIComponent(String(id))}.${encodeURIComponent(String(ext || 'mp4').toLowerCase())}`;
+        }
+        function escapeHtml(value) {
+            return String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+        }
 
         // HERO CAROUSEL 5s
         let heroItems = [];
@@ -1628,9 +1938,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             try {
                 msgEl.textContent = "Obtendo categorias do servidor...";
                 const [rTvCat, rVodCat, rSerCat] = await Promise.all([
-                    fetch(`${dns}/player_api.php?username=${u}&password=${p}&action=get_live_categories`).catch(()=>({json:()=>[]})),
-                    fetch(`${dns}/player_api.php?username=${u}&password=${p}&action=get_vod_categories`).catch(()=>({json:()=>[]})),
-                    fetch(`${dns}/player_api.php?username=${u}&password=${p}&action=get_series_categories`).catch(()=>({json:()=>[]}))
+                    fetch(xtreamUrl("get_live_categories")).catch(()=>({json:()=>[]})),
+                    fetch(xtreamUrl("get_vod_categories")).catch(()=>({json:()=>[]})),
+                    fetch(xtreamUrl("get_series_categories")).catch(()=>({json:()=>[]}))
                 ]);
                 xtreamCategories.tv = await rTvCat.json().catch(()=>[]);
                 xtreamCategories.movies = await rVodCat.json().catch(()=>[]);
@@ -1647,9 +1957,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
                 msgEl.textContent = "Sincronizando conteúdos...";
                 const [rVod, rSer, rLive] = await Promise.all([
-                    fetch(`${dns}/player_api.php?username=${u}&password=${p}&action=get_vod_streams`).catch(()=>({json:()=>[]})),
-                    fetch(`${dns}/player_api.php?username=${u}&password=${p}&action=get_series`).catch(()=>({json:()=>[]})),
-                    fetch(`${dns}/player_api.php?username=${u}&password=${p}&action=get_live_streams`).catch(()=>({json:()=>[]}))
+                    fetch(xtreamUrl("get_vod_streams")).catch(()=>({json:()=>[]})),
+                    fetch(xtreamUrl("get_series")).catch(()=>({json:()=>[]})),
+                    fetch(xtreamUrl("get_live_streams")).catch(()=>({json:()=>[]}))
                 ]);
                 const vods = await rVod.json().catch(()=>[]);
                 const series = await rSer.json().catch(()=>[]);
@@ -1659,7 +1969,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     id: v.stream_id, name: v.name, group: v.category_name || vodCatMap[v.category_id] || "Filmes", category_id: v.category_id,
                     type: "movies", logo: v.stream_icon, container_extension: v.container_extension || "mp4",
                     rating: v.rating, tmdb_id: v.tmdb_id,
-                    url: `${dns}/movie/${currentAuth.username}/${currentAuth.password}/${v.stream_id}.${v.container_extension || 'mp4'}`
+                    url: mediaUrl("movie", v.stream_id, v.container_extension || "mp4")
                 }));
 
                 catalog.series = (Array.isArray(series) ? series : []).map(s => ({
@@ -1671,10 +1981,16 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 catalog.tv = (Array.isArray(live) ? live : []).map(l => ({
                     id: l.stream_id, name: l.name, group: l.category_name || liveCatMap[l.category_id] || "Canais", category_id: l.category_id,
                     type: "tv", logo: l.stream_icon, epg_id: l.epg_channel_id,
-                    url: `${dns}/live/${currentAuth.username}/${currentAuth.password}/${l.stream_id}.ts`
+                    url: mediaUrl("live", l.stream_id, "ts")
                 }));
 
-                heroItems = [...catalog.movies, ...catalog.series].filter(it => !isAdultItem(it)).slice(0, 15);
+                const hm = catalog.movies.filter(it => !isAdultItem(it)).slice(0, 8);
+                const hs = catalog.series.filter(it => !isAdultItem(it)).slice(0, 8);
+                heroItems = [];
+                for (let i=0; i<Math.max(hm.length, hs.length); i++) {
+                    if (hm[i]) heroItems.push(hm[i]);
+                    if (hs[i]) heroItems.push(hs[i]);
+                }
                 if (heroItems.length > 0) renderHeroSlide(heroItems[0]);
 
                 renderHomeCarousels();
@@ -1735,7 +2051,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             if (!dns.startsWith("http://") && !dns.startsWith("https://")) dns = "http://" + dns;
 
             try {
-                const r = await fetch(`${dns}/player_api.php?username=${encodeURIComponent(currentAuth.username)}&password=${encodeURIComponent(currentAuth.password)}&action=get_series_info&series_id=${it.id}`);
+                const r = await fetch(xtreamUrl("get_series_info", {series_id: it.id}));
                 const data = await r.json();
                 const info = data.info || {};
                 const episodes = data.episodes || {};
@@ -1780,7 +2096,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                         const epTitle = ep.title ? `Ep. ${epNum} - ${ep.title}` : `Episódio ${epNum}`;
                         const epDur = (ep.info && ep.info.duration) ? ep.info.duration : "";
                         const epExt = ep.container_extension || "mp4";
-                        const playUrl = `${dns}/series/${currentAuth.username}/${currentAuth.password}/${ep.id}.${epExt}`;
+                        const playUrl = mediaUrl("series", ep.id, epExt);
 
                         epCard.innerHTML = `
                             <div style="display:flex; align-items:center; gap:0.6rem; overflow:hidden;">
@@ -1845,7 +2161,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 try {
                     let dns = currentAuth.dns.replace(/\/$/, "");
                     if (!dns.startsWith("http://") && !dns.startsWith("https://")) dns = "http://" + dns;
-                    const r = await fetch(`${dns}/player_api.php?username=${encodeURIComponent(currentAuth.username)}&password=${encodeURIComponent(currentAuth.password)}&action=get_vod_info&vod_id=${it.id}`);
+                    const r = await fetch(xtreamUrl("get_vod_info", {vod_id: it.id}));
                     const d = await r.json();
                     const info = d.info || {};
                     const plot = info.plot || info.description || "Sinopse não informada pelo servidor.";
@@ -1862,7 +2178,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         }
         document.getElementById("btn-tmdb-close").onclick = () => document.getElementById("tmdb-modal").classList.remove("active");
 
-        // LISTA LATERAL DE TV E DRAWER DE CATEGORIAS
+        // MINIPLAYER PERSISTENTE E DRAWER DE CATEGORIAS (50% / 50%)
         function setTvMiniMode(enabled) {
             const modal = document.getElementById("player-modal");
             modal.classList.toggle("tv-list-open", enabled);
@@ -1871,149 +2187,141 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             if (enabled) {
                 document.getElementById("player-dock-wrap").classList.remove("visible");
                 document.getElementById("player-top-slim").classList.remove("visible");
+                closeAllBubbles();
             }
         }
+        function ensureSplitPlayer() {
+            document.getElementById("player-modal").classList.add("active");
+            document.body.classList.add("player-open");
+            setTvMiniMode(true);
+        }
         function expandTvPlayer() {
-            if (!currentPlayingItem || currentPlayingItem.type !== "tv") return;
+            if (!currentPlayingItem) return;
             closeDrawer();
             setTvMiniMode(false);
             resetDockTimer();
         }
-        // The area to the right of the category drawer is the mini-player's expansion target.
+        function showDrawer() {
+            document.getElementById("drawer-backdrop").classList.add("active");
+            document.getElementById("drawer-panel").classList.add("active");
+        }
+        // O backdrop transparente cobre o espaço vazio, inclusive a área do miniplayer.
+        document.getElementById("drawer-backdrop").onclick = () => {
+            if (document.getElementById("player-modal").classList.contains("tv-list-open")) expandTvPlayer();
+            else closeDrawer();
+        };
+        // Tocar diretamente o vídeo também pode expandir quando o backdrop não interceptar.
         document.getElementById("player-modal").addEventListener("click", (e) => {
-            const modal = document.getElementById("player-modal");
-            if (!modal.classList.contains("tv-list-open")) return;
-            if (e.target.closest(".video-stage, .player-top-slim, .player-dock-wrap")) return;
-            expandTvPlayer();
+            if (document.getElementById("player-modal").classList.contains("tv-list-open") &&
+                !e.target.closest(".player-dock-wrap,.player-top-slim")) expandTvPlayer();
         });
+        function appendBackToCategories(listEl, tab) {
+            const back = document.createElement("button");
+            back.className = "drawer-item";
+            back.textContent = "‹ Voltar às categorias";
+            back.onclick = () => openCategoriesDrawer(tab);
+            listEl.appendChild(back);
+        }
         function openTvChannelList(catName) {
-            if (document.getElementById("player-modal").classList.contains("active")) {
-                setTvMiniMode(true);
-            }
+            activeTab = "tv";
+            ensureSplitPlayer();
             const listEl = document.getElementById("drawer-list");
-            listEl.innerHTML = "";
-            document.getElementById("drawer-title").textContent = catName;
-
-            const btnBack = document.createElement("button");
-            btnBack.className = "drawer-item";
-            btnBack.innerHTML = `<span>‹ Voltar a Todas as Categorias</span>`;
-            btnBack.onclick = () => openCategoriesDrawer("tv");
-            listEl.appendChild(btnBack);
-
+            listEl.replaceChildren();
+            document.getElementById("drawer-title").textContent = `Canais • ${catName}`;
+            appendBackToCategories(listEl, "tv");
             const filtered = catalog.tv.filter(it => (catName === "Todas" || it.group === catName) && (!isAdultItem(it) || adultUnlocked));
             filtered.forEach(it => {
                 const b = document.createElement("button");
                 b.className = "drawer-item";
-                b.style.padding = "0.45rem 0.75rem";
-                b.style.justifyContent = "flex-start";
-                b.style.gap = "0.75rem";
-                b.innerHTML = `
-                    <div style="width:38px; height:38px; background:#050509; border-radius:6px; flex-shrink:0; padding:2px; display:flex; align-items:center; justify-content:center;">
-                        <img src="${it.logo}" onerror="this.style.display='none'" style="max-width:100%; max-height:100%;">
-                    </div>
-                    <div style="overflow:hidden; text-align:left;">
-                        <div style="font-size:0.8rem; font-weight:700; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${it.name}</div>
-                    </div>
-                `;
-                b.onclick = () => {
-                    if (currentPlayingItem && currentPlayingItem.id === it.id && currentPlayingItem.type === "tv") {
+                b.style.cssText = "padding:.5rem .35rem; gap:.45rem; justify-content:flex-start; min-height:50px;";
+                const selected = currentPlayingItem && currentPlayingItem.type === "tv" && String(currentPlayingItem.id) === String(it.id);
+                if (selected) b.classList.add("now-playing");
+                b.innerHTML = `<img src="${escapeHtml(it.logo || '')}" alt="" style="width:32px;height:32px;object-fit:contain;flex-shrink:0;border-radius:5px" onerror="this.style.display='none'"><span style="font-size:.74rem;overflow:hidden;overflow-wrap:anywhere;text-align:left">${escapeHtml(it.name)}</span>`;
+                b.onclick = (e) => {
+                    e.stopPropagation();
+                    // Somente segundo toque no MESMO canal expande. Troca de canal mantém lista.
+                    if (currentPlayingItem && currentPlayingItem.type === "tv" && String(currentPlayingItem.id) === String(it.id)) {
                         expandTvPlayer();
-                        return;
+                    } else {
+                        openItemPlay(it);
+                        listEl.querySelectorAll(".now-playing").forEach(x => x.classList.remove("now-playing"));
+                        b.classList.add("now-playing");
+                        showDrawer();
+                        setTvMiniMode(true);
                     }
-                    openItemPlay(it);
-                    openTvChannelList(catName);
-                    document.getElementById("drawer-backdrop").classList.add("active");
-                    document.getElementById("drawer-panel").classList.add("active");
-                    setTvMiniMode(true);
                 };
                 listEl.appendChild(b);
             });
+            showDrawer();
         }
-
+        function openMediaCategoryList(tab, catName) {
+            ensureSplitPlayer();
+            const listEl = document.getElementById("drawer-list");
+            listEl.replaceChildren();
+            document.getElementById("drawer-title").textContent = `${tab === 'movies' ? 'Filmes' : 'Séries'} • ${catName}`;
+            appendBackToCategories(listEl, tab);
+            catalog[tab].filter(it => (catName === "Todas" || it.group === catName) && (!isAdultItem(it) || adultUnlocked)).slice(0,500).forEach(it => {
+                const b = document.createElement("button");
+                b.className = "drawer-item";
+                b.style.cssText = "gap:.5rem;justify-content:flex-start;min-height:50px;padding:.45rem .4rem";
+                b.innerHTML = `<img src="${escapeHtml(it.logo || '')}" alt="" style="width:32px;height:40px;object-fit:contain;flex-shrink:0" onerror="this.style.display='none'"><span style="overflow-wrap:anywhere;font-size:.74rem;text-align:left">${escapeHtml(it.name)}</span>`;
+                b.onclick = (e) => { e.stopPropagation(); if (tab === "movies") openTmdbDetails(it); else openSeriesDetails(it); };
+                listEl.appendChild(b);
+            });
+            showDrawer();
+        }
         function openCategoriesDrawer(forceTab = null) {
             if (forceTab) activeTab = forceTab;
+            const tab = activeTab;
+            if (!["tv", "movies", "series"].includes(tab)) return;
+            const isSplit = document.getElementById("player-modal").classList.contains("active");
+            if (isSplit) ensureSplitPlayer();
             const list = document.getElementById("drawer-list");
-            list.innerHTML = "";
-            const cats = activeTab === "tv" ? xtreamCategories.tv : (activeTab === "movies" ? xtreamCategories.movies : xtreamCategories.series);
-            
-            let t = activeTab === "tv" ? "TV ao Vivo" : (activeTab === "movies" ? "Filmes" : "Séries");
-            document.getElementById("drawer-title").textContent = `Categorias (${t})`;
-
-            const bAll = document.createElement("button");
-            bAll.className = `drawer-item ${activeCategory === "Todas" ? "active" : ""}`;
-            bAll.innerHTML = `<span>Todas as Categorias</span>`;
-            bAll.onclick = () => {
-                selectCategory("Todas");
-                if (activeTab === "tv" && document.getElementById("player-modal").classList.contains("active")) {
-                    openTvChannelList("Todas");
-                    return;
-                }
-                if (activeTab === "tv") {
-                    document.getElementById("view-home").classList.add("hidden");
-                    document.getElementById("view-catalog").classList.add("hidden");
-                    document.getElementById("view-tv").classList.remove("hidden");
-                    renderTvList();
-                }
-                closeDrawer();
+            list.replaceChildren();
+            const cats = xtreamCategories[tab] || [];
+            const label = tab === "tv" ? "TV ao Vivo" : tab === "movies" ? "Filmes" : "Séries";
+            document.getElementById("drawer-title").textContent = `Categorias (${label})`;
+            const makeCategory = (name) => {
+                const button = document.createElement("button");
+                button.className = `drawer-item ${activeCategory === name ? 'active' : ''}`;
+                button.textContent = name === "Todas" ? "Todas as Categorias" : name;
+                button.onclick = async (e) => {
+                    e.stopPropagation();
+                    if (isAdultCategory(name) && !adultUnlocked && !(await requestAdultAccess())) return;
+                    activeCategory = name;
+                    if (tab === "tv") openTvChannelList(name);
+                    else if (isSplit) openMediaCategoryList(tab,name);
+                    else { selectCategory(name); closeDrawer(); }
+                };
+                list.appendChild(button);
             };
-            list.appendChild(bAll);
-
-            const allCats = Array.isArray(cats) ? cats : [];
-            const protectedCats = allCats.filter(c => isAdultCategory(c.category_name));
-            if (protectedCats.length) {
+            makeCategory("Todas");
+            const adultCats = cats.filter(c => isAdultCategory(c.category_name));
+            if (adultCats.length) {
                 const folder = document.createElement("button");
                 folder.className = "drawer-item";
                 folder.textContent = "🔒 Pasta protegida (18+)";
-                folder.onclick = () => {
-                    if (!adultUnlocked && !requestAdultAccess()) return;
-                    list.innerHTML = "";
-                    const back = document.createElement("button");
-                    back.className = "drawer-item";
-                    back.textContent = "‹ Voltar às categorias";
-                    back.onclick = () => openCategoriesDrawer(activeTab);
-                    list.appendChild(back);
-                    protectedCats.forEach(c => addCategoryButton(c));
+                folder.onclick = async () => {
+                    if (!adultUnlocked && !(await requestAdultAccess())) return;
+                    list.replaceChildren();
+                    appendBackToCategories(list, tab);
+                    adultCats.forEach(c => makeCategory(c.category_name));
                 };
                 list.appendChild(folder);
             }
-            function addCategoryButton(c) {
-                const b = document.createElement("button");
-                b.className = `drawer-item ${activeCategory === c.category_name ? "active" : ""}`;
-                b.innerHTML = `<span>${c.category_name}</span>`;
-                b.onclick = () => {
-                    if (isAdultCategory(c.category_name) && !adultUnlocked && !requestAdultAccess()) return;
-                    if (activeTab === "tv") {
-                        if (document.getElementById("player-modal").classList.contains("active")) {
-                            openTvChannelList(c.category_name);
-                        } else {
-                            selectCategory(c.category_name);
-                            closeDrawer();
-                            document.getElementById("view-home").classList.add("hidden");
-                            document.getElementById("view-catalog").classList.add("hidden");
-                            document.getElementById("view-tv").classList.remove("hidden");
-                            renderTvList();
-                        }
-                    } else {
-                        selectCategory(c.category_name);
-                        closeDrawer();
-                    }
-                };
-                list.appendChild(b);
-            }
-            allCats.filter(c => !isAdultCategory(c.category_name)).forEach(addCategoryButton);
-
-            document.getElementById("drawer-backdrop").classList.add("active");
-            document.getElementById("drawer-panel").classList.add("active");
+            cats.filter(c => !isAdultCategory(c.category_name)).forEach(c => makeCategory(c.category_name));
+            showDrawer();
         }
-
         function closeDrawer() {
             document.getElementById("drawer-backdrop").classList.remove("active");
             document.getElementById("drawer-panel").classList.remove("active");
         }
         document.getElementById("btn-open-drawer").onclick = () => openCategoriesDrawer();
-        document.getElementById("btn-close-drawer").onclick = closeDrawer;
-        document.getElementById("drawer-backdrop").onclick = closeDrawer;
-
+        document.getElementById("btn-close-drawer").onclick = () => {
+            if (document.getElementById("player-modal").classList.contains("tv-list-open") && currentPlayingItem) expandTvPlayer();
+            else if (document.getElementById("player-modal").classList.contains("tv-list-open")) exitPlayer();
+            else closeDrawer();
+        };
         function selectCategory(catName) {
             activeCategory = catName;
             if (activeTab === "tv") {
@@ -2078,7 +2386,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                         <span>${it.group}</span>
                     </div>
                 `;
-                div.onclick = () => openItemPlay(it);
+                div.onclick = () => {
+                    if (currentPlayingItem && currentPlayingItem.type === 'tv' && String(currentPlayingItem.id) === String(it.id)) expandTvPlayer();
+                    else { openItemPlay(it); openTvChannelList(it.group); }
+                };
                 listEl.appendChild(div);
             });
         }
@@ -2102,7 +2413,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
             if (dockTimeout) clearTimeout(dockTimeout);
             dockTimeout = setTimeout(() => {
-                if (!vEl.paused) {
+                if (!document.querySelector(".dock-bubble.open")) {
                     closeAllBubbles();
                     dockWrap.classList.remove("visible");
                     topSlim.classList.remove("visible");
@@ -2151,22 +2462,63 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             resetDockTimer();
         });
 
-        function sendMonitorHeartbeat(isPlaying) {
-            if (!currentPlayingItem) return;
-            const mac = getOrCreateMac();
-            fetch("/api/monitor/heartbeat", {
-                method: "POST",
-                headers: {"Content-Type": "application/json"},
-                body: JSON.stringify({
-                    mac: mac,
-                    username: currentAuth ? currentAuth.username : "Anônimo",
-                    title: currentPlayingItem.name,
-                    type: currentPlayingItem.type,
-                    elapsed: playSecondsCounter,
-                    playing: isPlaying
-                })
-            }).catch(()=>{});
+        // Monitoramento por aba/sessão: registra carregando, reproduzindo e buffering.
+        const monitorSessionId = (() => {
+            try {
+                let id = sessionStorage.getItem("sf_monitor_tab_id");
+                if (!id) {
+                    id = (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + String(Math.random())).replace(/[^a-zA-Z0-9_-]/g, "");
+                    sessionStorage.setItem("sf_monitor_tab_id", id);
+                }
+                return id;
+            } catch (_) { return String(Date.now()) + Math.random().toString(36).slice(2); }
+        })();
+        let monitorStatus = "stopped";
+        let monitorViewId = monitorSessionId;
+        let monitorTickTime = Date.now();
+        function monitorPayload(status) {
+            if (!currentPlayingItem) return null;
+            return {
+                session_id: monitorViewId,
+                mac: getOrCreateMac(),
+                title: currentPlayingItem.name || "Sem título",
+                type: currentPlayingItem.type,
+                content_id: currentPlayingItem.id || currentPlayingItem.url || "",
+                elapsed: currentPlayingItem.type !== "tv" && Number.isFinite(vEl.currentTime) ? Math.floor(vEl.currentTime) : playSecondsCounter,
+                status
+            };
         }
+        function sendMonitorHeartbeat(status = monitorStatus, beacon = false) {
+            const data = monitorPayload(status);
+            if (!data) return;
+            const body = JSON.stringify(data);
+            if (beacon && navigator.sendBeacon) {
+                navigator.sendBeacon("/api/monitor/heartbeat", new Blob([body], {type:"application/json"}));
+            } else {
+                fetch("/api/monitor/heartbeat", { method:"POST", headers:{"Content-Type":"application/json"}, body, keepalive: status === 'stopped' }).catch(()=>{});
+            }
+        }
+        function setMonitorStatus(status) {
+            if (!currentPlayingItem) return;
+            if (monitorStatus !== status) {
+                monitorStatus = status;
+                sendMonitorHeartbeat(status);
+            }
+        }
+        function startMonitor() {
+            monitorTickTime = Date.now();
+            if (monitorInterval) clearInterval(monitorInterval);
+            monitorInterval = setInterval(() => {
+                const now = Date.now();
+                if (monitorStatus === 'playing' && currentPlayingItem && currentPlayingItem.type === 'tv')
+                    playSecondsCounter += Math.min(10, Math.max(0, (now - monitorTickTime) / 1000));
+                monitorTickTime = now;
+                if (currentPlayingItem) sendMonitorHeartbeat();
+            }, 7000);
+        }
+        window.addEventListener("pagehide", () => {
+            if (currentPlayingItem) sendMonitorHeartbeat("stopped", true);
+        });
 
         function setPlaybackStatus(message) {
              const el = document.getElementById("playback-status");
@@ -2179,140 +2531,161 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
              playbackWatchdog = null;
          }
 
-         function makePlaybackCandidates(item, requestedEngine) {
-             const url = item.url || "";
-             const isTs = /\.ts(?:[?#]|$)/i.test(url);
-             const isHls = /\.m3u8(?:[?#]|$)/i.test(url);
-             const hlsUrl = isTs ? url.replace(/\.ts(?=[?#]|$)/i, ".m3u8") : url;
-             const options = [];
-             const add = (engine, source) => {
-                 if (source && !options.some(x => x.engine === engine && x.url === source)) options.push({engine, url:source});
-             };
-             if (requestedEngine === "native") add("native", url);
-             else if (requestedEngine === "mpegts") { add("mpegts", url); add("native", url); }
-             else if (requestedEngine === "hls") { add("hls", hlsUrl); if (isTs) add("mpegts", url); add("native", url); }
-             else if (isTs || item.type === "tv") {
-                 if (isHls) add("hls", url);
-                 else { add("mpegts", url); if (isTs) add("hls", hlsUrl); }
-                 add("native", url);
-             }
-             else if (isHls) { add("hls", url); add("native", url); }
-             else { add("native", url); }
-             return options;
-         }
+        // Preserva os três mecanismos originais; todas as URLs são da mesma origem.
+        function makePlaybackCandidates(item, requestedEngine) {
+            const url = item.url || "";
+            const isTs = /\.ts(?:[?#]|$)/i.test(url);
+            const isHls = /\.m3u8(?:[?#]|$)/i.test(url);
+            const hlsUrl = isTs ? url.replace(/\.ts(?=[?#]|$)/i, ".m3u8") : url;
+            const choices = [];
+            const add = (engine, link) => { if (link && !choices.some(c => c.engine === engine && c.url === link)) choices.push({engine,url:link}); };
+            if (requestedEngine === "native") add("native", url);
+            else if (requestedEngine === "hls") { add("hls", hlsUrl); if (isTs) add("mpegts",url); }
+            else if (requestedEngine === "mpegts") { add("mpegts",url); add("native",url); }
+            else if (isHls) { add("hls",url); add("native",url); }
+            else if (item.type === "tv" && isTs) {
+                // Em dispositivos Android, HLS costuma funcionar melhor que TS contínuo.
+                add("hls",hlsUrl); add("mpegts",url); add("native",url);
+            } else if (isTs) { add("mpegts",url); add("native",url); }
+            else add("native",url);
+            return choices;
+        }
 
-         function tryPlaybackCandidate() {
-             clearPlaybackWatchdog();
-             const token = ++playbackToken;
-             playbackSwitching = true;
-             if (playbackCandidateIndex >= playbackCandidates.length) {
-                 stopPlayerEngines(false);
-                 playbackSwitching = false;
-                 setPlaybackStatus("Não foi possível reproduzir. Confira o formato, a conexão, HTTPS/CORS e o servidor. " + playbackLastError);
-                 document.getElementById("center-play-overlay").classList.remove("hidden");
-                 return;
-             }
-             const candidate = playbackCandidates[playbackCandidateIndex++];
-             stopPlayerEngines(false);
-             playbackAttemptStarted = Date.now();
-             playbackSwitching = false;
-             setPlaybackStatus("Conectando... (" + playbackCandidateIndex + "/" + playbackCandidates.length + ")");
-             let failed = false;
-             const fail = (reason) => {
-                 if (failed || token !== playbackToken || playbackSwitching) return;
-                 failed = true;
-                 playbackLastError = String(reason || "falha de mídia");
-                 // Avoid synchronous recursion while the browser is detaching media.
-                 setTimeout(() => { if (token === playbackToken && !playbackSwitching) tryPlaybackCandidate(); }, 100);
-             };
-             const attemptPlay = () => {
-                 if (token !== playbackToken) return;
-                 vEl.play().catch(() => {
-                     if (token === playbackToken) {
-                         clearPlaybackWatchdog();
-                         setPlaybackStatus("Toque em ▶ para iniciar a reprodução.");
-                         document.getElementById("center-play-overlay").classList.remove("hidden");
-                     }
-                 });
-             };
-             playbackWatchdog = setTimeout(() => {
-                 if (token === playbackToken && vEl.readyState < 2) fail("tempo limite de carregamento");
-             }, 15000);
-             try {
-                 if (candidate.engine === "hls") {
-                     if (typeof Hls !== "undefined" && Hls.isSupported()) {
-                         hlsInstance = new Hls({enableWorker:true, lowLatencyMode:currentPlayingItem.type === "tv", maxBufferLength:12, maxMaxBufferLength:30, backBufferLength:15});
-                         hlsInstance.on(Hls.Events.MANIFEST_PARSED, attemptPlay);
-                         hlsInstance.on(Hls.Events.ERROR, (_, err) => { if (err.fatal) fail(); });
-                         hlsInstance.loadSource(candidate.url);
-                         hlsInstance.attachMedia(vEl);
-                     } else if (vEl.canPlayType("application/vnd.apple.mpegurl")) {
-                         vEl.src = candidate.url; attemptPlay();
-                     } else fail();
-                 } else if (candidate.engine === "mpegts") {
-                     if (typeof mpegts === "undefined" || !mpegts.isSupported()) { fail(); return; }
-                     mpegtsInstance = mpegts.createPlayer({type:"mpegts", isLive:currentPlayingItem.type === "tv", url:candidate.url, cors:true}, {enableWorker:true, enableStashBuffer:true, stashInitialSize:384});
-                     mpegtsInstance.on(mpegts.Events.ERROR, fail);
-                     mpegtsInstance.attachMediaElement(vEl);
-                     mpegtsInstance.load(); attemptPlay();
-                 } else {
-                     vEl.src = candidate.url;
-                     vEl.load(); attemptPlay();
-                 }
-             } catch(e) { console.error("Falha no mecanismo de vídeo", e); fail(); }
-         }
+        let candidateFailure = null;
+        function tryPlaybackCandidate() {
+            clearPlaybackWatchdog();
+            playbackSwitching = true;
+            const token = ++playbackToken;
+            // Desmontagem protegida: eventos de 'error' e 'pause' antigos não iniciam outro player.
+            stopPlayerEngines(false);
+            if (playbackCandidateIndex >= playbackCandidates.length) {
+                playbackSwitching = false;
+                setMonitorStatus("error");
+                console.warn("StreamFlix: todas as tentativas de vídeo falharam", playbackLastError);
+                // Apenas falha FINAL exibe aviso; nenhuma informação durante o carregamento.
+                setPlaybackStatus("Não foi possível reproduzir este conteúdo. Toque na tela para ver os controles ou tente outro decodificador.");
+                return;
+            }
+            const candidate = playbackCandidates[playbackCandidateIndex++];
+            let failed = false;
+            playbackAttemptStarted = Date.now();
+            setPlaybackStatus("");
+            setMonitorStatus("connecting");
+            document.getElementById("center-play-overlay").classList.add("hidden");
+            const fail = reason => {
+                if (failed || token !== playbackToken) return;
+                failed = true;
+                playbackLastError = String(reason || "formato indisponível");
+                playbackSwitching = true;
+                clearPlaybackWatchdog();
+                candidateFailure = null;
+                setTimeout(() => { if (token === playbackToken) tryPlaybackCandidate(); }, 175);
+            };
+            candidateFailure = fail;
+            const attemptPlay = () => {
+                if (failed || token !== playbackToken) return;
+                const result = vEl.play();
+                if (result && typeof result.catch === "function") result.catch(error => {
+                    if (failed || token !== playbackToken) return;
+                    if (error && error.name === "NotAllowedError") {
+                        // Bloqueio de autoplay: permite toque no botão central sem mudar de canal.
+                        clearPlaybackWatchdog();
+                        document.getElementById("center-play-overlay").classList.remove("hidden");
+                        setMonitorStatus("paused");
+                    } else if (error && error.name !== "AbortError") fail(error.name || "falha no play");
+                });
+            };
+            playbackWatchdog = setTimeout(() => {
+                if (token === playbackToken && vEl.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) fail("tempo limite para receber vídeo");
+            }, 18000);
+            playbackSwitching = false;
+            try {
+                if (candidate.engine === "hls") {
+                    if (typeof Hls !== "undefined" && Hls.isSupported()) {
+                        hlsInstance = new Hls({enableWorker:true, lowLatencyMode:currentPlayingItem.type === "tv", maxBufferLength:18, backBufferLength:25});
+                        hlsInstance.on(Hls.Events.MANIFEST_PARSED, attemptPlay);
+                        hlsInstance.on(Hls.Events.ERROR, (_, err) => {
+                            if (err.fatal) fail(err.details || err.type || "erro HLS");
+                        });
+                        hlsInstance.attachMedia(vEl);
+                        hlsInstance.loadSource(candidate.url);
+                    } else if (vEl.canPlayType("application/vnd.apple.mpegurl")) {
+                        vEl.src = candidate.url; attemptPlay();
+                    } else fail("HLS não compatível com navegador");
+                } else if (candidate.engine === "mpegts") {
+                    if (typeof mpegts === "undefined" || !mpegts.isSupported()) { fail("MPEG-TS indisponível"); return; }
+                    mpegtsInstance = mpegts.createPlayer({type:"mpegts", isLive:currentPlayingItem.type === "tv", url:candidate.url, cors:true},
+                        {enableWorker:false, enableStashBuffer:currentPlayingItem.type !== "tv", stashInitialSize:384});
+                    mpegtsInstance.on(mpegts.Events.ERROR, (type,detail) => fail(detail || type));
+                    mpegtsInstance.attachMediaElement(vEl);
+                    mpegtsInstance.load();
+                    attemptPlay();
+                } else {
+                    vEl.src = candidate.url;
+                    vEl.load();
+                    attemptPlay();
+                }
+            } catch(error) {
+                console.error("Falha no decodificador", error);
+                fail(error.message || "erro interno");
+            }
+        }
 
-         function openItemPlay(it, forceEngine = "auto") {
-             if (!it || !it.url) { alert("Endereço de reprodução indisponível."); return; }
-             // Invalidate callbacks from the previous channel before cleaning its media.
-             playbackToken++;
-             playbackSwitching = true;
-             stopPlayerEngines();
-             currentPlayingItem = it;
-             playSecondsCounter = 0;
-             currentActiveEngine = forceEngine;
-             document.getElementById("player-modal").classList.add("active");
-             document.body.classList.add("player-open");
-             if (it.type === "tv") setTvMiniMode(true);
-             else setTvMiniMode(false);
-             document.getElementById("player-title").textContent = it.name;
-             document.getElementById("center-play-overlay").classList.add("hidden");
-             vEl.className = "";
-             closeAllBubbles();
-             document.getElementById("dock-btn-tv-list").classList.toggle("hidden", it.type !== "tv");
-             document.getElementById("btn-player-vod-list").classList.toggle("hidden", it.type === "tv");
-             document.getElementById("dock-btn-tv-list").onclick = (e) => {
-                 e.stopPropagation();
-                 openTvChannelList(currentPlayingItem.group);
-                 document.getElementById("drawer-backdrop").classList.add("active");
-                 document.getElementById("drawer-panel").classList.add("active");
-             };
-             document.getElementById("btn-player-vod-list").onclick = (e) => {
-                 e.stopPropagation();
-                 document.getElementById("btn-player-back").click();
-                 const tab = document.querySelector(`.bottom-nav .bnav-item[data-tab="${it.type}"]`);
-                 if (tab) { tab.click(); selectCategory(it.group); }
-             };
-             const seek = document.getElementById("vod-seek-wrap");
-             seek.classList.toggle("active", it.type !== "tv");
-             document.getElementById("seek-cur-time").textContent = "00:00";
-             document.getElementById("seek-total-time").textContent = "00:00";
-             document.getElementById("seek-track-fill").style.width = "0%";
-             document.getElementById("opt-vlc-ext").href = it.url;
-             document.getElementById("epg-bar").classList.toggle("active", it.type === "tv");
-             if (it.type === "tv") fetchEpg(it);
-             playbackCandidates = makePlaybackCandidates(it, forceEngine);
-             playbackCandidateIndex = 0;
-             playbackLastError = "";
-             tryPlaybackCandidate();
-             if (it.type !== "tv") resetDockTimer();
-         }
+        function openItemPlay(it, forceEngine = "auto") {
+            if (!it || !it.url) { alert("Endereço de reprodução indisponível."); return; }
+            const miniAlreadyOpen = document.getElementById("player-modal").classList.contains("tv-list-open");
+            playbackToken++;
+            playbackSwitching = true;
+            stopPlayerEngines(true);
+            currentPlayingItem = it;
+            monitorViewId = monitorSessionId + "_" + Math.random().toString(36).slice(2,10);
+            playSecondsCounter = 0;
+            currentActiveEngine = forceEngine;
+            document.getElementById("player-modal").classList.add("active");
+            document.body.classList.add("player-open");
+            // TV sempre permanece compacta após selecionar um canal; VOD segue
+            // a modalidade anterior apenas se o usuário tiver aberto as categorias.
+            setTvMiniMode(it.type === "tv" || miniAlreadyOpen);
+            document.getElementById("player-title").textContent = it.name || "Reproduzindo";
+            document.getElementById("center-play-overlay").classList.add("hidden");
+            vEl.className = "";
+            closeAllBubbles();
+            document.getElementById("dock-btn-tv-list").classList.toggle("hidden", it.type !== "tv");
+            document.getElementById("btn-player-vod-list").classList.toggle("hidden", it.type === "tv");
+            document.getElementById("dock-btn-tv-list").onclick = event => {
+                event.stopPropagation(); openTvChannelList(currentPlayingItem.group);
+            };
+            document.getElementById("dock-btn-categories").onclick = event => {
+                event.stopPropagation();
+                openCategoriesDrawer(currentPlayingItem.type);
+            };
+            document.getElementById("btn-player-vod-list").onclick = event => {
+                event.stopPropagation();
+                openCategoriesDrawer(currentPlayingItem.type);
+            };
+            const seek = document.getElementById("vod-seek-wrap");
+            seek.classList.toggle("active", it.type !== "tv");
+            document.getElementById("seek-cur-time").textContent = "00:00";
+            document.getElementById("seek-total-time").textContent = "00:00";
+            document.getElementById("seek-track-fill").style.width = "0%";
+            document.getElementById("opt-vlc-ext").href = it.url;
+            document.getElementById("epg-bar").classList.toggle("active", it.type === "tv");
+            if (it.type === "tv") fetchEpg(it);
+            playbackCandidates = makePlaybackCandidates(it, forceEngine);
+            playbackCandidateIndex = 0;
+            playbackLastError = "";
+            monitorStatus = "connecting";
+            sendMonitorHeartbeat("connecting");
+            startMonitor();
+            tryPlaybackCandidate();
+            if (it.type !== "tv" && !miniAlreadyOpen) resetDockTimer();
+        }
 
-        document.getElementById("center-play-overlay").onclick = (e) => {
-            e.stopPropagation();
+        document.getElementById("center-play-overlay").onclick = event => {
+            event.stopPropagation();
             if (document.getElementById("player-modal").classList.contains("tv-list-open")) expandTvPlayer();
             document.getElementById("center-play-overlay").classList.add("hidden");
-            vEl.play().catch(()=>{});
+            vEl.play().catch(error => console.warn("Toque para reproduzir:", error.name));
             resetDockTimer();
         };
 
@@ -2322,7 +2695,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             try {
                 let dns = currentAuth.dns.replace(/\/$/, "");
                 if (!dns.startsWith("http://") && !dns.startsWith("https://")) dns = "http://" + dns;
-                const r = await fetch(`${dns}/player_api.php?username=${encodeURIComponent(currentAuth.username)}&password=${encodeURIComponent(currentAuth.password)}&action=get_short_epg&stream_id=${it.id}`);
+                const r = await fetch(xtreamUrl("get_short_epg", {stream_id: it.id}));
                 const d = await r.json();
                 const prog = (d.epg_listings && d.epg_listings[0]) || {};
                 
@@ -2344,57 +2717,61 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         }
 
         function stopPlayerEngines(clearMonitoring = true) {
-             clearPlaybackWatchdog();
-            if (monitorInterval) {
-                clearInterval(monitorInterval);
-                monitorInterval = null;
+            clearPlaybackWatchdog();
+            if (clearMonitoring && monitorInterval) { clearInterval(monitorInterval); monitorInterval = null; }
+            if (clearMonitoring && currentPlayingItem) {
+                monitorStatus = "stopped";
+                sendMonitorHeartbeat("stopped");
             }
-             if (clearMonitoring) sendMonitorHeartbeat(false);
-            if (hlsInstance) { try { hlsInstance.destroy(); } catch (e) {} hlsInstance = null; }
-            if (mpegtsInstance) { try { mpegtsInstance.destroy(); } catch (e) {} mpegtsInstance = null; }
-            vEl.pause();
-            vEl.removeAttribute("src");
-            vEl.load();
+            playbackSwitching = true;
+            candidateFailure = null;
+            if (hlsInstance) { try { hlsInstance.destroy(); } catch (_) {} hlsInstance = null; }
+            if (mpegtsInstance) { try { mpegtsInstance.destroy(); } catch (_) {} mpegtsInstance = null; }
+            try { vEl.pause(); vEl.removeAttribute("src"); vEl.load(); } catch(_) {}
         }
-
-         vEl.addEventListener("playing", () => {
-             clearPlaybackWatchdog();
-             setPlaybackStatus("");
-             document.getElementById("center-play-overlay").classList.add("hidden");
-             if (!monitorInterval) {
-                 sendMonitorHeartbeat(true);
-                 monitorInterval = setInterval(() => {
-                     if (!vEl.paused && currentPlayingItem) { playSecondsCounter += 10; sendMonitorHeartbeat(true); }
-                 }, 10000);
-             }
-         });
-         vEl.addEventListener("error", () => {
-             if (!document.getElementById("player-modal").classList.contains("active") || playbackSwitching || !currentPlayingItem) return;
-             const error = vEl.error;
-             if (!error || !vEl.currentSrc) return;
-             // Avoid a second fail call from an engine's own error callback.
-             if (Date.now() - playbackAttemptStarted < 150) return;
-             if (playbackCandidateIndex < playbackCandidates.length) {
-                 playbackSwitching = true;
-                 setTimeout(() => { playbackSwitching = false; if (currentPlayingItem) tryPlaybackCandidate(); }, 150);
-             } else setPlaybackStatus("Falha de mídia (" + error.code + "). Verifique CORS, HTTPS e formato do stream.");
-         });
-         document.getElementById("btn-player-back").onclick = (e) => {
-            e.stopPropagation();
+        vEl.addEventListener("playing", () => {
+            if (playbackSwitching || !currentPlayingItem) return;
+            clearPlaybackWatchdog();
+            setPlaybackStatus("");
+            document.getElementById("center-play-overlay").classList.add("hidden");
+            document.getElementById("dock-btn-play").textContent = "⏸";
+            setMonitorStatus("playing");
+            if (!monitorInterval) startMonitor();
+        });
+        vEl.addEventListener("waiting", () => { if (!playbackSwitching && currentPlayingItem) setMonitorStatus("buffering"); });
+        vEl.addEventListener("stalled", () => { if (!playbackSwitching && currentPlayingItem) setMonitorStatus("buffering"); });
+        vEl.addEventListener("pause", () => {
+            if (playbackSwitching || !currentPlayingItem) return;
+            document.getElementById("dock-btn-play").textContent = "▶";
+            setMonitorStatus("paused");
+        });
+        vEl.addEventListener("error", () => {
+            if (playbackSwitching || !currentPlayingItem || !document.getElementById("player-modal").classList.contains("active")) return;
+            const err = vEl.error;
+            if (Date.now() - playbackAttemptStarted < 250) return;
+            if (candidateFailure) candidateFailure(err ? `erro HTMLMediaElement ${err.code}` : "falha de mídia");
+        });
+        function exitPlayer() {
             playbackToken++;
             playbackSwitching = true;
-            stopPlayerEngines();
+            stopPlayerEngines(true);
+            currentPlayingItem = null;
+            setPlaybackStatus("");
             document.getElementById("player-modal").classList.remove("active", "tv-list-open");
             document.body.classList.remove("player-open", "player-list-mode", "player-controls-visible");
+            if (dockTimeout) clearTimeout(dockTimeout);
+            document.getElementById("player-dock-wrap").classList.remove("visible");
+            document.getElementById("player-top-slim").classList.remove("visible");
             closeDrawer();
-        };
+        }
+        document.getElementById("btn-player-back").onclick = e => { e.stopPropagation(); exitPlayer(); };
 
         // CONTROLES SLIM DO DOCK COM BOLHAS INVISÍVEIS DURANTE REPRODUÇÃO
         const btnPlay = document.getElementById("dock-btn-play");
         btnPlay.onclick = (e) => {
             e.stopPropagation();
             closeAllBubbles();
-            if (vEl.paused) { vEl.play(); btnPlay.textContent = "⏸"; }
+            if (vEl.paused) { vEl.play().catch(err => console.warn("Falha ao iniciar",err)); btnPlay.textContent = "⏸"; }
             else { vEl.pause(); btnPlay.textContent = "▶"; }
             resetDockTimer();
         };
@@ -2448,6 +2825,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         document.getElementById("opt-aspect-fill").onclick = (e) => {
             e.stopPropagation();
             vEl.className = "mode-vertical-extend";
+            document.getElementById("video-stage").classList.add("vertical-fit");
             document.getElementById("opt-aspect-fill").classList.add("active");
             document.getElementById("opt-aspect-fit").classList.remove("active");
             btnAspect.classList.add("active");
@@ -2458,6 +2836,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         document.getElementById("opt-aspect-fit").onclick = (e) => {
             e.stopPropagation();
             vEl.className = "";
+            document.getElementById("video-stage").classList.remove("vertical-fit");
             document.getElementById("opt-aspect-fit").classList.add("active");
             document.getElementById("opt-aspect-fill").classList.remove("active");
             btnAspect.classList.remove("active");
@@ -2488,20 +2867,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         // NAVEGAÇÃO BOTTOM BAR E CATEGORIAS GERAIS
         document.querySelectorAll(".bottom-nav .bnav-item").forEach(btn => {
             btn.onclick = () => {
-                if (document.getElementById("player-modal").classList.contains("active")) {
-                    stopPlayerEngines();
-                    document.getElementById("player-modal").classList.remove("active", "tv-list-open");
-                    document.body.classList.remove("player-open", "player-list-mode", "player-controls-visible");
-                    closeDrawer();
-                }
-                // Always reset overlays before switching tabs; prevents dead Home/TV/Films/Series buttons.
-                if (document.getElementById("player-modal").classList.contains("active")) {
-                    playbackToken++;
-                    playbackSwitching = true;
-                    stopPlayerEngines();
-                    document.getElementById("player-modal").classList.remove("active", "tv-list-open");
-                    document.body.classList.remove("player-open", "player-list-mode", "player-controls-visible");
-                }
+                // Sai de qualquer modo de reprodução uma única vez. Nunca mantém
+                // backdrop/painel interceptando Início/TV/Filmes/Séries.
+                if (document.getElementById("player-modal").classList.contains("active")) exitPlayer();
                 closeDrawer();
                 activeTab = btn.dataset.tab;
                 adultUnlocked = false;
@@ -2578,7 +2946,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             const p = document.getElementById("cfg-adult-pin").value.trim();
             const r = await fetch("/api/update-adult-pin", { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({ new_pin: p }) });
             const d = await r.json();
-            if (d.ok) { adultPin = p; alert("✅ Senha Adulto alterada com sucesso!"); }
+            if (d.ok) { adultPin = p; adultUnlocked = false; alert("✅ Senha Adulto atualizada para esta conta!"); }
             else alert(d.error || "Erro ao salvar.");
         };
 
@@ -2597,7 +2965,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             const mac = getOrCreateMac();
             const r = await fetch("/api/login", { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({ username: u, password: p, mac: mac }) });
             const d = await r.json();
-            if (!d.ok) return alert(d.error || "Erro ao entrar.");
+            if (!d.ok) {
+                if (d.expired) { showExpiredCard(d.payment_link); return; }
+                alert(d.error || "Erro ao entrar."); return;
+            }
             currentAuth = d;
             localStorage.setItem("sf_session", JSON.stringify(d));
             enterApp();
@@ -2614,6 +2985,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 const r = await fetch("/api/request-trial", { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({ device_mac: mac }) });
                 const d = await r.json();
                 if (!d.ok) {
+                    if (d.payment_link && d.already_used) showExpiredCard(d.payment_link);
                     btn.textContent = "⚡ Gerar Teste Grátis Automático";
                     btn.disabled = false;
                     return alert(d.error || "Não foi possível gerar o teste.");
@@ -2675,17 +3047,83 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             enterApp();
         };
 
-        function enterApp() {
+        function showExpiredCard(link) {
+            exitPlayer();
+            document.getElementById("trial-modal").classList.remove("active");
+            const payBtn = document.getElementById("btn-expired-pay");
+            const info = document.getElementById("expired-pay-info");
+            const safe = typeof link === "string" && /^https?:\/\//i.test(link);
+            payBtn.href = safe ? link : "#";
+            payBtn.style.pointerEvents = safe ? "auto" : "none";
+            payBtn.style.opacity = safe ? "1" : ".45";
+            info.classList.toggle("hidden", safe);
+            document.getElementById("access-expired-modal").classList.add("active");
+        }
+        document.getElementById("btn-expired-switch").onclick = () => {
+            currentAuth = null;
+            localStorage.removeItem("sf_session");
+            fetch("/api/logout", {method:"POST"}).catch(()=>{});
+            document.getElementById("access-expired-modal").classList.remove("active");
+            document.getElementById("screen-login").classList.add("active");
+            document.getElementById("main-navbar").classList.add("hidden");
+            document.getElementById("main-content").classList.add("hidden");
+            document.getElementById("bottom-nav").classList.remove("active");
+        };
+        let sessionCheckInterval = null;
+        async function validateCurrentSession() {
+            if (!currentAuth || !currentAuth.username) return false;
+            try {
+                const check = await fetch("/api/check-session", {method:"POST"});
+                const d = await check.json();
+                if (d.expired) { showExpiredCard(d.payment_link || currentAuth.payment_link || serverConfig.default_payment_link); return false; }
+                if (d.valid) {
+                    if (d.payment_link) currentAuth.payment_link = d.payment_link;
+                    if (d.expires_at) currentAuth.expires_at = d.expires_at;
+                    return true;
+                }
+                // Cookie ausente após atualização/reinício: reautenticar usando
+                // credenciais da sessão existente, sem criar assinatura artificial.
+                const login = await fetch("/api/login", {method:"POST", headers:{"Content-Type":"application/json"},
+                    body:JSON.stringify({username:currentAuth.username,password:currentAuth.password,mac:getOrCreateMac()})});
+                const result = await login.json();
+                if (result.expired) { showExpiredCard(result.payment_link || currentAuth.payment_link); return false; }
+                if (!result.ok) return false;
+                currentAuth = result;
+                localStorage.setItem("sf_session", JSON.stringify(result));
+                return true;
+            } catch (error) { console.warn("Validação da sessão:", error); return false; }
+        }
+        async function enterApp() {
+            if (!currentAuth) return;
+            document.getElementById("loading-cover").classList.add("active");
+            const valid = await validateCurrentSession();
+            document.getElementById("loading-cover").classList.remove("active");
+            if (!valid) {
+                if (!document.getElementById("access-expired-modal").classList.contains("active")) {
+                    document.getElementById("screen-login").classList.add("active");
+                    alert("Não foi possível validar sua conta. Faça login novamente.");
+                }
+                return;
+            }
             document.getElementById("screen-login").classList.remove("active");
             document.getElementById("main-navbar").classList.remove("hidden");
             document.getElementById("main-content").classList.remove("hidden");
             document.getElementById("bottom-nav").classList.add("active");
+            if (sessionCheckInterval) clearInterval(sessionCheckInterval);
+            sessionCheckInterval = setInterval(async () => {
+                if (!currentAuth) return;
+                try {
+                    const resp = await fetch("/api/check-session", {method:"POST"});
+                    const d = await resp.json();
+                    if (d.expired) { showExpiredCard(d.payment_link || currentAuth.payment_link); clearInterval(sessionCheckInterval); }
+                } catch(_) {}
+            }, 60000);
             fetchXtreamData();
         }
 
         document.getElementById("btn-logout-cfg").onclick = () => {
             localStorage.removeItem("sf_session");
-            location.reload();
+            fetch("/api/logout", {method:"POST",keepalive:true}).finally(()=>location.reload());
         };
 
         // ROTA ADMINISTRATIVA (INVISÍVEL NA TELA DE LOGIN DO CLIENTE)
@@ -2727,37 +3165,65 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
                 const monTbody = document.getElementById("adm-monitoring-tbody");
                 monTbody.innerHTML = "";
-                document.getElementById("live-count").textContent = `${d.monitoring.length} assistindo agora`;
+                const actuallyPlaying = d.monitoring.filter(m => m.playback_status === 'playing').length;
+                document.getElementById("live-count").textContent = `${actuallyPlaying} assistindo • ${d.monitoring.length} sessão(ões) online`;
 
                 if (d.monitoring.length === 0) {
-                    monTbody.innerHTML = `<tr><td colspan="7" style="text-align:center; color:var(--text-muted); padding:1rem;">Nenhum usuário assistindo no momento.</td></tr>`;
+                    monTbody.innerHTML = `<tr><td colspan="8" style="text-align:center; color:var(--text-muted); padding:1rem;">Nenhuma sessão ativa no momento.</td></tr>`;
                 } else {
                     d.monitoring.forEach(m => {
                         const tr = document.createElement("tr");
                         tr.innerHTML = `
-                            <td><strong>${m.username}</strong></td>
-                            <td style="color:var(--gold);">▶ ${m.content_title}</td>
-                            <td><span class="badge-live">${m.elapsed_formatted}</span></td>
-                            <td>${m.ip}</td>
-                            <td>${m.location}</td>
-                            <td><code>${m.mac}</code></td>
-                            <td>${m.device}</td>
+                            <td><strong>${escapeHtml(m.username)}</strong></td>
+                            <td style="color:var(--gold);">▶ ${escapeHtml(m.content_title)}</td>
+                            <td><span class="monitor-status ${escapeHtml(m.playback_status || 'connecting')}">${{playing:'▶ Reproduzindo',connecting:'⏳ Conectando',paused:'⏸ Pausado',buffering:'⌛ Carregando',error:'⚠️ Falha'}[m.playback_status] || '⏳ Conectando'}</span></td>
+                            <td><span class="badge-live">${escapeHtml(m.elapsed_formatted)}</span></td>
+                            <td>${escapeHtml(m.ip)}</td>
+                            <td>${escapeHtml(m.location)}</td>
+                            <td><code>${escapeHtml(m.mac)}</code></td>
+                            <td>${escapeHtml(m.device)}</td>
                         `;
                         monTbody.appendChild(tr);
                     });
                 }
 
+                const historyTbody = document.getElementById("adm-history-tbody");
+                historyTbody.replaceChildren();
+                (d.history || []).forEach(h => {
+                    const row = document.createElement('tr');
+                    const seconds = Math.max(0, Number(h.elapsed_seconds || 0));
+                    row.innerHTML = `<td>${escapeHtml(h.username)}</td><td>${escapeHtml(h.content_title)}</td>
+                      <td>${escapeHtml(h.content_type)}</td><td>${escapeHtml(h.started_at)}</td>
+                      <td>${formatTime(seconds)}</td><td>${escapeHtml(h.playback_status)}</td>`;
+                    historyTbody.appendChild(row);
+                });
+                if (!historyTbody.children.length) historyTbody.innerHTML = '<tr><td colspan="6">Nenhum histórico ainda.</td></tr>';
+
+                const trialTbody = document.getElementById("adm-trials-tbody");
+                trialTbody.replaceChildren();
+                if (!d.trials || !d.trials.length) {
+                    trialTbody.innerHTML = '<tr><td colspan="5">Nenhum teste cadastrado.</td></tr>';
+                } else {
+                    d.trials.forEach(t => {
+                        const tr = document.createElement("tr");
+                        const exp = t.expires_at ? new Date(t.expires_at * 1000).toLocaleString('pt-BR') : 'Sem data';
+                        tr.innerHTML = `<td>${Number(t.id)}</td><td>${escapeHtml(t.username)}</td><td>${escapeHtml(t.created_at)}</td><td>${escapeHtml(exp)}</td>
+                            <td><button class="btn-pill btn-pill-outline" style="border-color:#ef4444;color:#fca5a5;padding:.3rem" data-del-trial="${Number(t.id)}">🗑️ Excluir</button></td>`;
+                        tr.querySelector('[data-del-trial]').onclick = () => deleteTrialRecord(t.id, t.username);
+                        trialTbody.appendChild(tr);
+                    });
+                }
                 const devTbody = document.getElementById("adm-devices-tbody");
                 devTbody.innerHTML = "";
                 d.devices.forEach(dev => {
                     const tr = document.createElement("tr");
                     tr.innerHTML = `
-                        <td><code>${dev.mac}</code></td>
-                        <td>${dev.ip}</td>
-                        <td>${dev.location}</td>
-                        <td>${dev.device}</td>
-                        <td><strong>${dev.username}</strong></td>
-                        <td>${dev.last_seen}</td>
+                        <td><code>${escapeHtml(dev.mac)}</code></td>
+                        <td>${escapeHtml(dev.ip)}</td>
+                        <td>${escapeHtml(dev.location)}</td>
+                        <td>${escapeHtml(dev.device)}</td>
+                        <td><strong>${escapeHtml(dev.username)}</strong></td>
+                        <td>${escapeHtml(dev.last_seen)}</td>
                         <td><button class="btn-pill btn-pill-outline" style="color:#fca5a5; border-color:#e50914; padding:0.25rem 0.65rem; font-size:0.7rem;" onclick="deleteDeviceRecord(${dev.id})">🗑️ Deletar</button></td>
                     `;
                     devTbody.appendChild(tr);
@@ -2765,8 +3231,25 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             } catch (e) {}
         }
 
+        async function deleteTrialRecord(id, user) {
+            if (!confirm(`Excluir somente o teste #${id} (${user})? Outros registros não serão apagados.`)) return;
+            const res = await fetch(`/api/admin/delete-trial/${id}`, {method:"DELETE"});
+            if (!res.ok) { alert("Erro ao excluir teste."); return; }
+            loadAdminDashboard();
+        }
+        document.getElementById("btn-admin-delete-all-trials").onclick = async () => {
+            if (!confirm("ATENÇÃO: apagar TODOS os testes cadastrados? Esta ação não pode ser desfeita.")) return;
+            const confirmation = prompt('Para confirmar a exclusão de todos os testes, digite EXCLUIR:');
+            if (confirmation !== 'EXCLUIR') return;
+            const res = await fetch("/api/admin/delete-all-trials", {method:"DELETE"});
+            if (!res.ok) { alert("Falha na exclusão coletiva."); return; }
+            const d = await res.json();
+            alert(`${d.deleted} teste(s) excluído(s).`);
+            loadAdminDashboard();
+        };
+
         window.deleteDeviceRecord = async (id) => {
-            if (!confirm("Deseja realmente deletar este registro de dispositivo? Isso liberará este aparelho para gerar um novo teste.")) return;
+            if (!confirm("Excluir apenas este dispositivo? Os demais dispositivos e testes serão preservados.")) return;
             await fetch(`/api/admin/delete-device/${id}`, { method: "DELETE" });
             loadAdminDashboard();
         };
@@ -2789,13 +3272,17 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 </html>
 """
 
+@app.route("/api/version")
+def api_version():
+    return jsonify({"name": "StreamFlix Pro", "version": "2026-11-10-integrado-monitoramento-v2"})
+
 @app.route("/")
 def index():
-    return render_template_string(HTML_TEMPLATE)
+    return Response(render_template_string(HTML_TEMPLATE), content_type="text/html; charset=utf-8", headers={"Cache-Control": "no-store, max-age=0"})
 
 @app.route("/admin")
 def admin_direct():
-    return render_template_string(HTML_TEMPLATE)
+    return Response(render_template_string(HTML_TEMPLATE), content_type="text/html; charset=utf-8", headers={"Cache-Control": "no-store, max-age=0"})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8095))
