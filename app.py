@@ -1181,7 +1181,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .expired-card {width:100%;max-width:370px;background:var(--bg-surface);border:1px solid var(--primary);border-radius:20px;padding:1.6rem;text-align:center;}
         .expired-card h2 {margin-bottom:0.6rem;}
         .expired-card p {color:var(--text-muted);font-size:.85rem;margin-bottom:1rem;}
-        @media(max-width:380px){#player-modal.tv-list-open .video-stage{height:26vh;min-height:110px;}}
+        @media (max-width:380px) { #player-modal.tv-list-open .video-stage{height:26vh;min-height:110px;}}
     </style>
 </head>
 <body>
