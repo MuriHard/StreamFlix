@@ -78,6 +78,8 @@ def init_dbs():
 
     migrate_table_columns(conn1, "active_users", {
         "dns_used": "TEXT",
+        "m3u_url": "TEXT",
+        "created_at_str": "TEXT",
         "plan_type": "TEXT",
         "max_connections": "TEXT",
         "expires_at": "INTEGER",
@@ -236,6 +238,8 @@ def parse_trial_api_response(raw_text, cfg):
         "dns": fallback_dns,
         "m3u_url": "",
         "plan_type": "Teste Completo",
+        "max_connections": "1",
+        "created_formatted": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
         "expires_at": fallback_exp_ts,
         "expires_formatted": fallback_exp_str,
         "payment_link": "",
@@ -260,6 +264,10 @@ def parse_trial_api_response(raw_text, cfg):
             pay = data.get("payUrl") or data.get("payment_link")
             exp_formatted = data.get("expiresAtFormatted") or data.get("expiresAt")
             reply = data.get("reply") or ""
+            created = data.get("createdAtFormatted") or data.get("createdAt")
+            conns = data.get("connections") or data.get("max_connections")
+            if created: res["created_formatted"] = str(created)
+            if conns: res["max_connections"] = str(conns)
 
             if u: res["username"] = str(u).strip()
             if p: res["password"] = str(p).strip()
@@ -322,7 +330,10 @@ def api_monitor_heartbeat():
     username = (data.get("username") or "Anônimo").strip()
     title = (data.get("title") or "Nenhum").strip()
     ctype = (data.get("type") or "tv").strip()
-    elapsed = int(data.get("elapsed") or 0)
+    try:
+        elapsed = max(0, int(data.get("elapsed") or 0))
+    except (TypeError, ValueError):
+        elapsed = 0
     is_playing = bool(data.get("playing", True))
 
     forwarded = request.headers.get("X-Forwarded-For", "")
@@ -361,6 +372,7 @@ def api_config():
         "dns": dns_list[0] if dns_list else "",
         "dns_list": dns_list,
         "support_whatsapp": cfg.get("support_whatsapp", ""),
+        "default_payment_link": cfg.get("default_payment_link", ""),
         "adult_pin": cfg.get("adult_pin", "0000"),
         "apps_smart_tv": cfg.get("apps_smart_tv", ""),
         "apps_android": cfg.get("apps_android", "")
@@ -388,18 +400,12 @@ def api_login():
     existing = conn.execute("SELECT * FROM active_users WHERE username = ?", (username,)).fetchone()
     now_ts = int(time.time())
 
-    if existing and existing["expires_at"] and now_ts >= int(existing["expires_at"]):
-        conn.close()
-        return jsonify({
-            "ok": False, "expired": True,
-            "payment_link": existing["payment_link"] or cfg.get("default_payment_link", ""),
-            "error": "Sua assinatura ou teste expirou! Redirecionando..."
-        }), 403
-
     chosen_dns = primary_dns
     expires_at = now_ts + (30 * 86400)
     max_conns = "1"
     status_str = "Active"
+    created_at_str = ""
+    provider_verified = False
 
     for dns in dns_list:
         if not dns.startswith("http://") and not dns.startswith("https://"):
@@ -415,6 +421,9 @@ def api_login():
                 u_info = info.get("user_info", {})
                 if str(u_info.get("auth")) == "1" or str(u_info.get("status")).lower() in ["active", "trial"]:
                     chosen_dns = dns
+                    provider_verified = True
+                    if str(u_info.get("created_at") or "").isdigit():
+                        created_at_str = datetime.fromtimestamp(int(u_info["created_at"])).strftime("%d/%m/%Y %H:%M:%S")
                     status_str = u_info.get("status", "Active")
                     max_conns = str(u_info.get("max_connections", "1"))
                     exp_date = u_info.get("exp_date")
@@ -431,6 +440,12 @@ def api_login():
         except Exception:
             continue
 
+    if existing and not provider_verified and existing["expires_at"] and now_ts >= int(existing["expires_at"]):
+        conn.close()
+        return jsonify({"ok": False, "expired": True,
+            "payment_link": existing["payment_link"] or cfg.get("default_payment_link", ""),
+            "error": "Seu acesso venceu."}), 403
+
     if not existing:
         conn.execute("""INSERT OR REPLACE INTO active_users
             (username, password, dns_used, plan_type, max_connections, expires_at, payment_link, is_trial)
@@ -438,9 +453,14 @@ def api_login():
             (username, password, chosen_dns, "Assinatura IPTV", max_conns, expires_at, cfg.get("default_payment_link", "")))
         conn.commit()
     else:
-        expires_at = existing["expires_at"] or expires_at
-        chosen_dns = existing["dns_used"] or chosen_dns
-        max_conns = existing["max_connections"] if "max_connections" in existing.keys() and existing["max_connections"] else max_conns
+        if not provider_verified:
+            expires_at = existing["expires_at"] or expires_at
+            chosen_dns = existing["dns_used"] or chosen_dns
+            max_conns = existing["max_connections"] or max_conns
+    if provider_verified:
+        conn.execute("UPDATE active_users SET dns_used = ?, max_connections = ?, expires_at = ?, created_at_str = ? WHERE username = ?",
+                     (chosen_dns, max_conns, expires_at, created_at_str or (existing["created_at_str"] if existing else ""), username))
+        conn.commit()
     conn.close()
 
     return jsonify({
@@ -448,6 +468,8 @@ def api_login():
         "username": username,
         "password": password,
         "dns": chosen_dns,
+        "m3u_url": f"{chosen_dns}/get.php?username={urllib.parse.quote(username)}&password={urllib.parse.quote(password)}&type=m3u_plus&output=ts",
+        "created_formatted": created_at_str or (existing["created_at_str"] if existing else "") or "Não informado",
         "plan_type": "Assinante Oficial",
         "max_connections": max_conns,
         "status": status_str,
@@ -514,11 +536,10 @@ def api_request_trial():
 
     parsed = parse_trial_api_response(raw_api_resp, cfg)
 
-    # Se a API falhar completamente em responder usuário e senha, gera fallback
-    if not parsed["username"]:
-        rand_suffix = hashlib.md5(f"{client_ip}{time.time()}".encode()).hexdigest()[:5]
-        parsed["username"] = f"teste_{rand_suffix}"
-        parsed["password"] = f"{int(time.time()) % 900000 + 100000}"
+    # Nunca inventar credenciais: isso exibiria um teste que não existe no provedor.
+    if not parsed["username"] or not parsed["password"]:
+        conn1.close()
+        return jsonify({"ok": False, "error": "O servidor de testes não retornou um acesso válido. Tente novamente mais tarde."}), 502
 
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     conn1.execute("""INSERT INTO trial_records
@@ -542,6 +563,8 @@ def api_request_trial():
             "dns": parsed["dns"],
             "m3u_url": parsed["m3u_url"],
             "plan_type": parsed["plan_type"],
+            "created_formatted": parsed["created_formatted"],
+            "max_connections": parsed["max_connections"],
             "expires_at": parsed["expires_at"],
             "expires_formatted": parsed["expires_formatted"],
             "payment_link": parsed["payment_link"],
@@ -677,6 +700,23 @@ def api_admin_delete_trial(trial_id):
     conn1.close()
     if r:
         purge_device_and_trials(target_mac=r["device_mac"], target_ip=r["ip_address"], target_username=r["username"])
+    return jsonify({"ok": True})
+
+@app.route("/api/admin/delete-all-devices", methods=["DELETE"])
+def api_admin_delete_all_devices():
+    if not session.get("is_admin"):
+        return jsonify({"ok": False}), 401
+    db1, db2 = get_main_db(), get_devices_db()
+    try:
+        db1.execute("DELETE FROM active_users WHERE is_trial = 1")
+        db1.execute("DELETE FROM trial_records")
+        db2.execute("DELETE FROM active_monitoring")
+        db2.execute("DELETE FROM devices")
+        db1.commit()
+        db2.commit()
+    finally:
+        db1.close()
+        db2.close()
     return jsonify({"ok": True})
 
 @app.route("/api/admin/save", methods=["POST"])
@@ -1122,6 +1162,26 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             .posters-grid { grid-template-columns:repeat(auto-fill, minmax(155px, 1fr)); }
             .poster-card { flex:0 0 155px; }
         }
+
+        /* MELHORIAS INCREMENTAIS: lista TV e mini player sem alterar engine original */
+        .tv-channel-list {display:flex;flex-direction:column;gap:0.4rem;}
+        .tv-channel-item {display:flex;align-items:center;gap:0.65rem;padding:0.55rem 0.7rem;border:1px solid var(--border);border-radius:12px;background:var(--bg-card);color:#fff;cursor:pointer;text-align:left;width:100%;}
+        .tv-channel-item img {width:40px;height:40px;object-fit:contain;border-radius:6px;flex-shrink:0;background:#08080e;}
+        .tv-channel-item span {overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:0.78rem;font-weight:700;}
+        body.player-open #bottom-nav {z-index:710;}
+        #player-modal.tv-list-open .video-stage {position:absolute;right:0;top:50%;transform:translateY(-50%);width:50%;height:32vh;min-height:130px;flex:none;z-index:5;border-radius:10px 0 0 10px;border:1px solid #333;}
+        #player-modal.tv-list-open #video-player {width:100%;height:100%;object-fit:contain;}
+        #player-modal.tv-list-open .player-top-slim,#player-modal.tv-list-open .player-dock-wrap {display:none!important;}
+        body.player-open .drawer-panel {width:50vw;max-width:50vw;min-width:0;z-index:680;}
+        body.player-open .drawer-backdrop {background:transparent;pointer-events:none;}
+        body.player-open .bottom-nav .bnav-item[data-tab="config"] {display:none;}
+        body.player-open .bottom-nav {background:rgba(8,8,12,.96);}
+        .expired-dialog {position:fixed;inset:0;display:none;align-items:center;justify-content:center;background:rgba(0,0,0,.92);z-index:990;padding:1rem;}
+        .expired-dialog.active {display:flex;}
+        .expired-card {width:100%;max-width:370px;background:var(--bg-surface);border:1px solid var(--primary);border-radius:20px;padding:1.6rem;text-align:center;}
+        .expired-card h2 {margin-bottom:0.6rem;}
+        .expired-card p {color:var(--text-muted);font-size:.85rem;margin-bottom:1rem;}
+        @media(max-width:380px){#player-modal.tv-list-open .video-stage{height:26vh;min-height:110px;}}
     </style>
 </head>
 <body>
@@ -1195,6 +1255,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         </div>
     </div>
 
+    <div id="expired-dialog" class="expired-dialog">
+        <div class="expired-card"><h2>Seu acesso venceu.</h2><p>Renove sua assinatura para continuar assistindo.</p>
+            <a id="expired-pay" class="btn-pill btn-pill-primary" style="width:100%" target="_blank" rel="noopener noreferrer">Liberar acesso</a>
+            <button id="expired-close" class="btn-pill btn-pill-outline" style="width:100%;margin-top:.6rem">Fechar</button>
+        </div>
+    </div>
+
     <!-- 3. TOPBAR GERAL -->
     <header class="navbar hidden" id="main-navbar">
         <div class="nav-left">
@@ -1259,6 +1326,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             <div class="posters-grid" id="posters-grid"></div>
         </div>
 
+        <!-- LISTA DE TV SEPARADA DO CATÁLOGO DE FILMES E SÉRIES -->
+        <div id="view-tv" class="hidden">
+            <div class="input-wrap" style="margin-bottom:0.8rem"><input id="tv-search" type="search" placeholder="🔍 Buscar canal..."></div>
+            <p id="tv-selected-label" style="font-size:0.75rem;color:var(--text-muted);margin-bottom:0.6rem">Categoria: Todas</p>
+            <div id="tv-list" class="tv-channel-list"></div>
+        </div>
+
         <!-- TELA CONFIGURAÇÕES -->
         <div id="view-config" class="hidden">
             <div class="config-card">
@@ -1266,8 +1340,15 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 <div class="trial-row"><strong>Usuário:</strong><span id="cfg-user">-</span></div>
                 <div class="trial-row"><strong>Senha:</strong><span id="cfg-pass">-</span></div>
                 <div class="trial-row"><strong>Vencimento:</strong><span id="cfg-exp">-</span></div>
+                <div class="trial-row"><strong>Data de criação no servidor:</strong><span id="cfg-created">-</span></div>
                 <div class="trial-row"><strong>Tipo de Plano:</strong><span id="cfg-plan">-</span></div>
                 <div class="trial-row"><strong>Telas Simultâneas:</strong><span id="cfg-screens">1 tela</span></div>
+            </div>
+
+            <div class="config-card">
+                <div class="config-title">💳 Pagamento e Renovação</div>
+                <a id="btn-config-pay" class="btn-pill btn-pill-primary hidden" target="_blank" rel="noopener noreferrer">Liberar acesso</a>
+                <span id="cfg-payment-unavailable" style="font-size:.8rem;color:var(--text-muted)">Link de pagamento indisponível.</span>
             </div>
 
             <div class="config-card">
@@ -1349,7 +1430,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <div class="player-top-slim" id="player-top-slim">
             <button class="btn-pill btn-pill-outline" id="btn-player-back" style="padding:0.35rem 0.75rem; font-size:0.72rem;">‹ Sair</button>
             <div class="player-title-badge" id="player-title">Reproduzindo...</div>
-            <div style="width:50px;"></div>
+            <button class="btn-pill btn-pill-outline hidden" id="btn-player-vod-list" style="padding:.3rem .6rem;font-size:.7rem">Voltar à categoria</button>
         </div>
 
         <div class="video-stage" id="video-stage">
@@ -1405,6 +1486,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 <button class="mini-btn" id="dock-btn-ff" title="Avançar 10s">⏩</button>
                 <button class="mini-btn" id="dock-btn-speed" title="Velocidade">1.0x</button>
                 <button class="mini-btn" id="dock-btn-aspect" title="Ajuste de Tela">📐</button>
+                <button class="mini-btn hidden" id="dock-btn-tv-list" title="Lista de canais">☷</button>
                 <button class="mini-btn" id="dock-btn-engine" title="Decodificador">⚙️</button>
             </div>
         </div>
@@ -1480,6 +1562,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     <div class="form-group"><label>Link Padrão de Pagamento (Fallback opcional)</label><div class="input-wrap"><input type="url" id="adm-pay-link"></div></div>
                     <div class="form-group"><label>WhatsApp de Suporte (Link Completo)</label><div class="input-wrap"><input type="text" id="adm-wa-link" placeholder="https://wa.me/55..."></div></div>
                     <button class="btn-pill btn-pill-primary" id="btn-adm-save">Salvar Alterações</button>
+                    <button class="btn-pill btn-pill-outline" id="btn-delete-all-devices" style="margin-top:1rem;color:#fca5a5;border-color:#e50914">🗑️ Remover todos os dispositivos e testes</button>
                 </div>
             </div>
         </div>
@@ -1567,6 +1650,20 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             } catch (e) {}
         }
         loadPublicConfig();
+
+        let adultCategoryUnlocked = false;
+        let tvDrawerCategory = "Todas";
+        let tvListVisible = false;
+        function showExpiredAccess(url) {
+            const dialog = document.getElementById("expired-dialog");
+            const pay = document.getElementById("expired-pay");
+            if (url && /^https?:\/\//i.test(url)) {
+                pay.href = url;
+                pay.classList.remove("hidden");
+            } else { pay.removeAttribute("href"); pay.classList.add("hidden"); }
+            dialog.classList.add("active");
+        }
+        document.getElementById("expired-close").onclick = () => document.getElementById("expired-dialog").classList.remove("active");
 
         // HERO CAROUSEL 5s (EXCLUSIVO FILMES E SÉRIES - ZERO CANAIS E ZERO ADULTO)
         let heroItems = [];
@@ -1853,73 +1950,113 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         }
         document.getElementById("btn-tmdb-close").onclick = () => document.getElementById("tmdb-modal").classList.remove("active");
 
-        // DRAWER LATERAL AUTOMÁTICO DE CATEGORIAS
-        function openCategoriesDrawer() {
-            const list = document.getElementById("drawer-list");
-            list.innerHTML = "";
-            const cats = activeTab === "tv" ? xtreamCategories.tv : (activeTab === "movies" ? xtreamCategories.movies : xtreamCategories.series);
-            document.getElementById("drawer-title").textContent = `Categorias (${activeTab.toUpperCase()})`;
-
-            const bAll = document.createElement("button");
-            bAll.className = `drawer-item ${activeCategory === "Todas" ? "active" : ""}`;
-            bAll.innerHTML = `<span>Todas as Categorias</span>`;
-            bAll.onclick = () => { selectCategory("Todas"); closeDrawer(); };
-            list.appendChild(bAll);
-
-            (Array.isArray(cats) ? cats : []).forEach(c => {
-                const b = document.createElement("button");
-                b.className = `drawer-item ${activeCategory === c.category_name ? "active" : ""}`;
-                b.innerHTML = `<span>${c.category_name}</span>`;
-                b.onclick = () => {
-                    if (ADULT_REGEX.test(c.category_name)) {
-                        const entered = prompt("🔒 Digite o PIN de 4 dígitos para conteúdo Adulto:");
-                        if (entered !== adultPin) return alert("PIN incorreto!");
-                    }
-                    selectCategory(c.category_name);
-                    closeDrawer();
-                };
-                list.appendChild(b);
+        // CATEGORIAS COM PROTEÇÃO +18, SEM EXIBIR NOMES ANTES DO PIN
+        function renderTvList() {
+            const el = document.getElementById("tv-list");
+            if (!el) return;
+            el.replaceChildren();
+            const query = document.getElementById("tv-search").value.trim().toLowerCase();
+            (catalog.tv || []).filter(it => (activeCategory === "Todas" ? (!isAdultItem(it) || adultCategoryUnlocked) : it.group === activeCategory) && (!isAdultItem(it) || adultCategoryUnlocked) && (!query || it.name.toLowerCase().includes(query))).slice(0,500).forEach(it => {
+                const btn = document.createElement("button"); btn.className = "tv-channel-item";
+                const img = document.createElement("img"); img.src = it.logo || ""; img.alt = "";
+                const label = document.createElement("span"); label.textContent = it.name;
+                btn.append(img,label);
+                btn.onclick = () => openItemPlay(it);
+                el.appendChild(btn);
             });
-
+        }
+        document.getElementById("tv-search").addEventListener("input",renderTvList);
+        function openTvChannelList(catName) {
+            tvDrawerCategory = catName || tvDrawerCategory || "Todas";
+            const list = document.getElementById("drawer-list");
+            list.replaceChildren();
+            document.getElementById("drawer-title").textContent = tvDrawerCategory;
+            const back = document.createElement("button"); back.className = "drawer-item"; back.textContent = "‹ Categorias";
+            back.onclick = () => openCategoriesDrawer(); list.appendChild(back);
+            (catalog.tv || []).filter(it => (tvDrawerCategory === "Todas" || it.group === tvDrawerCategory) && (!isAdultItem(it) || adultCategoryUnlocked)).forEach(it => {
+                const btn = document.createElement("button");btn.className="tv-channel-item";
+                const img=document.createElement("img");img.src=it.logo||"";img.alt="";
+                const label=document.createElement("span");label.textContent=it.name;
+                btn.append(img,label);
+                btn.onclick=()=>{openItemPlay(it);setTvMiniMode(true);};
+                list.appendChild(btn);
+            });
+            setTvMiniMode(true);
+        }
+        function setTvMiniMode(visible) {
+            tvListVisible=visible;
+            const player=document.getElementById("player-modal");
+            const enabled=visible && player.classList.contains("active") && currentPlayingItem && currentPlayingItem.type === "tv";
+            player.classList.toggle("tv-list-open",Boolean(enabled));
+            document.body.classList.toggle("player-open",Boolean(enabled));
+            document.getElementById("drawer-panel").classList.toggle("active",Boolean(enabled));
+            document.getElementById("drawer-backdrop").classList.toggle("active",Boolean(enabled));
+        }
+        function openCategoriesDrawer() {
+            const list=document.getElementById("drawer-list");list.replaceChildren();
+            const t=activeTab === "home" || activeTab === "config" ? "tv" : activeTab;
+            const cats=xtreamCategories[t] || [];
+            document.getElementById("drawer-title").textContent="Categorias";
+            const add=(title,name,isAdult=false)=>{
+                const btn=document.createElement("button");btn.className="drawer-item";btn.textContent=title;
+                btn.onclick=()=>{
+                    if(isAdult && !adultCategoryUnlocked){
+                        const pin=prompt("Digite seu PIN de 4 dígitos para conteúdo adulto:");
+                        if(pin!==adultPin) return alert("PIN incorreto!");
+                        adultCategoryUnlocked=true;
+                    }
+                    selectCategory(name);
+                    if(t==="tv" && document.getElementById("player-modal").classList.contains("active")) openTvChannelList(name);
+                    else closeDrawer();
+                };list.appendChild(btn);
+            };
+            add("Todas as categorias","Todas");
+            cats.filter(c=>!ADULT_REGEX.test(c.category_name||"")).forEach(c=>add(c.category_name,c.category_name));
+            const adultCats=cats.filter(c=>ADULT_REGEX.test(c.category_name||""));
+            if(adultCats.length){
+                if(!adultCategoryUnlocked) {
+                    const b=document.createElement("button");b.className="drawer-item";b.textContent="🔒 Conteúdo adulto";
+                    b.onclick=()=>{
+                        const pin=prompt("Digite seu PIN de 4 dígitos para conteúdo adulto:");
+                        if(pin!==adultPin)return alert("PIN incorreto!");
+                        adultCategoryUnlocked=true;openCategoriesDrawer();
+                    };list.appendChild(b);
+                } else adultCats.forEach(c=>add(c.category_name,c.category_name,true));
+            }
             document.getElementById("drawer-backdrop").classList.add("active");
             document.getElementById("drawer-panel").classList.add("active");
         }
-
         function closeDrawer() {
             document.getElementById("drawer-backdrop").classList.remove("active");
             document.getElementById("drawer-panel").classList.remove("active");
+            setTvMiniMode(false);
         }
-        document.getElementById("btn-open-drawer").onclick = openCategoriesDrawer;
-        document.getElementById("btn-close-drawer").onclick = closeDrawer;
-        document.getElementById("drawer-backdrop").onclick = closeDrawer;
-
+        document.getElementById("btn-open-drawer").onclick=openCategoriesDrawer;
+        document.getElementById("btn-close-drawer").onclick=closeDrawer;
+        document.getElementById("drawer-backdrop").onclick=closeDrawer;
         function selectCategory(catName) {
-            activeCategory = catName;
-            document.getElementById("cat-selected-label").textContent = `Categoria: ${catName}`;
-            renderCatalogGrid();
+            activeCategory=catName;
+            if(activeTab==="tv") {
+                document.getElementById("tv-selected-label").textContent="Categoria: "+catName;
+                renderTvList();
+            } else {
+                document.getElementById("cat-selected-label").textContent="Categoria: "+catName;
+                renderCatalogGrid();
+            }
         }
-
         function renderCatalogGrid() {
-            const rawList = catalog[activeTab] || [];
-            const search = document.getElementById("catalog-search").value.toLowerCase().trim();
-
-            const filtered = rawList.filter(it => {
-                const adult = isAdultItem(it);
-                if (activeCategory === "Todas") {
-                    if (adult) return false;
-                } else if (it.group !== activeCategory) {
-                    return false;
-                }
-                if (search && !it.name.toLowerCase().includes(search)) return false;
-                return true;
+            const raw=catalog[activeTab]||[];
+            const search=document.getElementById("catalog-search").value.toLowerCase().trim();
+            const filtered=raw.filter(it=>{
+                if(isAdultItem(it) && !adultCategoryUnlocked)return false;
+                if(activeCategory!=="Todas" && it.group!==activeCategory)return false;
+                return !search || it.name.toLowerCase().includes(search);
             });
-
-            document.getElementById("cat-total-label").textContent = `${filtered.length} títulos`;
-            const grid = document.getElementById("posters-grid");
-            grid.innerHTML = "";
-            filtered.slice(0, 150).forEach(it => grid.appendChild(createPosterCard(it)));
+            document.getElementById("cat-total-label").textContent=`${filtered.length} títulos`;
+            const grid=document.getElementById("posters-grid");grid.replaceChildren();
+            filtered.slice(0,150).forEach(it=>grid.appendChild(createPosterCard(it)));
         }
-        document.getElementById("catalog-search").oninput = renderCatalogGrid;
+        document.getElementById("catalog-search").oninput=renderCatalogGrid;
 
         // ==========================================================
         // PLAYER DE VÍDEO SLIM: CONTROLES OCULTOS DURANTE REPRODUÇÃO
@@ -1961,6 +2098,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             }
         });
 
+        document.getElementById("video-stage").addEventListener("click", () => {
+            if (tvListVisible) closeDrawer();
+        });
         // BARRA DE PROGRESSO (SEEK BAR) DE VOD
         vEl.addEventListener("timeupdate", () => {
             if (!currentPlayingItem || currentPlayingItem.type === "tv") return;
@@ -2001,20 +2141,29 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         }
 
         function openItemPlay(it, forceEngine = "auto") {
+            const keepTvMini = tvListVisible && it.type === "tv";
+            stopPlayerEngines();
             currentPlayingItem = it;
             playSecondsCounter = 0;
             currentActiveEngine = forceEngine;
 
             document.getElementById("player-modal").classList.add("active");
+            if (it.type === "tv" && activeTab === "tv" && !keepTvMini) {
+                // Primeiro toque no canal: lista à esquerda e reprodução à direita.
+                openTvChannelList(activeCategory === "Todas" ? it.group : activeCategory);
+            }
+            document.getElementById("dock-btn-tv-list").classList.toggle("hidden",it.type!=="tv");
+            document.getElementById("btn-player-vod-list").classList.toggle("hidden",it.type==="tv");
+            if (it.type !== "tv") setTvMiniMode(false);
             document.getElementById("player-title").textContent = it.name;
             document.getElementById("center-play-overlay").classList.add("hidden");
 
-            stopPlayerEngines();
             vEl.className = "";
             closeAllBubbles();
 
             // Ativa controles inicialmente e agenda sumiço em 3 segundos
-            resetDockTimer();
+            if(tvListVisible && it.type === "tv") setTvMiniMode(true);
+            else resetDockTimer();
 
             // Barra de progresso visível exclusivamente para VOD
             const seekWrap = document.getElementById("vod-seek-wrap");
@@ -2173,6 +2322,36 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             e.stopPropagation();
             stopPlayerEngines();
             document.getElementById("player-modal").classList.remove("active");
+            closeDrawer();
+        };
+
+        // Heartbeat apenas quando a mídia começa efetivamente a tocar.
+        vEl.addEventListener("playing", () => {
+            sendMonitorHeartbeat(true);
+            if (monitorInterval) clearInterval(monitorInterval);
+            monitorInterval = setInterval(() => {
+                if (!vEl.paused && currentPlayingItem) {
+                    playSecondsCounter += 5;
+                    sendMonitorHeartbeat(true);
+                }
+            }, 5000);
+        });
+        vEl.addEventListener("pause", () => {
+            if(monitorInterval){clearInterval(monitorInterval);monitorInterval=null;}
+            sendMonitorHeartbeat(false);
+        });
+        document.getElementById("dock-btn-tv-list").onclick = (e) => {
+            e.stopPropagation();
+            if(!currentPlayingItem || currentPlayingItem.type!=="tv")return;
+            if(tvListVisible) closeDrawer(); else openTvChannelList(currentPlayingItem.group);
+        };
+        document.getElementById("btn-player-vod-list").onclick=(e)=>{
+            e.stopPropagation();
+            if(!currentPlayingItem)return;
+            const it=currentPlayingItem;
+            document.getElementById("btn-player-back").click();
+            const tab=document.querySelector(`.bottom-nav .bnav-item[data-tab="${it.type}"]`);
+            if(tab){tab.click();selectCategory(it.group);closeDrawer();}
         };
 
         // CONTROLES SLIM DO DOCK
@@ -2269,50 +2448,44 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
         document.addEventListener("click", () => closeAllBubbles());
 
-        // NAVEGAÇÃO BOTTOM BAR
-        document.querySelectorAll(".bottom-nav .bnav-item").forEach(btn => {
-            btn.onclick = () => {
-                activeTab = btn.dataset.tab;
-                document.querySelectorAll(".bottom-nav .bnav-item").forEach(b => b.classList.remove("active"));
-                btn.classList.add("active");
-
-                const backBtn = document.getElementById("btn-global-back");
-                if (activeTab === "home") {
-                    backBtn.classList.add("hidden");
-                    document.getElementById("btn-open-drawer").classList.add("hidden");
-                    document.getElementById("view-home").classList.remove("hidden");
-                    document.getElementById("view-catalog").classList.add("hidden");
-                    document.getElementById("view-config").classList.add("hidden");
-                } else if (activeTab === "config") {
-                    backBtn.classList.remove("hidden");
-                    document.getElementById("btn-open-drawer").classList.add("hidden");
-                    document.getElementById("view-home").classList.add("hidden");
-                    document.getElementById("view-catalog").classList.add("hidden");
-                    document.getElementById("view-config").classList.remove("hidden");
-                    fillConfigScreen();
-                } else {
-                    backBtn.classList.remove("hidden");
-                    document.getElementById("btn-open-drawer").classList.remove("hidden");
-                    document.getElementById("view-home").classList.add("hidden");
-                    document.getElementById("view-catalog").classList.remove("hidden");
-                    document.getElementById("view-config").classList.add("hidden");
-                    activeCategory = "Todas";
-                    renderCatalogGrid();
-                    openCategoriesDrawer();
+        // Navegação independente: nenhuma seção herda o estado oculto da anterior.
+        document.querySelectorAll(".bottom-nav .bnav-item").forEach(btn=>{
+            btn.onclick=()=>{
+                const tab=btn.dataset.tab;
+                if(document.getElementById("player-modal").classList.contains("active")) {
+                    if(tab==="tv" && currentPlayingItem && currentPlayingItem.type==="tv"){
+                        if(tvListVisible)closeDrawer();else openTvChannelList(currentPlayingItem.group);
+                        return;
+                    }
+                    document.getElementById("btn-player-back").click();
                 }
-                window.scrollTo({ top: 0, behavior: "smooth" });
+                activeTab=tab;
+                closeDrawer();
+                document.querySelectorAll(".bottom-nav .bnav-item").forEach(b=>b.classList.toggle("active",b===btn));
+                ["home","catalog","tv","config"].forEach(v=>document.getElementById("view-"+v).classList.add("hidden"));
+                const section=tab==="home"?"home":tab==="config"?"config":tab==="tv"?"tv":"catalog";
+                document.getElementById("view-"+section).classList.remove("hidden");
+                document.getElementById("btn-global-back").classList.toggle("hidden",tab==="home");
+                document.getElementById("btn-open-drawer").classList.toggle("hidden",tab==="home"||tab==="config");
+                activeCategory="Todas";
+                if(tab==="tv")renderTvList();
+                if(tab==="movies"||tab==="series")renderCatalogGrid();
+                if(tab==="config")fillConfigScreen();
+                window.scrollTo({top:0,behavior:"smooth"});
             };
         });
-
-        document.getElementById("btn-global-back").onclick = () => {
-            document.querySelector('.bottom-nav .bnav-item[data-tab="home"]').click();
-        };
+        document.getElementById("btn-global-back").onclick=()=>document.querySelector('.bottom-nav .bnav-item[data-tab="home"]').click();
 
         function fillConfigScreen() {
             if (!currentAuth) return;
             document.getElementById("cfg-user").textContent = currentAuth.username;
             document.getElementById("cfg-pass").textContent = currentAuth.password;
             document.getElementById("cfg-exp").textContent = currentAuth.expires_formatted || "Ativo";
+            document.getElementById("cfg-created").textContent = currentAuth.created_formatted || "Não informado";
+            const pay=currentAuth.payment_link || serverConfig.default_payment_link || "";
+            document.getElementById("btn-config-pay").classList.toggle("hidden", !/^https?:\/\//i.test(pay));
+            if(/^https?:\/\//i.test(pay))document.getElementById("btn-config-pay").href=pay;
+            document.getElementById("cfg-payment-unavailable").classList.toggle("hidden",/^https?:\/\//i.test(pay));
             document.getElementById("cfg-plan").textContent = currentAuth.plan_type || "Plano IPTV";
             document.getElementById("cfg-screens").textContent = `${currentAuth.max_connections || '1'} tela(s)`;
         }
@@ -2337,7 +2510,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             const mac = getOrCreateMac();
             const r = await fetch("/api/login", { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({ username: u, password: p, mac: mac }) });
             const d = await r.json();
-            if (!d.ok) return alert(d.error || "Erro ao entrar.");
+            if (!d.ok) {
+                if (d.expired) return showExpiredAccess(d.payment_link);
+                return alert(d.error || "Erro ao entrar.");
+            }
             currentAuth = d;
             localStorage.setItem("sf_session", JSON.stringify(d));
             enterApp();
@@ -2429,7 +2605,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             document.getElementById("main-navbar").classList.remove("hidden");
             document.getElementById("main-content").classList.remove("hidden");
             document.getElementById("bottom-nav").classList.add("active");
-            fetchXtreamData();
+            if (!catalog.movies.length && !catalog.series.length && !catalog.tv.length) fetchXtreamData();
         }
 
         document.getElementById("btn-logout-cfg").onclick = () => {
@@ -2467,11 +2643,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 const res = await fetch("/api/admin/data");
                 const d = await res.json();
                 if (!d.ok) return;
-
-                document.getElementById("adm-dns").value = d.settings.dns_list || "";
-                document.getElementById("adm-trial-api").value = d.settings.trial_api_url || "";
-                document.getElementById("adm-pay-link").value = d.settings.default_payment_link || "";
-                document.getElementById("adm-wa-link").value = d.settings.support_whatsapp || "";
+                if(document.activeElement !== document.getElementById("adm-dns"))document.getElementById("adm-dns").value = d.settings.dns_list || "";
+                if(document.activeElement !== document.getElementById("adm-trial-api"))document.getElementById("adm-trial-api").value = d.settings.trial_api_url || "";
+                if(document.activeElement !== document.getElementById("adm-pay-link"))document.getElementById("adm-pay-link").value = d.settings.default_payment_link || "";
+                if(document.activeElement !== document.getElementById("adm-wa-link"))document.getElementById("adm-wa-link").value = d.settings.support_whatsapp || "";
 
                 const monTbody = document.getElementById("adm-monitoring-tbody");
                 monTbody.innerHTML = "";
@@ -2519,6 +2694,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             loadAdminDashboard();
         };
 
+        document.getElementById("btn-delete-all-devices").onclick=async()=>{
+            if(!confirm("Remover todos os dispositivos e testes? Contas de assinantes não serão apagadas."))return;
+            const r=await fetch("/api/admin/delete-all-devices",{method:"DELETE"});
+            const d=await r.json();
+            if(d.ok){alert("Dispositivos e testes removidos.");loadAdminDashboard();}
+            else alert("Não foi possível remover os registros.");
+        };
         document.getElementById("btn-adm-save").onclick = async () => {
             await fetch("/api/admin/save", { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({
                 dns_list: document.getElementById("adm-dns").value,
