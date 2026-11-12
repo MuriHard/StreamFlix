@@ -166,6 +166,10 @@ def parse_trial_api_response(raw_text, cfg):
 
     return res
 
+# External credentials are not treated as confirmed subscriptions.
+ASSETS['/ui.js']['body']=ASSETS['/ui.js']['body'].replace("if(!a.expiresAt)return 'Acesso ativo';", "if(a.status==='External')return 'Validade no provedor';if(!a.expiresAt)return 'Acesso ativo';")
+ASSETS['/app.js']['body']=ASSETS['/app.js']['body'].replace("state.account.isTrial?'Teste gratuito':'Assinatura ativa'", "state.account.status==='External'?'Acesso externo':state.account.isTrial?'Teste gratuito':'Assinatura ativa'")
+
 DATA = Path(os.environ.get('NEXO_DATA_DIR', str(Path(__file__).resolve().parent / 'nexo-data')))
 DATA.mkdir(parents=True, exist_ok=True, mode=0o700)
 def private_value(name, generator):
@@ -282,7 +286,7 @@ def timestamp(value):
         return int(date.timestamp()*1000)
     except (ValueError,TypeError,OverflowError):return None
 
-def allowed(a):return bool(a and not a['revoked'] and a['provider_status']=='Active' and (not a['expires_at'] or a['expires_at']>now()) and (not a['is_trial'] or a['trial_deadline'] and a['trial_deadline']>now()))
+def allowed(a):return bool(a and not a['revoked'] and (a['provider_status']=='Active' or a['provider_status']=='External' and not a['is_trial']) and (not a['expires_at'] or a['expires_at']>now()) and (not a['is_trial'] or a['trial_deadline'] and a['trial_deadline']>now()))
 def public_account(a):
     if not a:return None
     return {'id':a['id'],'username':a['username'],'plan':a['plan'],'expiresAt':iso(a['expires_at']),'trialDeadline':iso(a['trial_deadline']),
@@ -396,19 +400,17 @@ def do_login(body):
     if not username or not password or len(username)>100 or len(password)>200:raise ApiError('Informe usuário e senha válidos.')
     existing=row('SELECT * FROM accounts WHERE username=? AND revoked=0',(username,))
     if existing and hmac.compare_digest(unseal(existing['credentials']).get('password',''),password):return login_response(existing)
-    servers=list(dict.fromkeys([server_origin(s.strip()) for s in setting('provider_dns').splitlines() if server_origin(s.strip())]))
-    for server in servers:
-        c={'username':username,'password':password,'server':server}
-        try:
-            info=provider_json(c);u=info.get('user_info') or {}
-            if str(u.get('auth'))!='1':continue
-            if str(u.get('status','')).lower() not in ('active','trial'):raise ApiError('Seu acesso está inativo ou expirado.',403)
-            a=save_account(c,info,body=body);return login_response(a)
-        except (urllib.error.URLError,TimeoutError,ValueError):
-            try:
-                if verify_m3u(c):return login_response(save_account(c,body=body))
-            except (urllib.error.URLError,TimeoutError,ValueError):pass
-    raise ApiError('Não foi possível validar esse acesso. Confira DNS, usuário e senha. A VPS pode estar sendo recusada pelo provedor.',503,'PROVIDER_UNAVAILABLE')
+    # Manual credentials: connect from browser, no VPS authentication required.
+    # Existing accounts retain their stored password and fixed trial deadline.
+    if existing:
+        raise ApiError('Usuário ou senha inválidos.',401,'LOGIN_REQUIRED')
+    server=next((server_origin(s.strip()) for s in setting('provider_dns').splitlines() if server_origin(s.strip())),None)
+    if not server:raise ApiError('Configure o DNS do provedor no admin.',503)
+    c={'username':username,'password':password,'server':server}
+    a=save_account(c,body=body)
+    execute("UPDATE accounts SET provider_status='External',plan='Acesso externo',access_count=NULL,last_verified=0 WHERE id=?",(a['id'],))
+    return login_response(row('SELECT * FROM accounts WHERE id=?',(a['id'],)))
+
 
 def renew_account(a):
     try:
